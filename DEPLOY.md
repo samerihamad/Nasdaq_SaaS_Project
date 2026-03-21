@@ -15,8 +15,11 @@ shortcuts** for local development; on a VPS you run the same Python modules from
 
 ## Paths & environment
 
-- **Linux has no `C:\...`**. Use paths relative to the project root in `.env`, or `/home/user/natb/...`.
-- Copy `.env` to the server; **never commit secrets** to git.
+- **`.env` is not on GitHub** (see `.gitignore`). You must create it **on each server**:
+  - Copy `.env.example` → `.env`, fill values, or `scp` your local `.env` over SSH (secure channel).
+- **Linux has no `C:\...`**. Use POSIX paths in `.env` on the VPS, e.g. `/home/ubuntu/Nasdaq_SaaS_Project/config/gdrive_token.json`.
+- The app **does not** read secrets from GitHub; without a valid `.env` on the VPS, **nothing will authenticate** (Telegram, Capital.com, backups, SMTP).
+- Optional: inject vars via **systemd `EnvironmentFile=`** pointing to a root-only file instead of a repo file.
 - `GOOGLE_SERVICE_ACCOUNT_JSON`, `GDRIVE_OAUTH_CLIENT_JSON`, `GDRIVE_OAUTH_TOKEN_JSON` must point to **files that exist on the VPS** (upload the JSON + token after first OAuth).
 
 ## Google Drive OAuth on a server (headless)

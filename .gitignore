@@ -3,29 +3,46 @@
 .env.*
 !.env.example
 
-# ── Node / frontend ──────────────────────────────────────────────────────────
+# ── Dependencies / libraries (Node) ────────────────────────────────────────
 node_modules/
+jspm_packages/
+bower_components/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .pnpm-store/
+.pnp.*
+.yarn/cache
+.yarn/unplugged
+.yarn/build-state.yml
+.yarn/install-state.gz
+
+# ── Dependencies / libraries (Python) ───────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+.virtualenv/
+pip-wheel-metadata/
+# Conda (if used)
+.conda/
+conda-meta/
+
+# ── JS / frontend build output ─────────────────────────────────────────────
 dist/
 .next/
 out/
 .nuxt/
 .cache/
+.parcel-cache/
+.turbo/
 
-# ── Python virtual environments ───────────────────────────────────────────────
-.venv/
-venv/
-env/
-ENV/
-
-# ── Python bytecode & packaging ──────────────────────────────────────────────
+# ── Python bytecode & packaging ─────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
+*.dylib
 .Python
 build/
 develop-eggs/
@@ -44,7 +61,7 @@ MANIFEST
 pip-log.txt
 pip-delete-this-directory.txt
 
-# ── Test / tooling caches ────────────────────────────────────────────────────
+# ── Test / tooling caches ───────────────────────────────────────────────────
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -57,24 +74,54 @@ htmlcov/
 # ── Jupyter ──────────────────────────────────────────────────────────────────
 .ipynb_checkpoints/
 
-# ── Local data & runtime (sensitive or huge) ────────────────────────────────
+# ── Data files & local databases ───────────────────────────────────────────
 *.db
 *.db-journal
 *.sqlite
 *.sqlite3
-backups/
 *.db.enc
+# Put large tables under data/ or datasets/ — avoid ignoring *.csv globally if you commit small fixtures
+*.parquet
+*.feather
+*.arrow
+*.npy
+*.npz
+*.h5
+*.hdf5
+# Local data directories (dumps, exports, uploads)
+data/
+datasets/
+raw_data/
+exports/
+uploads/
+storage/
+media/
+samples/local/
+
+# ── ML / trained models (utils/ai_model.py uses models/*.pkl) ────────────────
+models/
+*.pkl
+*.joblib
+*.onnx
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+
+# ── App runtime & backups ─────────────────────────────────────────────────
+backups/
 conversation_states.pkl
 main.pid
 heartbeat.json
 
-# OAuth / cloud keys (paths often under config/ or project root)
+# OAuth / cloud keys
 config/gdrive_token.json
 **/client_secret*.json
+**/service_secret*.json
 **/service_account*.json
 **/credentials.json
 
-# ── IDE & editors ────────────────────────────────────────────────────────────
+# ── IDE & editors ───────────────────────────────────────────────────────────
 .idea/
 .vscode/
 *.swp
@@ -93,8 +140,6 @@ desktop.ini
 *.log
 logs/
 
-# ── ML / large artifacts (uncomment if you store models locally) ────────────
-# *.pkl
-# *.joblib
-# models/
-# *.h5
+# ── Archives (uncomment if you never commit zips to the repo) ───────────────
+# *.zip
+# *.tar.gz
