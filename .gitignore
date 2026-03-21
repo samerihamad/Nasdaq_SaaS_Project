@@ -1,0 +1,100 @@
+# ── Environment & secrets (never commit) ───────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Node / frontend ──────────────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-store/
+dist/
+.next/
+out/
+.nuxt/
+.cache/
+
+# ── Python virtual environments ───────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Python bytecode & packaging ──────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ── Test / tooling caches ────────────────────────────────────────────────────
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+htmlcov/
+*.cover
+.hypothesis/
+
+# ── Jupyter ──────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── Local data & runtime (sensitive or huge) ────────────────────────────────
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+backups/
+*.db.enc
+conversation_states.pkl
+main.pid
+heartbeat.json
+
+# OAuth / cloud keys (paths often under config/ or project root)
+config/gdrive_token.json
+**/client_secret*.json
+**/service_account*.json
+**/credentials.json
+
+# ── IDE & editors ────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# ── OS ───────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── ML / large artifacts (uncomment if you store models locally) ────────────
+# *.pkl
+# *.joblib
+# models/
+# *.h5

@@ -1,0 +1,9 @@
+# Install into the SAME Python you use for `python main.py` (system or venv):
+#   python -m pip install -r requirements.txt
+#
+# Hourly backup (utils/backup.py → Google Drive) needs:
+google-api-python-client>=2.100
+google-auth>=2.0
+google-auth-oauthlib>=1.0
+cryptography>=41.0
+python-dotenv>=1.0

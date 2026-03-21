@@ -1,0 +1,362 @@
+"""
+Momentum Strategy — NATB v2.0
+
+Entry logic (primarily 15m, confirmed by 1D trend):
+  1D  — master trend must align: 1D RSI > 50 for BUY, < 50 for SELL.
+         EMA20 > EMA50 for BUY, EMA20 < EMA50 for SELL.
+  15M — trigger conditions:
+         • ADX > MOM_ADX_THRESHOLD (trend is real, not chop)
+         • MACD crossover: macd_line crosses above/below signal_line
+         • Volume spike: current vol ≥ MOM_VOL_RATIO × 20-bar average
+         • Optional gap: gap > MOM_GAP_PCT boosts score
+
+News quality boost (optional, requires NEWS_API_KEY):
+  Checks NewsAPI for recent headlines mentioning the ticker.
+  A positive/negative headline adds NEWS_QUALITY_SCORE bonus points.
+
+Signal score breakdown (max 100):
+  ADX strength        → 20 pts  (scaled; +5 bonus if ADX > MOM_ADX_STRONG)
+  MACD crossover      → 20 pts
+  Volume spike        → 20 pts  (scaled by ratio)
+  1D trend alignment  → 15 pts
+  Gap confirmation    → 10 pts
+  News quality        → 15 pts  (optional)
+"""
+
+import logging
+import requests
+from datetime import datetime, timedelta, timezone
+
+import numpy as np
+import pandas as pd
+
+from config import (
+    MOM_ADX_THRESHOLD,
+    MOM_ADX_STRONG,
+    MOM_VOL_RATIO,
+    MOM_GAP_PCT,
+    MOM_MACD_CONFIRM,
+    MOM_MIN_SCORE,
+    NEWS_API_KEY,
+    NEWS_LOOKBACK_HOURS,
+    NEWS_QUALITY_SCORE,
+)
+
+log = logging.getLogger(__name__)
+
+
+# ── Indicator helpers ─────────────────────────────────────────────────────────
+
+def _ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
+
+
+def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta    = series.diff()
+    gain     = delta.clip(lower=0)
+    loss     = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def _macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    """Returns (macd_line, signal_line)."""
+    ema_fast    = _ema(series, fast)
+    ema_slow    = _ema(series, slow)
+    macd_line   = ema_fast - ema_slow
+    signal_line = _ema(macd_line, signal)
+    return macd_line, signal_line
+
+
+def _adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """
+    Wilder's ADX implementation.
+    Returns a Series of ADX values (same index as df).
+    """
+    high  = df["High"].squeeze().astype(float)
+    low   = df["Low"].squeeze().astype(float)
+    close = df["Close"].squeeze().astype(float)
+
+    prev_high  = high.shift(1)
+    prev_low   = low.shift(1)
+    prev_close = close.shift(1)
+
+    # True Range
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low  - prev_close).abs(),
+    ], axis=1).max(axis=1)
+
+    # Directional Movements
+    up_move   = high - prev_high
+    down_move = prev_low - low
+
+    plus_dm  = np.where((up_move > down_move) & (up_move > 0),  up_move,  0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    plus_dm  = pd.Series(plus_dm,  index=df.index, dtype=float)
+    minus_dm = pd.Series(minus_dm, index=df.index, dtype=float)
+
+    # Wilder smoothing (equivalent to EWM with alpha = 1/period)
+    atr_s       = tr.ewm(alpha=1 / period, adjust=False).mean()
+    plus_di     = 100 * plus_dm.ewm(alpha=1 / period, adjust=False).mean()  / atr_s.replace(0, np.nan)
+    minus_di    = 100 * minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr_s.replace(0, np.nan)
+
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx_series  = dx.ewm(alpha=1 / period, adjust=False).mean()
+
+    return adx_series, plus_di, minus_di
+
+
+def _flatten(df: pd.DataFrame) -> pd.DataFrame:
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.copy()
+        df.columns = df.columns.get_level_values(0)
+    return df
+
+
+# ── MACD crossover detector ───────────────────────────────────────────────────
+
+def _macd_crossover(macd_line: pd.Series, signal_line: pd.Series, direction: str) -> bool:
+    """
+    Returns True if a fresh crossover occurred on the LAST bar.
+    BUY : macd_line crossed ABOVE signal_line (prev bar was below, curr bar is above)
+    SELL: macd_line crossed BELOW signal_line
+    """
+    if len(macd_line) < 2:
+        return False
+    prev_diff = float(macd_line.iloc[-2]) - float(signal_line.iloc[-2])
+    curr_diff = float(macd_line.iloc[-1]) - float(signal_line.iloc[-1])
+
+    if direction == "BUY":
+        return prev_diff < 0 < curr_diff          # crossed from below to above
+    else:
+        return prev_diff > 0 > curr_diff          # crossed from above to below
+
+
+# ── Volume spike ─────────────────────────────────────────────────────────────
+
+def _volume_ratio(df: pd.DataFrame) -> float:
+    """Current bar volume / 20-bar rolling average volume."""
+    vol = df["Volume"].squeeze().astype(float)
+    avg = float(vol.rolling(20).mean().iloc[-1])
+    if avg == 0:
+        return 0.0
+    return float(vol.iloc[-1]) / avg
+
+
+# ── Gap detector ─────────────────────────────────────────────────────────────
+
+def _gap_pct(df: pd.DataFrame) -> float:
+    """
+    Returns the gap % between the previous close and current open.
+    Positive = gap up, negative = gap down.
+    """
+    if len(df) < 2:
+        return 0.0
+    prev_close = float(df["Close"].iloc[-2])
+    curr_open  = float(df["Open"].iloc[-1])
+    if prev_close == 0:
+        return 0.0
+    return (curr_open - prev_close) / prev_close * 100
+
+
+# ── 1D trend alignment ────────────────────────────────────────────────────────
+
+def _check_1d_trend(df_1d: pd.DataFrame, direction: str) -> bool:
+    """
+    1D must show a clear trend:
+      BUY : RSI > 50 AND EMA20 > EMA50
+      SELL: RSI < 50 AND EMA20 < EMA50
+    """
+    if df_1d is None or df_1d.empty:
+        return False
+    df_1d  = _flatten(df_1d)
+    close  = df_1d["Close"].squeeze().astype(float)
+    rsi    = _rsi(close)
+    ema20  = _ema(close, 20)
+    ema50  = _ema(close, 50)
+
+    rsi_v   = float(rsi.iloc[-1])
+    ema20_v = float(ema20.iloc[-1])
+    ema50_v = float(ema50.iloc[-1])
+
+    if direction == "BUY":
+        return rsi_v > 50 and ema20_v > ema50_v
+    else:
+        return rsi_v < 50 and ema20_v < ema50_v
+
+
+# ── News quality check ────────────────────────────────────────────────────────
+
+def _news_quality_score(symbol: str, direction: str) -> int:
+    """
+    Fetch recent headlines from NewsAPI for `symbol`.
+    Returns NEWS_QUALITY_SCORE if relevant positive/negative news found, else 0.
+    Fails silently — news is a bonus, never a blocker.
+    """
+    if not NEWS_API_KEY:
+        return 0
+
+    try:
+        since = (datetime.now(timezone.utc) - timedelta(hours=NEWS_LOOKBACK_HOURS)).isoformat()
+        resp = requests.get(
+            "https://newsapi.org/v2/everything",
+            params={
+                "q":        symbol,
+                "from":     since,
+                "sortBy":   "publishedAt",
+                "pageSize": 5,
+                "apiKey":   NEWS_API_KEY,
+            },
+            timeout=5,
+        )
+        if resp.status_code != 200:
+            return 0
+
+        articles = resp.json().get("articles", [])
+        if not articles:
+            return 0
+
+        # Keyword scoring — very basic sentiment proxy
+        positive_kw = {"beat", "upgrade", "record", "surge", "growth", "profit", "revenue"}
+        negative_kw = {"miss", "downgrade", "loss", "cut", "decline", "lawsuit", "recall"}
+
+        for article in articles:
+            title = (article.get("title") or "").lower()
+            if direction == "BUY"  and any(w in title for w in positive_kw):
+                log.info("[Momentum %s] Positive news detected: %s", symbol, article["title"])
+                return NEWS_QUALITY_SCORE
+            if direction == "SELL" and any(w in title for w in negative_kw):
+                log.info("[Momentum %s] Negative news detected: %s", symbol, article["title"])
+                return NEWS_QUALITY_SCORE
+
+    except Exception as exc:
+        log.debug("[Momentum %s] News API error: %s", symbol, exc)
+
+    return 0
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+def analyze(symbol: str, timeframes: dict) -> dict | None:
+    """
+    Run the full Momentum analysis.
+
+    Parameters
+    ----------
+    symbol     : ticker string
+    timeframes : dict with keys '1d', '4h', '15m' — each a DataFrame
+
+    Returns
+    -------
+    dict  with keys: action, confidence, score, strategy, stop_loss_pct, reason
+    None  if no valid signal found
+    """
+    df_1d  = _flatten(timeframes.get("1d",  pd.DataFrame()))
+    df_15m = _flatten(timeframes.get("15m", pd.DataFrame()))
+
+    if df_15m.empty or len(df_15m) < 30:
+        log.debug("[Momentum %s] Insufficient 15m data", symbol)
+        return None
+
+    close_15m = df_15m["Close"].squeeze().astype(float)
+
+    # ── ADX ───────────────────────────────────────────────────────────────────
+    adx_series, plus_di, minus_di = _adx(df_15m)
+    adx_val      = float(adx_series.iloc[-1])
+    plus_di_val  = float(plus_di.iloc[-1])
+    minus_di_val = float(minus_di.iloc[-1])
+
+    if adx_val < MOM_ADX_THRESHOLD:
+        log.debug("[Momentum %s] ADX=%.1f below threshold %.1f — no trend", symbol, adx_val, MOM_ADX_THRESHOLD)
+        return None
+
+    # Determine direction from DI lines
+    if plus_di_val > minus_di_val:
+        direction = "BUY"
+    else:
+        direction = "SELL"
+
+    # ── MACD crossover ────────────────────────────────────────────────────────
+    macd_line, signal_line = _macd(close_15m)
+    if MOM_MACD_CONFIRM and not _macd_crossover(macd_line, signal_line, direction):
+        log.debug("[Momentum %s] No MACD crossover — signal rejected", symbol)
+        return None
+
+    # ── Volume spike ──────────────────────────────────────────────────────────
+    vol_ratio = _volume_ratio(df_15m)
+    if vol_ratio < MOM_VOL_RATIO:
+        log.debug("[Momentum %s] VolRatio=%.2f below threshold %.2f", symbol, vol_ratio, MOM_VOL_RATIO)
+        return None
+
+    # ── Composite scoring ─────────────────────────────────────────────────────
+    score   = 0
+    reasons = []
+
+    # 1. ADX (20 pts base + 5 bonus for strong trend)
+    adx_pts = min(20, int(20 * (adx_val - MOM_ADX_THRESHOLD) / (MOM_ADX_STRONG - MOM_ADX_THRESHOLD)))
+    score  += adx_pts
+    reasons.append(f"ADX={adx_val:.1f} (+{adx_pts})")
+    if adx_val >= MOM_ADX_STRONG:
+        score += 5
+        reasons.append("StrongTrend (+5)")
+
+    # 2. MACD crossover (20 pts)
+    score += 20
+    reasons.append("MACD_cross (+20)")
+
+    # 3. Volume spike (20 pts, scaled)
+    vol_pts = min(20, int(20 * (vol_ratio - MOM_VOL_RATIO) / 2.0 + 10))
+    score  += vol_pts
+    reasons.append(f"VolRatio={vol_ratio:.1f}x (+{vol_pts})")
+
+    # 4. 1D trend alignment (15 pts)
+    if _check_1d_trend(df_1d, direction):
+        score += 15
+        reasons.append("1D_trend (+15)")
+
+    # 5. Gap confirmation (10 pts)
+    gap = _gap_pct(df_15m)
+    gap_confirms = (direction == "BUY" and gap >= MOM_GAP_PCT) or \
+                   (direction == "SELL" and gap <= -MOM_GAP_PCT)
+    if gap_confirms:
+        score += 10
+        reasons.append(f"Gap={gap:.1f}% (+10)")
+
+    # 6. News quality (up to NEWS_QUALITY_SCORE pts — 15 default)
+    news_pts = _news_quality_score(symbol, direction)
+    if news_pts:
+        score  += news_pts
+        reasons.append(f"News (+{news_pts})")
+
+    log.info(
+        "[Momentum %s] %s | score=%d | %s",
+        symbol, direction, score, " | ".join(reasons),
+    )
+
+    if score < MOM_MIN_SCORE:
+        log.debug("[Momentum %s] Score %d below threshold %d", symbol, score, MOM_MIN_SCORE)
+        return None
+
+    # Map score (60–100) to confidence (65–95 %)
+    confidence = round(65.0 + (score - MOM_MIN_SCORE) / (100 - MOM_MIN_SCORE) * 30.0, 1)
+    confidence = min(95.0, confidence)
+
+    # Estimate stop distance from recent ATR proxy (15m range)
+    avg_range   = float((df_15m["High"] - df_15m["Low"]).tail(14).mean())
+    close_val   = float(close_15m.iloc[-1])
+    stop_pct    = round(avg_range / close_val, 4) if close_val > 0 else 0.01
+    stop_pct    = max(0.005, min(0.05, stop_pct))
+
+    return {
+        "action":        direction,
+        "confidence":    confidence,
+        "score":         score,
+        "strategy":      "Momentum",
+        "stop_loss_pct": stop_pct,
+        "reason":        " | ".join(reasons),
+    }

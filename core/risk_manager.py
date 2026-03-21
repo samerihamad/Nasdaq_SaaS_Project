@@ -1,0 +1,384 @@
+"""
+Risk Management Engine — NATB v2.0
+
+State machine per user per day:
+  NORMAL          → trading allowed
+  CIRCUIT_BREAKER → 2 consecutive losses; no new entries; Telegram prompt sent
+  MANUAL_OVERRIDE → user approved one extra trade after Circuit Breaker
+  HARD_BLOCK      → manual override trade was a loss; fully locked until next day
+
+Open positions are NEVER touched during a Circuit Breaker or Hard Block.
+They stay active until they hit TP or SL.
+"""
+
+import sqlite3
+from datetime import date
+from bot.notifier import send_telegram_message
+from database.db_manager import (
+    is_master_kill_switch, get_user_kill_switch, get_user_risk_params,
+    get_user_tier,
+)
+
+STATE_NORMAL          = 'NORMAL'
+STATE_CIRCUIT_BREAKER = 'CIRCUIT_BREAKER'
+STATE_MANUAL_OVERRIDE = 'MANUAL_OVERRIDE'
+STATE_HARD_BLOCK      = 'HARD_BLOCK'
+
+CONSECUTIVE_LOSS_LIMIT = 2
+DB_PATH = 'database/trading_saas.db'
+
+# Risk scaling: confidence 70% → 1.0% risk, 100% → 2.0% risk  (hard cap at 2%)
+MIN_CONF, MAX_CONF = 70.0, 100.0
+MIN_RISK, MAX_RISK = 1.0,  2.0
+
+# Institutional risk controls
+DAILY_DRAWDOWN_LIMIT = 5.0   # % drawdown from session start → hard stop
+MIN_RR_RATIO         = 2.0   # minimum reward:risk required (1:2)
+
+# ── Subscription tier limits ───────────────────────────────────────────────────
+# tier 0 = no tier set (treat as Tier 1 restrictions for safety)
+_TIER_LIMITS = {
+    0: {'max_trades': 3,              'max_leverage': 2,  'max_watchlist': 50},
+    1: {'max_trades': 3,              'max_leverage': 2,  'max_watchlist': 50},
+    2: {'max_trades': float('inf'),   'max_leverage': 10, 'max_watchlist': float('inf')},
+}
+
+
+def get_tier_limits(chat_id: str) -> dict:
+    """Return the trade/leverage/watchlist limits for this user's subscription tier."""
+    tier = get_user_tier(chat_id)
+    return _TIER_LIMITS.get(tier, _TIER_LIMITS[0])
+
+
+def get_user_max_leverage(chat_id: str) -> int:
+    """Return the maximum leverage allowed for this user's tier."""
+    return get_tier_limits(chat_id)['max_leverage']
+
+
+# ── DB helpers ────────────────────────────────────────────────────────────────
+
+def _conn():
+    return sqlite3.connect(DB_PATH)
+
+
+def _get_or_reset_state(cursor, chat_id):
+    """
+    Return today's state row for chat_id.
+    Automatically resets to NORMAL at the start of each new trading day.
+    """
+    today = str(date.today())
+    cursor.execute(
+        "SELECT date, consecutive_losses, state FROM daily_risk_state WHERE chat_id=?",
+        (chat_id,)
+    )
+    row = cursor.fetchone()
+
+    if row is None or row[0] != today:
+        cursor.execute(
+            '''INSERT OR REPLACE INTO daily_risk_state
+               (chat_id, date, consecutive_losses, state)
+               VALUES (?, ?, 0, ?)''',
+            (chat_id, today, STATE_NORMAL)
+        )
+        return {'date': today, 'consecutive_losses': 0, 'state': STATE_NORMAL}
+
+    return {'date': row[0], 'consecutive_losses': row[1], 'state': row[2]}
+
+
+# ── Public read API ───────────────────────────────────────────────────────────
+
+def get_risk_state(chat_id):
+    """Return the current state string for chat_id (resets daily)."""
+    db = _conn()
+    c  = db.cursor()
+    state = _get_or_reset_state(c, chat_id)['state']
+    db.commit()
+    db.close()
+    return state
+
+
+def _get_daily_trade_count(chat_id: str) -> int:
+    """Count trades opened today for this user."""
+    today = str(date.today())
+    conn  = sqlite3.connect(DB_PATH)
+    c     = conn.cursor()
+    c.execute(
+        "SELECT COUNT(*) FROM trades WHERE chat_id=? AND DATE(opened_at)=?",
+        (chat_id, today),
+    )
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+
+def can_open_trade(chat_id):
+    """
+    Returns (allowed: bool, reason: str).
+
+    Gate order (checked in priority):
+      1. Master kill switch       — admin halted ALL trading globally
+      2. User kill switch         — this specific user is halted
+      3. Subscription tier limit  — daily trade cap from subscription plan
+      4. Circuit Breaker / Hard Block state machine
+    """
+    # ── 1. Master kill switch ─────────────────────────────────────────────────
+    if is_master_kill_switch():
+        return False, "Master kill switch active — all trading halted by admin"
+
+    # ── 2. Per-user kill switch ───────────────────────────────────────────────
+    if get_user_kill_switch(chat_id):
+        return False, "Your trading session has been halted by the admin"
+
+    # ── 3. Subscription tier daily trade limit ────────────────────────────────
+    limits     = get_tier_limits(chat_id)
+    max_trades = limits['max_trades']
+    if max_trades != float('inf'):
+        daily_count = _get_daily_trade_count(chat_id)
+        if daily_count >= max_trades:
+            return False, (
+                f"Daily trade limit reached ({daily_count}/{int(max_trades)}) — "
+                f"upgrade your plan or wait until tomorrow"
+            )
+
+    # ── 4. Circuit Breaker / Hard Block ───────────────────────────────────────
+    state = get_risk_state(chat_id)
+    if state in (STATE_NORMAL, STATE_MANUAL_OVERRIDE):
+        return True, state
+    if state == STATE_CIRCUIT_BREAKER:
+        return False, "Circuit Breaker active — awaiting your Telegram approval"
+    if state == STATE_HARD_BLOCK:
+        return False, "Hard Block active — lifts automatically at next trading day open"
+    return False, "Unknown risk state"
+
+
+# ── Trade outcome recording ───────────────────────────────────────────────────
+
+def record_trade_result(chat_id, pnl: float):
+    """
+    Call this every time a position closes.
+
+    Transitions:
+      NORMAL          + 2nd consecutive loss  → CIRCUIT_BREAKER (sends Telegram prompt)
+      MANUAL_OVERRIDE + loss                  → HARD_BLOCK
+      MANUAL_OVERRIDE + win                   → NORMAL
+      Any state       + win                   → resets consecutive_losses to 0
+    """
+    db = _conn()
+    c  = db.cursor()
+    data = _get_or_reset_state(c, chat_id)
+    prev_state   = data['state']
+    consecutive  = data['consecutive_losses']
+
+    is_loss = pnl < 0
+    consecutive = (consecutive + 1) if is_loss else 0
+
+    # Determine new state
+    if prev_state == STATE_MANUAL_OVERRIDE:
+        new_state = STATE_HARD_BLOCK if is_loss else STATE_NORMAL
+    elif consecutive >= CONSECUTIVE_LOSS_LIMIT and prev_state == STATE_NORMAL:
+        new_state = STATE_CIRCUIT_BREAKER
+    else:
+        new_state = prev_state
+
+    c.execute(
+        "UPDATE daily_risk_state SET consecutive_losses=?, state=? WHERE chat_id=?",
+        (consecutive, new_state, chat_id)
+    )
+    db.commit()
+    db.close()
+
+    # Notify on state transitions
+    if new_state == STATE_CIRCUIT_BREAKER and prev_state != STATE_CIRCUIT_BREAKER:
+        _send_circuit_breaker_prompt(chat_id)
+    elif new_state == STATE_HARD_BLOCK:
+        send_telegram_message(
+            chat_id,
+            "🔒 *قفل كامل حتى الغد*\n"
+            "خسرت الصفقة اليدوية بعد تفعيل قاطع الدارة.\n"
+            "لن تُفتح صفقات جديدة حتى بداية يوم التداول القادم.\n"
+            "الصفقات المفتوحة تبقى نشطة حتى TP / SL."
+        )
+
+    return new_state
+
+
+# ── Telegram prompts ──────────────────────────────────────────────────────────
+
+def _send_circuit_breaker_prompt(chat_id):
+    send_telegram_message(
+        chat_id,
+        "⚡ *قاطع الدارة — Circuit Breaker*\n\n"
+        "تم رصد خسارتين متتاليتين اليوم.\n"
+        "🚫 تم إيقاف فتح صفقات جديدة تلقائياً.\n\n"
+        "✅ الصفقات المفتوحة تبقى نشطة حتى TP أو SL.\n\n"
+        "الخيارات المتاحة:\n"
+        "• /override — السماح بصفقة يدوية واحدة ⚠️\n"
+        "• /stop\\_today — إيقاف التداول حتى الغد 🛑"
+    )
+
+
+# ── User commands ─────────────────────────────────────────────────────────────
+
+def apply_manual_override(chat_id):
+    """Process /override command. Returns (success: bool, message: str)."""
+    db = _conn()
+    c  = db.cursor()
+    data = _get_or_reset_state(c, chat_id)
+    if data['state'] != STATE_CIRCUIT_BREAKER:
+        db.close()
+        return False, "لا يوجد قاطع دارة نشط حالياً."
+
+    c.execute(
+        "UPDATE daily_risk_state SET state=? WHERE chat_id=?",
+        (STATE_MANUAL_OVERRIDE, chat_id)
+    )
+    db.commit()
+    db.close()
+
+    send_telegram_message(
+        chat_id,
+        "⚠️ *تجاوز يدوي مفعّل — صفقة واحدة فقط*\n"
+        "تم السماح بصفقة إضافية واحدة.\n"
+        "⚠️ إذا خسرت هذه الصفقة ← قفل كامل حتى الغد."
+    )
+    return True, "تم تفعيل التجاوز اليدوي."
+
+
+def apply_stop_today(chat_id):
+    """Process /stop_today command."""
+    db = _conn()
+    db.execute(
+        "UPDATE daily_risk_state SET state=? WHERE chat_id=?",
+        (STATE_CIRCUIT_BREAKER, chat_id)
+    )
+    db.commit()
+    db.close()
+
+    send_telegram_message(
+        chat_id,
+        "🛑 *تم الإيقاف حتى الغد*\n"
+        "لن تُفتح صفقات جديدة اليوم.\n"
+        "الصفقات المفتوحة تبقى نشطة حتى TP أو SL."
+    )
+
+
+# ── Position sizing ───────────────────────────────────────────────────────────
+
+def calculate_position_size(balance: float, confidence: float,
+                             entry_price: float, stop_loss_pct: float = 0.01,
+                             chat_id: str = None):
+    """
+    Per-user dynamic risk sizing.
+
+    Uses this user's risk_percent / max_risk_percent from the DB if chat_id
+    is supplied; falls back to global MIN_RISK / MAX_RISK constants otherwise.
+
+    Scaling:
+      confidence at MIN_CONF (70%)  → user's min_risk %
+      confidence at MAX_CONF (100%) → user's max_risk %  (hard cap)
+
+    size = risk_amount / (entry_price * stop_loss_pct)
+    Minimum 1 unit.
+    """
+    if chat_id:
+        user_min, user_max = get_user_risk_params(chat_id)
+    else:
+        user_min, user_max = MIN_RISK, MAX_RISK
+
+    clamped  = max(MIN_CONF, min(MAX_CONF, confidence))
+    risk_pct = user_min + (user_max - user_min) * ((clamped - MIN_CONF) / (MAX_CONF - MIN_CONF))
+
+    risk_amount = balance * (risk_pct / 100)
+    if entry_price <= 0 or stop_loss_pct <= 0:
+        return 1.0
+
+    size = risk_amount / (entry_price * stop_loss_pct)
+    return max(1.0, round(size, 2))
+
+
+# ── Daily drawdown guard ──────────────────────────────────────────────────────
+
+def get_daily_pnl(chat_id: str) -> float:
+    """Sum of today's closed P&L in dollar terms."""
+    try:
+        today = str(date.today())
+        conn  = sqlite3.connect(DB_PATH)
+        c     = conn.cursor()
+        c.execute(
+            "SELECT SUM(pnl) FROM trades "
+            "WHERE chat_id=? AND DATE(closed_at)=? AND status='CLOSED'",
+            (chat_id, today),
+        )
+        row = c.fetchone()
+        conn.close()
+        return float(row[0] or 0.0)
+    except Exception:
+        return 0.0
+
+
+def check_daily_drawdown(chat_id: str, current_balance: float) -> tuple:
+    """
+    Returns (within_limit: bool, drawdown_pct: float).
+
+    Computes today's total closed P&L as a % of current balance.
+    If drawdown exceeds DAILY_DRAWDOWN_LIMIT (-5%), triggers CIRCUIT_BREAKER
+    and returns False.
+    """
+    if current_balance <= 0:
+        return True, 0.0
+
+    daily_pnl     = get_daily_pnl(chat_id)
+    drawdown_pct  = daily_pnl / current_balance * 100   # negative = loss
+
+    if drawdown_pct <= -DAILY_DRAWDOWN_LIMIT:
+        # Force circuit breaker state
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute(
+                "UPDATE daily_risk_state SET state=? WHERE chat_id=?",
+                (STATE_CIRCUIT_BREAKER, chat_id),
+            )
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+        send_telegram_message(
+            chat_id,
+            f"🔴 *Daily Drawdown Limit Hit*\n"
+            f"Daily P&L: ${daily_pnl:.2f} ({drawdown_pct:.1f}%)\n"
+            f"Limit: -{DAILY_DRAWDOWN_LIMIT}%\n"
+            f"All new entries blocked until tomorrow.\n"
+            f"Open positions remain active until TP / SL."
+        )
+        return False, round(drawdown_pct, 2)
+
+    return True, round(drawdown_pct, 2)
+
+
+# ── Risk:Reward enforcement ───────────────────────────────────────────────────
+
+def check_rr_ratio(entry: float, stop: float, direction: str,
+                    atr: float, min_rr: float = MIN_RR_RATIO) -> tuple:
+    """
+    Returns (passes: bool, rr_ratio: float).
+
+    Computes the natural RR of the setup:
+      stop_distance = |entry - stop|
+      target        = entry ± (stop_distance × min_rr)
+
+    The target is considered achievable if it falls within 4 × ATR
+    (a move the market can realistically make in 1–3 sessions).
+    A setup that cannot offer 1:2 is discarded before any order is sent.
+    """
+    stop_dist = abs(entry - stop)
+    if stop_dist == 0 or atr <= 0:
+        return False, 0.0
+
+    target_dist = stop_dist * min_rr
+    rr_ratio    = round(target_dist / stop_dist, 2)
+
+    # Target must be within 4 × ATR — beyond this it's unrealistic
+    achievable = target_dist <= (atr * 4)
+
+    return achievable and rr_ratio >= min_rr, rr_ratio
