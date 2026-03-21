@@ -263,6 +263,17 @@ STRINGS = {
             '📅 Next open: *{next_gst}*'
         ),
     },
+    # Trading engine (main.py) — one-shot notice when regular session is closed
+    'main_market_closed_notify': {
+        'ar': (
+            '*السوق مغلق* — يُفتح خلال ~{hours}س {minutes}د\n'
+            'تبقى الصفقات المفتوحة قيد المراقبة النشطة.'
+        ),
+        'en': (
+            '*Market Closed* — opens in ~{hours}h {minutes}m\n'
+            'All open positions remain actively monitored.'
+        ),
+    },
 
     # ── Main menu ─────────────────────────────────────────────────────────────
     'main_menu_title': {
@@ -352,6 +363,24 @@ STRINGS = {
     'reg_invalid_license': {
         'ar': '❌ مفتاح الترخيص غير صحيح أو منتهي الصلاحية.\nتواصل مع الدعم.',
         'en': '❌ Invalid or expired license key.\nContact support.',
+    },
+    'approved_missing_license': {
+        'ar': (
+            '⚠️ *تمت الموافقة على الدفع* لكن تعذّر ربط مفتاح الترخيص تلقائياً في النظام.\n\n'
+            'أرسل *مفتاح الترخيص* الذي وصلك من الإدارة.\n'
+            'إذا لم يصلك مفتاح، تواصل مع الدعم.\n\n'
+            'الصق المفتاح في الرسالة التالية:'
+        ),
+        'en': (
+            '⚠️ *Payment was approved* but your license key could not be linked automatically.\n\n'
+            'Send the *license key* you received from admin.\n'
+            'If you did not receive a key, contact support.\n\n'
+            'Paste your key in your next message:'
+        ),
+    },
+    'license_linked_resume': {
+        'ar': '✅ *تم ربط الترخيص.* استئناف لوحة التحكم…',
+        'en': '✅ *License linked.* Resuming your dashboard…',
     },
 
     # ── Balance ───────────────────────────────────────────────────────────────
@@ -556,6 +585,114 @@ STRINGS = {
     'settings_reset': {
         'ar': '⚙️ تم مسح بيانات الوسيط. أرسل /start لإعادة الإدخال.',
         'en': '⚙️ Broker credentials cleared. Send /start to re-enter them.',
+    },
+    'settings_menu_intro': {
+        'ar': (
+            '⚙️ *الإعدادات*\n\n'
+            'اختر أحد الخيارات أدناه. لن يُمس الترخيص أو الاشتراك إلا إذا اخترت ذلك صراحة.'
+        ),
+        'en': (
+            '⚙️ *Settings*\n\n'
+            'Choose an option below. Your license is not changed unless you explicitly cancel or update broker data.'
+        ),
+    },
+    'btn_cancel_subscription': {
+        'ar': '🚫 إلغاء الاشتراك',
+        'en': '🚫 Cancel subscription',
+    },
+    'btn_leverage_settings': {
+        'ar': '📊 الرافعة المالية',
+        'en': '📊 Leverage',
+    },
+    'btn_update_broker': {
+        'ar': '🔑 تحديث بيانات Capital',
+        'en': '🔑 Update Capital credentials',
+    },
+    'cancel_sub_warning': {
+        'ar': (
+            '⚠️ *إلغاء الاشتراك — تأكيد مطلوب*\n\n'
+            '• لن يُسترد مبلغ الاشتراك.\n'
+            '• عند إعادة الاشتراك لاحقاً ستدفع الرسوم *من جديد* بالكامل.\n'
+            '• سيتم إيقاف التداول الآلي وإلغاء الترخيص الحالي.\n\n'
+            'هل أنت متأكد؟'
+        ),
+        'en': (
+            '⚠️ *Cancel subscription — confirmation required*\n\n'
+            '• Your subscription fee is *not* refunded.\n'
+            '• If you subscribe again later, you must pay the full fee again.\n'
+            '• Automated trading will stop and your current license will be revoked.\n\n'
+            'Are you sure?'
+        ),
+    },
+    'btn_cancel_confirm': {
+        'ar': '✅ نعم، إلغاء الاشتراك',
+        'en': '✅ Yes, cancel subscription',
+    },
+    'cancel_sub_not_available': {
+        'ar': 'غير متاح: نافذة الإلغاء خلال 30 يوماً من بداية الاشتراك فقط.',
+        'en': 'Not available: cancellation is only within 30 days of subscription start.',
+    },
+    'cancel_sub_done': {
+        'ar': (
+            '🚫 *تم إلغاء اشتراكك.*\n'
+            'لم يعد الترخيص نشطاً. لإعادة التفعيل اختر الباقة وادفع من جديد من /start'
+        ),
+        'en': (
+            '🚫 *Your subscription was cancelled.*\n'
+            'Your license is no longer active. To reactivate, pick a plan and pay again via /start.'
+        ),
+    },
+    'leverage_settings_body': {
+        'ar': (
+            '📊 *الرافعة المالية*\n\n'
+            'حد الباقة: *{cap}x*\n'
+            'اختيارك الحالي: *{current}x*\n\n'
+            'اختر المستوى المناسب (ضمن حد الباقة):'
+        ),
+        'en': (
+            '📊 *Leverage*\n\n'
+            'Plan cap: *{cap}x*\n'
+            'Your selection: *{current}x*\n\n'
+            'Choose a level (within your plan cap):'
+        ),
+    },
+    'leverage_disclaimer': {
+        'ar': (
+            '⚠️ *تحذير:* التداول بالرافعة المالية يزيد المخاطر وقد يؤدي إلى خسائر تتجاوز رأس المال المستثمر. '
+            '*أنت وحدك* تتحمل المسؤولية الكاملة؛ النظام لا يضمن النتائج ولا يتحمل خسائر التداول.'
+        ),
+        'en': (
+            '⚠️ *Warning:* Leveraged trading increases risk and can cause losses exceeding your invested capital. '
+            '*You alone* bear full responsibility; the system does not guarantee results or cover trading losses.'
+        ),
+    },
+    'leverage_saved': {
+        'ar': '✅ تم حفظ الرافعة: *{leverage}x* (حد الباقة {cap}x).',
+        'en': '✅ Leverage saved: *{leverage}x* (plan cap {cap}x).',
+    },
+    'leverage_invalid': {
+        'ar': 'قيمة غير مسموحة لباقتك.',
+        'en': 'Not allowed for your plan.',
+    },
+    'settings_broker_warn_text': {
+        'ar': (
+            '🔑 *تحديث بيانات Capital.com*\n\n'
+            'سيتم *مسح* البريد وكلمة مرور الـ API والمفتاح المخزّنين لدينا لتتمكن من إدخال بيانات جديدة عبر /start.\n\n'
+            'هل تريد المتابعة؟'
+        ),
+        'en': (
+            '🔑 *Update Capital.com credentials*\n\n'
+            'We will *clear* the stored email, API password, and API key so you can enter new ones via /start.\n\n'
+            'Continue?'
+        ),
+    },
+    'btn_broker_clear_confirm': {
+        'ar': '✅ نعم، امسح البيانات',
+        'en': '✅ Yes, clear credentials',
+    },
+    'settings_broker_cleared': {
+        'ar': '🔑 تم مسح بيانات الوسيط. أرسل /start ثم أدخل مفتاح الترخيص وبيانات Capital من جديد.',
+        'en': '🔑 Broker credentials cleared. Send /start, then enter your license key and Capital details again.',
     },
 
     # ── Stop trading ──────────────────────────────────────────────────────────

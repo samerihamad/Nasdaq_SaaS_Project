@@ -232,16 +232,30 @@ def pretrain_models(watchlist):
 # ── Pre-market alert ──────────────────────────────────────────────────────────
 
 def send_premarket_alert(watchlist_count: int):
-    """Broadcast pre-market alert to all active subscribers + admin."""
+    """Broadcast pre-market alert to all active subscribers (per-user language)."""
     global _premarket_sent
-    from core.watcher import broadcast_to_all
-    broadcast_to_all(
-        f"*Pre-Market Alert*\n"
-        f"Watchlist: {watchlist_count} symbols ready for scanning.\n"
-        f"Market opens shortly — bot is active."
-    )
+    from core.watcher import get_all_active_subscribers
+
+    for row in get_all_active_subscribers():
+        chat_id = str(row[0])
+        lang    = _get_user_lang(chat_id)
+        mode    = _get_user_mode(chat_id)
+        mode_label = (
+            t('btn_mode_auto', lang) if mode == 'AUTO' else t('btn_mode_hybrid', lang)
+        )
+        msg = t(
+            'premarket_alert',
+            lang,
+            watchlist_count=watchlist_count,
+            mode=mode_label,
+        )
+        try:
+            send_telegram_message(chat_id, msg)
+        except Exception:
+            pass
+
     _premarket_sent = date.today()
-    print(f"Pre-market alert sent to all subscribers.")
+    print("Pre-market alert sent to all subscribers (localized).")
 
 
 # ── Signal dispatch ───────────────────────────────────────────────────────────
@@ -352,10 +366,15 @@ def run_trading_bot():
                     mins = minutes_to_open()
                     hrs  = mins // 60
                     if ADMIN_CHAT_ID:
+                        _alang = _get_user_lang(ADMIN_CHAT_ID)
                         send_telegram_message(
                             ADMIN_CHAT_ID,
-                            f"*Market Closed* — opens in ~{hrs}h {mins % 60}m\n"
-                            f"All open positions remain actively monitored.",
+                            t(
+                                'main_market_closed_notify',
+                                _alang,
+                                hours=hrs,
+                                minutes=mins % 60,
+                            ),
                         )
                     _closed_notified = True
                     print(f"[MARKET] Closed — opens in ~{mins} min")

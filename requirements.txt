@@ -1,9 +1,39 @@
-# Install into the SAME Python you use for `python main.py` (system or venv):
-#   python -m pip install -r requirements.txt
-#
-# Hourly backup (utils/backup.py → Google Drive) needs:
-google-api-python-client>=2.100
-google-auth>=2.0
-google-auth-oauthlib>=1.0
-cryptography>=41.0
-python-dotenv>=1.0
+# NATB — Nasdaq SaaS Project
+# Install:  python -m pip install -r requirements.txt
+# Use the SAME interpreter you run main.py / bot with (venv recommended).
+
+# ── Core & config ────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0
+requests>=2.28.0
+
+# ── Telegram bot (main.py imports bot.dashboard) ───────────────────────────
+python-telegram-bot>=21.0
+
+# ── Crypto / subscriber credentials ────────────────────────────────────────
+cryptography>=41.0.0
+
+# ── Trading stack (AI model, strategies, market data) ───────────────────────
+numpy>=1.24.0
+pandas>=2.0.0
+yfinance>=0.2.40
+scikit-learn>=1.3.0
+
+# ── Market hours & calendars ────────────────────────────────────────────────
+pytz>=2023.3
+pandas-market-calendars>=4.3.0
+
+# ── Process lock (main.py single-instance) ─────────────────────────────────
+psutil>=5.9.0
+
+# ── HTTP API (api/app.py) ──────────────────────────────────────────────────
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+
+# ── Cloud backup (utils/backup.py — Google Drive / optional Dropbox) ───────
+google-api-python-client>=2.100.0
+google-auth>=2.0.0
+google-auth-oauthlib>=1.0.0
+
+# ── Optional (install only if you use the feature) ───────────────────────────
+# Dropbox backup (BACKUP_PROVIDER=dropbox):  pip install "dropbox>=11.36"
+# WhatsApp alerts (TWILIO_* in .env):        pip install "twilio>=8.0"

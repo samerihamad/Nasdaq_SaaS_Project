@@ -130,13 +130,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_main_menu(update, context)
         
     elif query.data == 'settings':
-        # مسح يدوي لإعادة التسجيل
+        # مسح بيانات الوسيط فقط — لا يُحذف صف المشترك ولا الترخيص
         conn = sqlite3.connect('database/trading_saas.db')
         c = conn.cursor()
-        c.execute("DELETE FROM subscribers WHERE chat_id=?", (str(query.message.chat_id),))
+        c.execute(
+            "UPDATE subscribers SET email=NULL, api_password=NULL, api_key=NULL "
+            "WHERE chat_id=?",
+            (str(query.message.chat_id),),
+        )
         conn.commit()
         conn.close()
-        await query.edit_message_text("⚙️ تم مسح الإعدادات. أرسل /start للبدء من جديد.")
+        await query.edit_message_text(
+            "⚙️ تم مسح بيانات Capital. أرسل /start لإعادة إدخال المفتاح والبيانات."
+        )
 
 # --- 4. Circuit Breaker command handlers ---
 async def override_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):

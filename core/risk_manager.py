@@ -16,7 +16,7 @@ from datetime import date
 from bot.notifier import send_telegram_message
 from database.db_manager import (
     is_master_kill_switch, get_user_kill_switch, get_user_risk_params,
-    get_user_tier,
+    get_user_tier, get_preferred_leverage,
 )
 
 STATE_NORMAL          = 'NORMAL'
@@ -53,6 +53,21 @@ def get_tier_limits(chat_id: str) -> dict:
 def get_user_max_leverage(chat_id: str) -> int:
     """Return the maximum leverage allowed for this user's tier."""
     return get_tier_limits(chat_id)['max_leverage']
+
+
+def get_effective_leverage(chat_id: str) -> int:
+    """
+    User-chosen leverage capped by tier (1–2 for tier 1, 1–10 for tier 2).
+    If unset, uses the tier maximum.
+
+    Used with tier max to form (effective / tier_max): scales risk budget for
+    position sizing — not a multiplier on size after risk is computed.
+    """
+    cap = get_user_max_leverage(chat_id)
+    pref = get_preferred_leverage(chat_id)
+    if pref is None:
+        return cap
+    return max(1, min(int(pref), cap))
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
@@ -277,7 +292,15 @@ def calculate_position_size(balance: float, confidence: float,
       confidence at MIN_CONF (70%)  → user's min_risk %
       confidence at MAX_CONF (100%) → user's max_risk %  (hard cap)
 
-    size = risk_amount / (entry_price * stop_loss_pct)
+    Leverage (tier cap vs user preference):
+      Dollar risk at the stop is budgeted as
+      balance × risk_pct × (effective_leverage / tier_max_leverage).
+      Choosing the tier maximum uses the full risk band; choosing a lower
+      leverage (e.g. 1× vs 2× cap) scales risk and size down in proportion.
+      We never multiply the post-risk position size by leverage — that would
+      exceed the intended risk percentage.
+
+    size = risk_budget / (entry_price * stop_loss_pct)
     Minimum 1 unit.
     """
     if chat_id:
@@ -288,11 +311,17 @@ def calculate_position_size(balance: float, confidence: float,
     clamped  = max(MIN_CONF, min(MAX_CONF, confidence))
     risk_pct = user_min + (user_max - user_min) * ((clamped - MIN_CONF) / (MAX_CONF - MIN_CONF))
 
-    risk_amount = balance * (risk_pct / 100)
+    risk_budget = balance * (risk_pct / 100)
+    if chat_id:
+        cap = get_user_max_leverage(chat_id)
+        lev = get_effective_leverage(chat_id)
+        if cap > 0:
+            risk_budget *= lev / cap
+
     if entry_price <= 0 or stop_loss_pct <= 0:
         return 1.0
 
-    size = risk_amount / (entry_price * stop_loss_pct)
+    size = risk_budget / (entry_price * stop_loss_pct)
     return max(1.0, round(size, 2))
 
 

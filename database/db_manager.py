@@ -1,4 +1,5 @@
 import sqlite3
+from datetime import date, timedelta
 
 DB_PATH = 'database/trading_saas.db'
 
@@ -39,6 +40,8 @@ def create_db():
         ('payment_proof',    'TEXT'),
         ('payment_status',   "TEXT DEFAULT 'NONE'"),
         ('trading_enabled',  'INTEGER DEFAULT 0'),
+        ('subscription_started_at', "TEXT"),
+        ('preferred_leverage', 'INTEGER'),
     ]:
         try:
             c.execute(f"ALTER TABLE subscribers ADD COLUMN {col} {definition}")
@@ -266,6 +269,96 @@ def get_user_tier(chat_id: str) -> int:
     row  = c.fetchone()
     conn.close()
     return int(row[0]) if row and row[0] else 0
+
+
+# ── Subscription period / leverage preferences ────────────────────────────────
+
+TIER_SUBSCRIPTION_DAYS = {1: 30, 2: 30}
+
+
+def get_subscription_started_at(chat_id: str) -> str | None:
+    conn = sqlite3.connect(DB_PATH)
+    c    = conn.cursor()
+    c.execute("SELECT subscription_started_at FROM subscribers WHERE chat_id=?", (str(chat_id),))
+    row  = c.fetchone()
+    conn.close()
+    return row[0] if row and row[0] else None
+
+
+def set_subscription_started_today(chat_id: str):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE subscribers SET subscription_started_at=? WHERE chat_id=?",
+        (str(date.today()), str(chat_id)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def infer_subscription_start(chat_id: str) -> date | None:
+    """First day of current period: stored value, or expiry minus plan length."""
+    conn = sqlite3.connect(DB_PATH)
+    c    = conn.cursor()
+    c.execute(
+        "SELECT subscription_started_at, expiry_date, tier FROM subscribers WHERE chat_id=?",
+        (str(chat_id),),
+    )
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return None
+    started, expiry, tier = row[0], row[1], int(row[2] or 0)
+    if started:
+        try:
+            return date.fromisoformat(started)
+        except ValueError:
+            pass
+    if expiry:
+        try:
+            d = int(TIER_SUBSCRIPTION_DAYS.get(tier, 30))
+            return date.fromisoformat(expiry) - timedelta(days=d)
+        except ValueError:
+            pass
+    return None
+
+
+def get_preferred_leverage(chat_id: str) -> int | None:
+    conn = sqlite3.connect(DB_PATH)
+    c    = conn.cursor()
+    c.execute("SELECT preferred_leverage FROM subscribers WHERE chat_id=?", (str(chat_id),))
+    row = c.fetchone()
+    conn.close()
+    if not row or row[0] is None:
+        return None
+    return int(row[0])
+
+
+def set_preferred_leverage(chat_id: str, value: int):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE subscribers SET preferred_leverage=? WHERE chat_id=?",
+        (int(value), str(chat_id)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def apply_subscription_cancellation(chat_id: str):
+    """Revoke license after user-confirmed cancellation; keeps broker row for renewal flow."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """UPDATE subscribers SET
+           license_key=NULL,
+           expiry_date=NULL,
+           payment_status='CANCELLED',
+           subscription_started_at=NULL,
+           trading_enabled=0,
+           preferred_leverage=NULL
+           WHERE chat_id=?""",
+        (str(chat_id),),
+    )
+    conn.commit()
+    conn.close()
 
 
 if __name__ == "__main__":

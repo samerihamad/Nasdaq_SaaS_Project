@@ -79,8 +79,8 @@ def issue_license(chat_id: str, days: int = 30) -> str:
 
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
-        "UPDATE subscribers SET license_key=?, expiry_date=? WHERE chat_id=?",
-        (key, expiry, chat_id)
+        "UPDATE subscribers SET license_key=?, expiry_date=?, subscription_started_at=? WHERE chat_id=?",
+        (key, expiry, str(date.today()), chat_id)
     )
     conn.commit()
     conn.close()

@@ -35,12 +35,17 @@ from bot.licensing import (
     safe_decrypt, validate_license_key,
 )
 from bot.notifier import send_telegram_message, notify_admin_payment
-from core.risk_manager import apply_manual_override, apply_stop_today
+from core.risk_manager import (
+    apply_manual_override, apply_stop_today,
+    get_effective_leverage, get_user_max_leverage,
+)
 from core.executor import get_user_credentials, get_session
 from bot.admin import admin_handler
 from database.db_manager import (
     create_db, get_bank_details, get_user_tier,
     get_trading_enabled, set_trading_enabled,
+    apply_subscription_cancellation, get_preferred_leverage,
+    set_preferred_leverage, infer_subscription_start,
 )
 from utils.market_hours import (
     get_market_status,
@@ -162,6 +167,8 @@ def _get_user_onboarding_state(chat_id: str) -> str:
     """
     Returns one of:
       FULLY_ACTIVE     — has API credentials + valid license
+      NEEDS_RENEWAL    — has credentials + stale license row (expired); clear and renew
+      APPROVED_MISSING_LICENSE — paid (APPROVED) but license_key missing; ask for key, not bank
       LICENSE_READY    — admin approved, license issued, waiting for API creds
       PAYMENT_PENDING  — proof uploaded, awaiting admin review
       PAYMENT_REJECTED — admin rejected the payment
@@ -175,11 +182,18 @@ def _get_user_onboarding_state(chat_id: str) -> str:
         return 'NEW'
 
     if sub.get('email'):
-        return 'FULLY_ACTIVE'
+        valid, _ = check_license(chat_id)
+        if valid:
+            return 'FULLY_ACTIVE'
+        ps0 = sub.get('payment_status', 'NONE')
+        if ps0 != 'PENDING' and sub.get('license_key'):
+            return 'NEEDS_RENEWAL'
+        if ps0 == 'APPROVED' and not sub.get('license_key'):
+            return 'APPROVED_MISSING_LICENSE'
 
     ps = sub.get('payment_status', 'NONE')
 
-    if sub.get('license_key') and ps == 'APPROVED':
+    if sub.get('license_key') and ps == 'APPROVED' and not sub.get('email'):
         return 'LICENSE_READY'
 
     if ps == 'PENDING':
@@ -256,6 +270,54 @@ def _back_keyboard(lang: str):
     return InlineKeyboardMarkup([[
         InlineKeyboardButton(t('btn_back', lang), callback_data='main_menu')
     ]])
+
+
+def _can_cancel_subscription(chat_id: str) -> bool:
+    valid, _ = check_license(chat_id)
+    if not valid:
+        return False
+    conn = _db()
+    c    = conn.cursor()
+    c.execute("SELECT payment_status FROM subscribers WHERE chat_id=?", (chat_id,))
+    row = c.fetchone()
+    conn.close()
+    if not row or row[0] != 'APPROVED':
+        return False
+    start = infer_subscription_start(chat_id)
+    if not start:
+        return False
+    return (date.today() - start).days <= 30
+
+
+def _settings_menu_keyboard(lang: str, chat_id: str):
+    rows = []
+    if _can_cancel_subscription(chat_id):
+        rows.append([InlineKeyboardButton(
+            t('btn_cancel_subscription', lang), callback_data='settings_cancel_warn')])
+    rows.append([InlineKeyboardButton(
+        t('btn_leverage_settings', lang), callback_data='settings_leverage')])
+    rows.append([InlineKeyboardButton(
+        t('btn_update_broker', lang), callback_data='settings_broker_warn')])
+    rows.append([InlineKeyboardButton(t('btn_back', lang), callback_data='main_menu')])
+    return InlineKeyboardMarkup(rows)
+
+
+def _leverage_choice_keyboard(lang: str, tier: int, cap: int):
+    if tier <= 1:
+        nums = [1, 2]
+    else:
+        nums = list(range(1, cap + 1))
+    rows = []
+    row = []
+    for n in nums:
+        row.append(InlineKeyboardButton(f'{n}x', callback_data=f'lev_set_{n}'))
+        if len(row) >= 5:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(t('btn_back', lang), callback_data='settings')])
+    return InlineKeyboardMarkup(rows)
 
 
 def _contact_support_keyboard(lang: str):
@@ -387,6 +449,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     state = _get_user_onboarding_state(chat_id)
     lang  = _get_lang(chat_id)
+
+    # ── Expired license row but broker credentials still stored ─────────────
+    if state == 'NEEDS_RENEWAL':
+        _update_subscriber(chat_id,
+                           payment_status='NONE',
+                           license_key=None,
+                           expiry_date=None)
+        await update.message.reply_text(
+            t('license_expired', lang), parse_mode='Markdown'
+        )
+        await update.message.reply_text(
+            t('select_tier_title', lang),
+            reply_markup=_tier_keyboard(lang),
+            parse_mode='Markdown',
+        )
+        return SELECT_TIER
+
+    # ── Paid but license row missing (corruption / failed write) ────────────
+    if state == 'APPROVED_MISSING_LICENSE':
+        await update.message.reply_text(
+            t('approved_missing_license', lang),
+            reply_markup=_contact_support_keyboard(lang),
+            parse_mode='Markdown',
+        )
+        return ENTER_LICENSE
 
     # ── Already fully registered ───────────────────────────────────────────
     if state == 'FULLY_ACTIVE':
@@ -599,6 +686,8 @@ async def enter_license(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang        = _get_lang(chat_id)
     license_key = update.message.text.strip()
 
+    had_broker = bool(_get_subscriber(chat_id).get('email'))
+
     owner_id, expiry = validate_license_key(license_key)
     if not owner_id:
         await update.message.reply_text(
@@ -616,6 +705,14 @@ async def enter_license(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     conn.commit()
     conn.close()
+
+    if had_broker:
+        await update.message.reply_text(
+            t('license_linked_resume', lang), parse_mode='Markdown'
+        )
+        _schedule_status_job(context, chat_id)
+        await _show_main_menu(update, context)
+        return ConversationHandler.END
 
     await update.message.reply_text(t('broker_intro', lang), parse_mode='Markdown')
     return GET_EMAIL
@@ -708,9 +805,10 @@ async def _handle_approve_payment(query, chat_id: str, user_chat_id: str):
     conn = _db()
     conn.execute(
         """UPDATE subscribers
-           SET license_key=?, expiry_date=?, payment_status='APPROVED'
+           SET license_key=?, expiry_date=?, payment_status='APPROVED',
+               subscription_started_at=?
            WHERE chat_id=?""",
-        (license_key, expiry, user_chat_id)
+        (license_key, expiry, str(date.today()), user_chat_id)
     )
     conn.commit()
     conn.close()
@@ -1050,18 +1148,84 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=_back_keyboard(lang), parse_mode='Markdown'
         )
 
-    # ── Settings (clear broker creds, re-enter) ────────────────────────────
+    # ── Settings (cancel sub, leverage, broker update) ─────────────────────
     elif data == 'settings':
-        conn = _db()
-        conn.execute(
-            "UPDATE subscribers SET email=NULL, api_password=NULL, api_key=NULL "
-            "WHERE chat_id=?",
-            (chat_id,)
-        )
-        conn.commit()
-        conn.close()
         await query.edit_message_text(
-            t('settings_reset', lang), parse_mode='Markdown'
+            t('settings_menu_intro', lang),
+            reply_markup=_settings_menu_keyboard(lang, chat_id),
+            parse_mode='Markdown',
+        )
+
+    elif data == 'settings_cancel_warn':
+        if not _can_cancel_subscription(chat_id):
+            await query.answer(t('cancel_sub_not_available', lang), show_alert=True)
+            return
+        await query.edit_message_text(
+            t('cancel_sub_warning', lang),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    t('btn_cancel_confirm', lang), callback_data='settings_cancel_do')],
+                [InlineKeyboardButton(t('btn_back', lang), callback_data='settings')],
+            ]),
+            parse_mode='Markdown',
+        )
+
+    elif data == 'settings_cancel_do':
+        if not _can_cancel_subscription(chat_id):
+            await query.answer(t('cancel_sub_not_available', lang), show_alert=True)
+            return
+        apply_subscription_cancellation(chat_id)
+        await query.edit_message_text(
+            t('cancel_sub_done', lang), parse_mode='Markdown'
+        )
+        await asyncio.sleep(2.5)
+        await _show_main_menu(update, context, edit=True)
+
+    elif data == 'settings_leverage':
+        tier = get_user_tier(chat_id)
+        cap  = get_user_max_leverage(chat_id)
+        eff  = get_effective_leverage(chat_id)
+        await query.edit_message_text(
+            t('leverage_settings_body', lang, cap=cap, current=eff)
+            + '\n\n' + t('leverage_disclaimer', lang),
+            reply_markup=_leverage_choice_keyboard(lang, tier, cap),
+            parse_mode='Markdown',
+        )
+
+    elif data.startswith('lev_set_'):
+        try:
+            n = int(data.split('_', 2)[2])
+        except (ValueError, IndexError):
+            await query.answer()
+            return
+        cap = get_user_max_leverage(chat_id)
+        if n < 1 or n > cap:
+            await query.answer(t('leverage_invalid', lang), show_alert=True)
+            return
+        set_preferred_leverage(chat_id, n)
+        await query.edit_message_text(
+            t('leverage_saved', lang, leverage=n, cap=cap)
+            + '\n\n' + t('leverage_disclaimer', lang),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(t('btn_back', lang), callback_data='settings')]]),
+            parse_mode='Markdown',
+        )
+
+    elif data == 'settings_broker_warn':
+        await query.edit_message_text(
+            t('settings_broker_warn_text', lang),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    t('btn_broker_clear_confirm', lang), callback_data='settings_broker_do')],
+                [InlineKeyboardButton(t('btn_back', lang), callback_data='settings')],
+            ]),
+            parse_mode='Markdown',
+        )
+
+    elif data == 'settings_broker_do':
+        _clear_credentials(chat_id)
+        await query.edit_message_text(
+            t('settings_broker_cleared', lang), parse_mode='Markdown'
         )
 
     # ── Hybrid signal: approve ─────────────────────────────────────────────
