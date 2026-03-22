@@ -289,7 +289,14 @@ STRINGS = {
     'btn_switch_hybrid':   {'ar': '🔄 تفعيل الوضع الهجين','en': '🔄 Switch to Hybrid'},
     'btn_engine_start':    {'ar': '▶ تشغيل التداول',      'en': '▶ Start Trading'},
     'btn_engine_stop':     {'ar': '⏹ إيقاف التداول',     'en': '⏹ Stop Trading'},
-    'btn_stop_trading':    {'ar': '🛑 إيقاف التداول لكامل هذا اليوم', 'en': '🛑 Halt trading for today'},
+    'btn_day_halt': {
+        'ar': '🛑 حجب التداول ليوم كامل',
+        'en': '🛑 Block trading for the rest of today',
+    },
+    'btn_resume_day_trading': {
+        'ar': '▶ استئناف التداول (إلغاء الحجب)',
+        'en': '▶ Resume trading (lift block)',
+    },
     'btn_settings':        {'ar': '⚙️ الإعدادات',         'en': '⚙️ Settings'},
 
     # ── Trading engine status lines (shown in dashboard header) ───────────────
@@ -317,6 +324,18 @@ STRINGS = {
         'en': (
             '🔴 *System HALTED* — no new trades until the next trading session opens.\n'
             'Open positions remain active until TP or SL.'
+        ),
+    },
+    'engine_status_day_block': {
+        'ar': (
+            '🔴 *النظام متوقف* — *حجب التداول ليوم كامل* (تم إيقاف المحرك).\n'
+            'لا صفقات جديدة حتى افتتاح جلسة التداول القادمة.\n'
+            'اضغط ▶ استئناف التداول لإلغاء الحجب وتشغيل المحرك تلقائياً.'
+        ),
+        'en': (
+            '🔴 *System HALTED* — *full-day block* active (engine stopped).\n'
+            'No new trades until the next trading session opens.\n'
+            'Press ▶ Resume trading to lift the block and restart the engine.'
         ),
     },
 
@@ -706,17 +725,39 @@ STRINGS = {
     },
 
     # ── Stop trading ──────────────────────────────────────────────────────────
-    'trading_stopped': {
+    'day_halt_applied': {
         'ar': (
-            '🛑 *تم إيقاف فتح صفقات جديدة لكامل هذا اليوم*\n\n'
-            'لن تُفتح صفقات جديدة حتى افتتاح جلسة التداول القادمة.\n'
-            'الصفقات المفتوحة تبقى نشطة حتى TP أو SL.'
+            '🛑 *تم تفعيل حجب التداول ليوم كامل*\n\n'
+            '• تم إيقاف محرك التداول.\n'
+            '• لن تُفتح صفقات جديدة حتى افتتاح جلسة التداول القادمة.\n'
+            '• الصفقات المفتوحة تبقى نشطة حتى TP أو SL.\n\n'
+            'اضغط ▶ *استئناف التداول* من لوحة التحكم عندما ترغب بالعودة.'
         ),
         'en': (
-            '🛑 *New entries halted for the rest of today*\n\n'
-            'No new trades until the next trading session opens.\n'
-            'Open positions remain active until TP or SL.'
+            '🛑 *Full-day trading block enabled*\n\n'
+            '• Trading engine stopped.\n'
+            '• No new trades until the next trading session opens.\n'
+            '• Open positions remain active until TP or SL.\n\n'
+            'Press ▶ *Resume trading* on the dashboard when you want to continue.'
         ),
+    },
+    'day_halt_resumed': {
+        'ar': (
+            '✅ *تم إلغاء الحجب وتشغيل محرك التداول.*\n\n'
+            'عاد النظام للوضع الطبيعي ويراقب السوق من جديد.'
+        ),
+        'en': (
+            '✅ *Block lifted — trading engine started.*\n\n'
+            'The system is back to normal and monitoring the market again.'
+        ),
+    },
+    'resume_day_noop': {
+        'ar': 'لا يوجد حجب يوم كامل نشط حالياً.',
+        'en': 'No full-day block is active.',
+    },
+    'use_resume_to_lift_halt': {
+        'ar': 'الحجب ليوم كامل مفعّل — استخدم زر ▶ استئناف التداول لإلغاء الحجب.',
+        'en': 'Full-day block is on — use ▶ Resume trading to lift it.',
     },
 
     # ── Tier info (shown in dashboard) ────────────────────────────────────────

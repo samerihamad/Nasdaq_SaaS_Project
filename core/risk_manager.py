@@ -3,6 +3,7 @@ Risk Management Engine — NATB v2.0
 
 State machine per user per day:
   NORMAL          → trading allowed
+  USER_DAY_HALT   → user blocked the rest of the day; engine off; resume from dashboard
   CIRCUIT_BREAKER → 2 consecutive losses; no new entries; Telegram prompt sent
   MANUAL_OVERRIDE → user approved one extra trade after Circuit Breaker
   HARD_BLOCK      → manual override trade was a loss; fully locked until next day
@@ -16,13 +17,14 @@ from datetime import date
 from bot.notifier import send_telegram_message
 from database.db_manager import (
     is_master_kill_switch, get_user_kill_switch, get_user_risk_params,
-    get_user_tier, get_preferred_leverage,
+    get_user_tier, get_preferred_leverage, set_trading_enabled,
 )
 
 STATE_NORMAL          = 'NORMAL'
 STATE_CIRCUIT_BREAKER = 'CIRCUIT_BREAKER'
 STATE_MANUAL_OVERRIDE = 'MANUAL_OVERRIDE'
 STATE_HARD_BLOCK      = 'HARD_BLOCK'
+STATE_USER_DAY_HALT   = 'USER_DAY_HALT'
 
 CONSECUTIVE_LOSS_LIMIT = 2
 DB_PATH = 'database/trading_saas.db'
@@ -159,6 +161,8 @@ def can_open_trade(chat_id):
     state = get_risk_state(chat_id)
     if state in (STATE_NORMAL, STATE_MANUAL_OVERRIDE):
         return True, state
+    if state == STATE_USER_DAY_HALT:
+        return False, "Full-day halt active — resume from dashboard to trade again"
     if state == STATE_CIRCUIT_BREAKER:
         return False, "Circuit Breaker active — awaiting your Telegram approval"
     if state == STATE_HARD_BLOCK:
@@ -190,6 +194,9 @@ def record_trade_result(chat_id, pnl: float):
     # Determine new state
     if prev_state == STATE_MANUAL_OVERRIDE:
         new_state = STATE_HARD_BLOCK if is_loss else STATE_NORMAL
+    elif prev_state == STATE_USER_DAY_HALT:
+        # Stay in user day-halt until they resume from the dashboard
+        new_state = STATE_USER_DAY_HALT
     elif consecutive >= CONSECUTIVE_LOSS_LIMIT and prev_state == STATE_NORMAL:
         new_state = STATE_CIRCUIT_BREAKER
     else:
@@ -259,17 +266,44 @@ def apply_manual_override(chat_id):
     return True, "تم تفعيل التجاوز اليدوي."
 
 
-def apply_stop_today(chat_id):
-    """Process /stop_today — blocks new entries until next trading day (same gate as circuit breaker)."""
+def apply_day_halt(chat_id: str):
+    """
+    User-requested full-day block: no new entries, trading engine off.
+    Distinct from automatic CIRCUIT_BREAKER (two losses).
+    """
     db = _conn()
     c = db.cursor()
     _get_or_reset_state(c, chat_id)
     c.execute(
         "UPDATE daily_risk_state SET state=? WHERE chat_id=?",
-        (STATE_CIRCUIT_BREAKER, chat_id)
+        (STATE_USER_DAY_HALT, chat_id),
     )
     db.commit()
     db.close()
+    set_trading_enabled(chat_id, False)
+
+
+def resume_day_halt(chat_id: str) -> bool:
+    """Clear USER_DAY_HALT and turn the trading engine back on."""
+    db = _conn()
+    c = db.cursor()
+    data = _get_or_reset_state(c, chat_id)
+    if data['state'] != STATE_USER_DAY_HALT:
+        db.close()
+        return False
+    c.execute(
+        "UPDATE daily_risk_state SET consecutive_losses=0, state=? WHERE chat_id=?",
+        (STATE_NORMAL, chat_id),
+    )
+    db.commit()
+    db.close()
+    set_trading_enabled(chat_id, True)
+    return True
+
+
+def apply_stop_today(chat_id):
+    """Alias: /stop_today — same as full-day block (engine off + USER_DAY_HALT)."""
+    apply_day_halt(chat_id)
 
 
 # ── Position sizing ───────────────────────────────────────────────────────────

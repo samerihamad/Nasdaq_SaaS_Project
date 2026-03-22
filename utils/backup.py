@@ -519,10 +519,8 @@ def run_backup() -> bool:
         if admin_id:
             send_telegram_message(
                 admin_id,
-                f"✅ *نسخ احتياطي مشفّر — اكتمل*\n"
-                f"الموفر: `{provider}`\n"
-                f"الملف: `{enc_path.name}`\n"
-                f"الوقت: {now_str}"
+                f"✅ *تم إكمال النسخ الاحتياطي المشفّر الروتيني*\n"
+                f"📅 {now_str}"
             )
         return True
 

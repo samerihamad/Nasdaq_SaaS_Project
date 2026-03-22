@@ -8,7 +8,7 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     CallbackQueryHandler, filters, ContextTypes, ConversationHandler
 )
-from core.risk_manager import apply_manual_override, apply_stop_today
+from core.risk_manager import apply_manual_override, apply_day_halt
 from bot.i18n import t
 from database.db_manager import get_subscriber_lang
 
@@ -155,9 +155,9 @@ async def override_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def stop_today_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.message.chat_id)
-    apply_stop_today(chat_id)
+    apply_day_halt(chat_id)
     lang = get_subscriber_lang(chat_id)
-    await update.message.reply_text(t('trading_stopped', lang), parse_mode='Markdown')
+    await update.message.reply_text(t('day_halt_applied', lang), parse_mode='Markdown')
 
 
 # --- 5. التشغيل ---
