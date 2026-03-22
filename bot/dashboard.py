@@ -38,8 +38,7 @@ from bot.notifier import send_telegram_message, notify_admin_payment
 from core.risk_manager import (
     apply_manual_override, apply_day_halt, resume_day_halt,
     get_effective_leverage, get_user_max_leverage,
-    get_risk_state,
-    STATE_CIRCUIT_BREAKER, STATE_HARD_BLOCK, STATE_USER_DAY_HALT,
+    get_risk_state, STATE_USER_DAY_HALT,
 )
 from core.executor import get_user_credentials, get_session
 from bot.admin import admin_handler
@@ -238,8 +237,8 @@ def _paid_keyboard(lang: str):
     ]])
 
 
-def _main_keyboard(lang: str, mode: str, trading: bool, chat_id: str):
-    risk = get_risk_state(chat_id)
+def _main_keyboard(lang: str, mode: str, trading: bool):
+    """Main menu: Start/Stop = pause only. Full-day block lives under Settings."""
     mode_btn = (
         t('btn_mode_auto',    lang) if mode == 'AUTO'
         else t('btn_mode_hybrid', lang)
@@ -248,30 +247,15 @@ def _main_keyboard(lang: str, mode: str, trading: bool, chat_id: str):
         t('btn_switch_hybrid', lang) if mode == 'AUTO'
         else t('btn_switch_auto', lang)
     )
-    # Row 1: while full-day halt is active, only "resume" (restarts engine + clears halt)
-    if risk == STATE_USER_DAY_HALT:
-        row_engine = [
-            InlineKeyboardButton(
-                t('btn_resume_day_trading', lang), callback_data='resume_day_halt'
-            ),
-        ]
-    else:
-        engine_btn = (
-            InlineKeyboardButton(t('btn_engine_stop',  lang), callback_data='toggle_engine')
-            if trading else
-            InlineKeyboardButton(t('btn_engine_start', lang), callback_data='toggle_engine')
-        )
-        row_engine = [engine_btn]
-
-    if risk in (STATE_USER_DAY_HALT, STATE_CIRCUIT_BREAKER, STATE_HARD_BLOCK):
-        row_halt_settings = [
-            InlineKeyboardButton(t('btn_settings', lang), callback_data='settings'),
-        ]
-    else:
-        row_halt_settings = [
-            InlineKeyboardButton(t('btn_day_halt', lang), callback_data='stop_today'),
-            InlineKeyboardButton(t('btn_settings',     lang), callback_data='settings'),
-        ]
+    engine_btn = (
+        InlineKeyboardButton(t('btn_engine_stop',  lang), callback_data='toggle_engine')
+        if trading else
+        InlineKeyboardButton(t('btn_engine_start', lang), callback_data='toggle_engine')
+    )
+    row_engine = [engine_btn]
+    row_settings = [
+        InlineKeyboardButton(t('btn_settings', lang), callback_data='settings'),
+    ]
 
     return InlineKeyboardMarkup([
         row_engine,
@@ -283,7 +267,7 @@ def _main_keyboard(lang: str, mode: str, trading: bool, chat_id: str):
         [InlineKeyboardButton(t('btn_license',  lang), callback_data='license'),
          InlineKeyboardButton(t('btn_lang',     lang), callback_data='toggle_lang')],
         [InlineKeyboardButton(t('btn_tier_info', lang), callback_data='tier_info')],
-        row_halt_settings,
+        row_settings,
         [InlineKeyboardButton(t('btn_support',      lang), callback_data='support')],
     ])
 
@@ -316,6 +300,13 @@ def _settings_menu_keyboard(lang: str, chat_id: str):
     if _can_cancel_subscription(chat_id):
         rows.append([InlineKeyboardButton(
             t('btn_cancel_subscription', lang), callback_data='settings_cancel_warn')])
+    risk = get_risk_state(chat_id)
+    if risk == STATE_USER_DAY_HALT:
+        rows.append([InlineKeyboardButton(
+            t('btn_resume_day_trading', lang), callback_data='settings_resume_day_halt')])
+    else:
+        rows.append([InlineKeyboardButton(
+            t('btn_day_halt', lang), callback_data='settings_day_halt')])
     rows.append([InlineKeyboardButton(
         t('btn_leverage_settings', lang), callback_data='settings_leverage')])
     rows.append([InlineKeyboardButton(
@@ -374,8 +365,8 @@ def _engine_status_line(chat_id: str, lang: str) -> str:
     trading = get_trading_enabled(chat_id)
     if not trading:
         return t('engine_status_off', lang)
-    if risk in (STATE_CIRCUIT_BREAKER, STATE_HARD_BLOCK):
-        return t('engine_status_halted_day', lang)
+    # Engine on: show market activity. Risk limits (circuit breaker, etc.) do not
+    # replace "system running" here — that is pause vs run only.
     market = get_market_status()
     if market == STATUS_OPEN:
         return t('engine_status_on_open', lang)
@@ -393,7 +384,7 @@ async def _show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE,
     name    = update.effective_user.first_name or ''
     name    = name.replace('_', '\\_').replace('*', '\\*').replace('`', '\\`').replace('[', '\\[')
     text    = t('main_menu_title', lang, name=name) + '\n\n' + _engine_status_line(chat_id, lang)
-    markup  = _main_keyboard(lang, mode, trading, chat_id)
+    markup  = _main_keyboard(lang, mode, trading)
 
     if edit and update.callback_query:
         await update.callback_query.edit_message_text(
@@ -1094,7 +1085,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Toggle trading engine on / off ────────────────────────────────────
     elif data == 'toggle_engine':
         if get_risk_state(chat_id) == STATE_USER_DAY_HALT:
-            await query.answer(t('use_resume_to_lift_halt', lang), show_alert=True)
+            await query.answer(t('use_resume_in_settings', lang), show_alert=True)
             return
         currently_on = get_trading_enabled(chat_id)
         new_state    = not currently_on
@@ -1181,8 +1172,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _set_lang(chat_id, new_lang)
         await _show_main_menu(update, context, edit=True)
 
-    # ── Full-day halt (engine off + USER_DAY_HALT) ──────────────────────────
-    elif data == 'stop_today':
+    # ── Full-day halt (Settings, /stop_today, or legacy callback stop_today) ──
+    elif data in ('stop_today', 'settings_day_halt'):
         apply_day_halt(chat_id)
         await query.edit_message_text(
             t('day_halt_applied', lang), parse_mode='Markdown'
@@ -1190,7 +1181,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(2)
         await _show_main_menu(update, context, edit=True)
 
-    elif data == 'resume_day_halt':
+    elif data in ('resume_day_halt', 'settings_resume_day_halt'):
         ok = resume_day_halt(chat_id)
         if not ok:
             await query.answer(t('resume_day_noop', lang), show_alert=True)

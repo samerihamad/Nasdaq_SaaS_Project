@@ -330,12 +330,12 @@ STRINGS = {
         'ar': (
             '🔴 *النظام متوقف* — *حجب التداول ليوم كامل* (تم إيقاف المحرك).\n'
             'لا صفقات جديدة حتى افتتاح جلسة التداول القادمة.\n'
-            'اضغط ▶ استئناف التداول لإلغاء الحجب وتشغيل المحرك تلقائياً.'
+            'لإلغاء الحجب: من *⚙️ الإعدادات* → ▶ استئناف التداول (إلغاء الحجب).'
         ),
         'en': (
             '🔴 *System HALTED* — *full-day block* active (engine stopped).\n'
             'No new trades until the next trading session opens.\n'
-            'Press ▶ Resume trading to lift the block and restart the engine.'
+            'To lift the block: *⚙️ Settings* → ▶ Resume trading (lift block).'
         ),
     },
 
@@ -618,10 +618,14 @@ STRINGS = {
     'settings_menu_intro': {
         'ar': (
             '⚙️ *الإعدادات*\n\n'
+            'من هنا يمكنك *حجب التداول ليوم كامل* (بدون إغلاق الصفقات المفتوحة) أو إلغاء الحجب.\n'
+            'تشغيل/إيقاف المحرك من لوحة التحكم الرئيسية هو إيقاف مؤقت فقط.\n\n'
             'اختر أحد الخيارات أدناه. لن يُمس الترخيص أو الاشتراك إلا إذا اخترت ذلك صراحة.'
         ),
         'en': (
             '⚙️ *Settings*\n\n'
+            'Use *Block trading for the rest of today* here (open positions stay active) or lift that block.\n'
+            'Start/Stop on the main dashboard is a temporary pause only.\n\n'
             'Choose an option below. Your license is not changed unless you explicitly cancel or update broker data.'
         ),
     },
@@ -731,14 +735,14 @@ STRINGS = {
             '• تم إيقاف محرك التداول.\n'
             '• لن تُفتح صفقات جديدة حتى افتتاح جلسة التداول القادمة.\n'
             '• الصفقات المفتوحة تبقى نشطة حتى TP أو SL.\n\n'
-            'اضغط ▶ *استئناف التداول* من لوحة التحكم عندما ترغب بالعودة.'
+            'لإلغاء الحجب لاحقاً: *⚙️ الإعدادات* → ▶ استئناف التداول (إلغاء الحجب).'
         ),
         'en': (
             '🛑 *Full-day trading block enabled*\n\n'
             '• Trading engine stopped.\n'
             '• No new trades until the next trading session opens.\n'
             '• Open positions remain active until TP or SL.\n\n'
-            'Press ▶ *Resume trading* on the dashboard when you want to continue.'
+            'To lift the block later: *⚙️ Settings* → ▶ Resume trading (lift block).'
         ),
     },
     'day_halt_resumed': {
@@ -755,9 +759,9 @@ STRINGS = {
         'ar': 'لا يوجد حجب يوم كامل نشط حالياً.',
         'en': 'No full-day block is active.',
     },
-    'use_resume_to_lift_halt': {
-        'ar': 'الحجب ليوم كامل مفعّل — استخدم زر ▶ استئناف التداول لإلغاء الحجب.',
-        'en': 'Full-day block is on — use ▶ Resume trading to lift it.',
+    'use_resume_in_settings': {
+        'ar': 'حجب التداول ليوم كامل مفعّل — ألغِ الحجب من ⚙️ الإعدادات (استئناف التداول).',
+        'en': 'Full-day block is on — lift it from ⚙️ Settings (Resume trading).',
     },
 
     # ── Tier info (shown in dashboard) ────────────────────────────────────────
