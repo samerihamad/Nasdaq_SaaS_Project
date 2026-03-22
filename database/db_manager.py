@@ -241,6 +241,15 @@ def set_bank_field(field: str, value: str) -> bool:
 
 # ── Trading engine on/off per subscriber ──────────────────────────────────────
 
+def get_subscriber_lang(chat_id: str) -> str:
+    conn = sqlite3.connect(DB_PATH)
+    c    = conn.cursor()
+    c.execute("SELECT lang FROM subscribers WHERE chat_id=?", (str(chat_id),))
+    row  = c.fetchone()
+    conn.close()
+    return (row[0] if row and row[0] else 'ar')
+
+
 def get_trading_enabled(chat_id: str) -> bool:
     conn = sqlite3.connect(DB_PATH)
     c    = conn.cursor()

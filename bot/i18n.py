@@ -289,7 +289,7 @@ STRINGS = {
     'btn_switch_hybrid':   {'ar': '🔄 تفعيل الوضع الهجين','en': '🔄 Switch to Hybrid'},
     'btn_engine_start':    {'ar': '▶ تشغيل التداول',      'en': '▶ Start Trading'},
     'btn_engine_stop':     {'ar': '⏹ إيقاف التداول',     'en': '⏹ Stop Trading'},
-    'btn_stop_trading':    {'ar': '🛑 إيقاف اليوم',       'en': '🛑 Stop Today'},
+    'btn_stop_trading':    {'ar': '🛑 إيقاف التداول لكامل هذا اليوم', 'en': '🛑 Halt trading for today'},
     'btn_settings':        {'ar': '⚙️ الإعدادات',         'en': '⚙️ Settings'},
 
     # ── Trading engine status lines (shown in dashboard header) ───────────────
@@ -308,6 +308,16 @@ STRINGS = {
     'engine_status_on_premarket': {
         'ar': '🟡 *النظام يعمل* — جلسة ما قبل السوق. تبدأ الجلسة الرسمية قريباً.',
         'en': '🟡 *System RUNNING* — pre-market session. Regular session starts soon.',
+    },
+    'engine_status_halted_day': {
+        'ar': (
+            '🔴 *النظام متوقف* — لا صفقات جديدة حتى افتتاح جلسة التداول القادمة.\n'
+            'الصفقات المفتوحة تبقى نشطة حتى TP أو SL.'
+        ),
+        'en': (
+            '🔴 *System HALTED* — no new trades until the next trading session opens.\n'
+            'Open positions remain active until TP or SL.'
+        ),
     },
 
     # ── Trading start/stop notifications ──────────────────────────────────────
@@ -697,8 +707,16 @@ STRINGS = {
 
     # ── Stop trading ──────────────────────────────────────────────────────────
     'trading_stopped': {
-        'ar': '🛑 تم إيقاف التداول حتى إشعار آخر.',
-        'en': '🛑 Trading stopped until further notice.',
+        'ar': (
+            '🛑 *تم إيقاف فتح صفقات جديدة لكامل هذا اليوم*\n\n'
+            'لن تُفتح صفقات جديدة حتى افتتاح جلسة التداول القادمة.\n'
+            'الصفقات المفتوحة تبقى نشطة حتى TP أو SL.'
+        ),
+        'en': (
+            '🛑 *New entries halted for the rest of today*\n\n'
+            'No new trades until the next trading session opens.\n'
+            'Open positions remain active until TP or SL.'
+        ),
     },
 
     # ── Tier info (shown in dashboard) ────────────────────────────────────────

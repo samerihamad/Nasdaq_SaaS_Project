@@ -38,6 +38,7 @@ from bot.notifier import send_telegram_message, notify_admin_payment
 from core.risk_manager import (
     apply_manual_override, apply_stop_today,
     get_effective_leverage, get_user_max_leverage,
+    get_risk_state, STATE_CIRCUIT_BREAKER, STATE_HARD_BLOCK,
 )
 from core.executor import get_user_credentials, get_session
 from bot.admin import admin_handler
@@ -349,6 +350,9 @@ def _engine_status_line(chat_id: str, lang: str) -> str:
     trading = get_trading_enabled(chat_id)
     if not trading:
         return t('engine_status_off', lang)
+    risk = get_risk_state(chat_id)
+    if risk in (STATE_CIRCUIT_BREAKER, STATE_HARD_BLOCK):
+        return t('engine_status_halted_day', lang)
     market = get_market_status()
     if market == STATUS_OPEN:
         return t('engine_status_on_open', lang)

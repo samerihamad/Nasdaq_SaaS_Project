@@ -260,21 +260,16 @@ def apply_manual_override(chat_id):
 
 
 def apply_stop_today(chat_id):
-    """Process /stop_today command."""
+    """Process /stop_today — blocks new entries until next trading day (same gate as circuit breaker)."""
     db = _conn()
-    db.execute(
+    c = db.cursor()
+    _get_or_reset_state(c, chat_id)
+    c.execute(
         "UPDATE daily_risk_state SET state=? WHERE chat_id=?",
         (STATE_CIRCUIT_BREAKER, chat_id)
     )
     db.commit()
     db.close()
-
-    send_telegram_message(
-        chat_id,
-        "🛑 *تم الإيقاف حتى الغد*\n"
-        "لن تُفتح صفقات جديدة اليوم.\n"
-        "الصفقات المفتوحة تبقى نشطة حتى TP أو SL."
-    )
 
 
 # ── Position sizing ───────────────────────────────────────────────────────────
