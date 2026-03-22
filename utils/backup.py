@@ -19,7 +19,8 @@ Required .env variables:
        GDRIVE_AUTH=oauth
        GDRIVE_OAUTH_CLIENT_JSON = OAuth Desktop client JSON from Google Cloud
        GDRIVE_OAUTH_TOKEN_JSON  = optional path for saved token (default: config/gdrive_token.json)
-       First backup must run once in main thread: python -m utils.backup (browser login).
+       First backup must run once in main thread: python -m utils.backup
+       VPS/SSH: GDRIVE_OAUTH_CONSOLE=1 python -m utils.backup — open the printed URL, then paste the redirect URL or code.
        If Google says the app is in testing: OAuth consent screen → Test users → add your Gmail.
 
 Run from the project root folder (where the `utils` folder lives). Do not run from
@@ -39,6 +40,7 @@ import shutil
 import datetime
 import threading
 from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
 from cryptography.fernet import Fernet
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -54,6 +56,64 @@ def _load_project_env() -> None:
     except ImportError:
         return
     load_dotenv(PROJECT_ROOT / '.env')
+
+
+def _gdrive_oauth_use_console() -> bool:
+    """True = OAuth via terminal (URL + auth code). Use on headless VPS over SSH."""
+    return os.getenv('GDRIVE_OAUTH_CONSOLE', '').lower() in ('1', 'true', 'yes')
+
+
+def _parse_oauth_redirect_paste(raw: str) -> str:
+    """Extract authorization code from full redirect URL or raw code string."""
+    s = raw.strip().strip('"').strip("'")
+    if not s:
+        raise EnvironmentError("Empty input.")
+    if s.startswith("python ") or s.startswith("python3 ") or "-m utils.backup" in s:
+        raise EnvironmentError(
+            "لصق رابط إعادة التوجيه (يبدأ بـ http) أو قيمة code فقط — وليس أمر python. "
+            "شغّل من جديد: GDRIVE_OAUTH_CONSOLE=1 python -m utils.backup ثم الصق عند السؤال فقط."
+        )
+    if s.startswith("http"):
+        parsed = urlparse(s)
+        code = (parse_qs(parsed.query).get("code") or [None])[0]
+        if not code:
+            raise EnvironmentError("Could not find a 'code' in that URL.")
+        return unquote(code)
+    if "code=" in s:
+        m = re.search(r"(?:^|[?&])code=([^&]+)", s)
+        if m:
+            return unquote(m.group(1))
+    return unquote(s)
+
+
+def _gdrive_oauth_console_flow(flow, port: int):
+    """
+    google-auth-oauthlib 1.x removed InstalledAppFlow.run_console().
+    Headless VPS: open URL on any device/browser, then paste the redirect URL or raw code.
+    """
+    flow.redirect_uri = f"http://localhost:{port}/"
+    auth_url, _ = flow.authorization_url()
+    print(
+        "\n[VPS OAuth] Open this URL in a browser (signed in to the Google account):\n",
+        flush=True,
+    )
+    print(auth_url, flush=True)
+    print(
+        "\n---\n"
+        "AR: بعد الموافقة، Google يوجّهك إلى localhost — غالباً تظهر \"الصفحة لا تعمل\" أو ERR_CONNECTION_REFUSED.\n"
+        "    هذا طبيعي. انسخ الرابط الكامل من شريط عنوان المتصفح (يحتوي code=...) ثم الصقه هنا في نفس الطرفية.\n"
+        "    ليس في المتصفح: الصق في نافذة SSH/الترمنال التي تشغّل فيها هذا الأمر.\n"
+        "    لا تلصق الرابط في سطر أوامر bash بعد انتهاء السكربت — الرمز & يفسّر كأوامر. الصق فقط عند سؤال Python أدناه.\n"
+        "EN: After consent, the redirect page may error — that is OK. Copy the FULL URL from the address bar\n"
+        "    (contains code=...) and paste it below in THIS terminal (where you ran python -m utils.backup).\n"
+        "    Do not paste the URL at a fresh bash prompt — & will break. Paste only when Python asks below.\n"
+        "---\n",
+        flush=True,
+    )
+    raw = input("Paste redirect URL or authorization code: ")
+    code = _parse_oauth_redirect_paste(raw)
+    flow.fetch_token(code=code)
+    return flow.credentials
 
 
 def _gdrive_supports_all_drives() -> bool:
@@ -232,12 +292,18 @@ def _gdrive_oauth_credentials():
 
     if threading.current_thread() is not threading.main_thread():
         raise EnvironmentError(
-            "GDRIVE OAuth: first login required. Stop the bot, open CMD in the project folder, "
-            "run: python -m utils.backup   (browser opens once), then restart."
+            "GDRIVE OAuth: first login required. Stop the bot, cd to project root, then run once:\n"
+            "  Windows/local:  python -m utils.backup\n"
+            "  VPS/SSH:        GDRIVE_OAUTH_CONSOLE=1 python -m utils.backup\n"
+            "Then: sudo systemctl restart nasdaq.service"
         )
 
     flow = InstalledAppFlow.from_client_secrets_file(client_path, scopes)
-    creds = flow.run_local_server(port=0)
+    if _gdrive_oauth_use_console():
+        port = int(os.getenv("GDRIVE_OAUTH_PORT", "8080"))
+        creds = _gdrive_oauth_console_flow(flow, port)
+    else:
+        creds = flow.run_local_server(port=0)
     Path(token_path).parent.mkdir(parents=True, exist_ok=True)
     with open(token_path, 'w', encoding='utf-8') as f:
         f.write(creds.to_json())
