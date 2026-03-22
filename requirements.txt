@@ -7,7 +7,8 @@ python-dotenv>=1.0.0
 requests>=2.28.0
 
 # ── Telegram bot (main.py imports bot.dashboard) ───────────────────────────
-python-telegram-bot>=21.0
+# [job-queue] enables Application.job_queue (hourly status in bot/dashboard.py)
+python-telegram-bot[job-queue]>=21.0
 
 # ── Crypto / subscriber credentials ────────────────────────────────────────
 cryptography>=41.0.0

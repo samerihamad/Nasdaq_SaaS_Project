@@ -364,6 +364,7 @@ async def _show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE,
     mode    = _get_mode(chat_id)
     trading = get_trading_enabled(chat_id)
     name    = update.effective_user.first_name or ''
+    name    = name.replace('_', '\\_').replace('*', '\\*').replace('`', '\\`').replace('[', '\\[')
     text    = t('main_menu_title', lang, name=name) + '\n\n' + _engine_status_line(chat_id, lang)
     markup  = _main_keyboard(lang, mode, trading)
 
@@ -429,9 +430,17 @@ async def _send_status_update(context: ContextTypes.DEFAULT_TYPE):
 
 def _schedule_status_job(context: ContextTypes.DEFAULT_TYPE, chat_id: str):
     """Start (or restart) the hourly status broadcast for a subscriber."""
-    for job in context.job_queue.get_jobs_by_name(f'status_{chat_id}'):
+    jq = context.job_queue
+    if jq is None:
+        # Without extras, PTB has no JobQueue — do not block the main menu.
+        print(
+            "[dashboard] JobQueue unavailable (pip install "
+            '"python-telegram-bot[job-queue]"). Hourly status jobs skipped.'
+        )
+        return
+    for job in jq.get_jobs_by_name(f'status_{chat_id}'):
         job.schedule_removal()
-    context.job_queue.run_repeating(
+    jq.run_repeating(
         _send_status_update,
         interval = 3600,
         first    = 10,          # first message 10 s after login
@@ -501,6 +510,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state == 'LICENSE_READY':
         sub  = _get_subscriber(chat_id)
         name = sub.get('first_name') or ''
+        name = name.replace('_', '\\_').replace('*', '\\*').replace('`', '\\`').replace('[', '\\[')
         await update.message.reply_text(
             t('enter_license_prompt', lang, name=name), parse_mode='Markdown'
         )
@@ -595,6 +605,7 @@ async def get_lastname(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _update_subscriber(chat_id, last_name=last_name)
     sub  = _get_subscriber(chat_id)
     name = sub.get('first_name', '')
+    name = name.replace('_', '\\_').replace('*', '\\*').replace('`', '\\`').replace('[', '\\[')
 
     await update.message.reply_text(
         t('welcome_name', lang, name=name), parse_mode='Markdown'
