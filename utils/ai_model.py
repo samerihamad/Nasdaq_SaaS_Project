@@ -6,7 +6,7 @@ Role: GATEKEEPER, not observer.
 Architecture:
   1. Technical strategies (MeanRev, Momentum, RF) generate a candidate signal.
   2. validate_signal() scores that specific direction using the RF model.
-     If probability < AI_PROBABILITY_THRESHOLD (70%), the trade is BLOCKED.
+     If probability < AI_PROBABILITY_THRESHOLD (65%), the trade is BLOCKED.
   3. detect_regime() classifies market context (TRENDING / RANGING / VOLATILE).
      A VOLATILE regime applies a probability penalty.
 
@@ -35,7 +35,7 @@ log = logging.getLogger(__name__)
 
 MODEL_DIR             = "models"
 MODEL_VERSION         = 2          # bump whenever build_features() columns change
-AI_PROBABILITY_THRESHOLD = 70.0    # minimum probability to approve a trade
+AI_PROBABILITY_THRESHOLD = 65.0    # minimum probability to approve a trade
 
 os.makedirs(MODEL_DIR, exist_ok=True)
 
@@ -339,7 +339,7 @@ def validate_signal(symbol: str, direction: str, timeframes: dict) -> tuple:
 
     # Regime penalty: high volatility = uncertain environment
     if regime['type'] == 'VOLATILE':
-        probability = round(probability * 0.88, 1)   # -12% penalty
+        probability = round(probability * 0.92, 1)   # -8% penalty
         log.info(
             "[AI Gate %s] VOLATILE regime penalty applied → probability=%.1f%%",
             symbol, probability,
