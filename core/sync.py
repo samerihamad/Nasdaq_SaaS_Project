@@ -118,7 +118,7 @@ def _fetch_closed_pnl(base_url, headers, deal_id):
         )
         if res.status_code == 200:
             for tx in res.json().get('transactions', []):
-                if tx.get('dealId') == deal_id:
+                if str(tx.get('dealId')) == str(deal_id):
                     return float(tx.get('profitAndLoss', 0))
     except Exception:
         pass

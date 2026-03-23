@@ -185,6 +185,36 @@ def _open_position_with_protection(base_url, headers, epic, action, size, stop_l
     return False, last_err or "unknown error"
 
 
+def _resolve_confirmed_deal_id(base_url, headers, order_response):
+    """
+    Resolve a real dealId from order response.
+    Capital may return dealReference first, while /positions uses dealId.
+    """
+    deal_id = order_response.get("dealId")
+    if deal_id:
+        return str(deal_id)
+
+    deal_ref = order_response.get("dealReference")
+    if not deal_ref:
+        return ""
+
+    # Confirmation can lag briefly after order placement.
+    import time as _time
+    for _ in range(5):
+        try:
+            res = requests.get(f"{base_url}/confirms/{deal_ref}", headers=headers)
+            if res.status_code == 200:
+                data = res.json() or {}
+                did = data.get("dealId")
+                if did:
+                    return str(did)
+        except Exception:
+            pass
+        _time.sleep(0.4)
+
+    return str(deal_ref)
+
+
 def _sync_stop_to_broker(base_url, headers, deal_id, stop_level):
     """
     Push updated trailing-stop level to Capital for an open position.
@@ -196,6 +226,35 @@ def _sync_stop_to_broker(base_url, headers, deal_id, stop_level):
     payloads = [
         {"stopLevel": stop_level},
         {"stopLevel": stop_level, "trailingStop": False},
+    ]
+    last_err = ""
+    for payload in payloads:
+        try:
+            res = requests.put(
+                f"{base_url}/positions/{deal_id}",
+                json=payload,
+                headers=headers,
+            )
+            if res.status_code == 200:
+                return True, "ok"
+            last_err = (res.text or "")[:300]
+        except Exception as exc:
+            last_err = str(exc)
+    return False, last_err or "unknown error"
+
+
+def _sync_protection_to_broker(base_url, headers, deal_id, stop_level, profit_level):
+    """
+    Ensure both SL and TP are set on broker for a live position.
+    Returns (ok: bool, info: str).
+    """
+    if not deal_id:
+        return False, "missing deal_id"
+
+    payloads = [
+        {"stopLevel": stop_level, "profitLevel": profit_level},
+        {"stopLevel": stop_level, "profitLevel": profit_level, "trailingStop": False},
+        {"profitLevel": profit_level},
     ]
     last_err = ""
     for payload in payloads:
@@ -483,9 +542,17 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             )
             break
 
-        deal_id = out.get('dealId') or out.get('dealReference', '')
+        deal_id = _resolve_confirmed_deal_id(base_url, headers, out)
         opened_legs.append((leg_size, leg_target, deal_id))
         record_open_trade(chat_id, symbol, action, entry_price, leg_size, deal_id, stop_level)
+        ok, info = _sync_protection_to_broker(
+            base_url, headers, deal_id, stop_level, leg_target
+        )
+        if not ok:
+            print(
+                f"⚠️  Broker TP/SL sync failed "
+                f"[{symbol} {deal_id}] sl={stop_level:.4f} tp={leg_target:.4f} :: {info}"
+            )
 
     # ── Notify (localized detailed trade report) ─────────────────────────────
     is_override  = (reason == STATE_MANUAL_OVERRIDE)
