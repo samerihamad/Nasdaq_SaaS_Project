@@ -324,12 +324,18 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             entry_price * (1 - effective_sl_pct) if action == 'BUY'
             else entry_price * (1 + effective_sl_pct)
         )
-        rr_ok, rr_ratio = check_rr_ratio(entry_price, stop_price, action, atr)
+        rr_ok, rr_ratio, rr_reason = check_rr_ratio(entry_price, stop_price, action, atr)
         if not rr_ok:
-            msg = (
-                f"❌ R:R {rr_ratio:.1f}:1 does not meet minimum 1:2 — "
-                f"setup discarded ({symbol} {action})"
-            )
+            if rr_reason == "target_beyond_atr_limit":
+                msg = (
+                    f"❌ R:R {rr_ratio:.1f}:1 rejected — target not achievable "
+                    f"within ATR limit ({symbol} {action})"
+                )
+            else:
+                msg = (
+                    f"❌ R:R {rr_ratio:.1f}:1 does not meet minimum 1:2 — "
+                    f"setup discarded ({symbol} {action})"
+                )
             send_telegram_message(chat_id, msg)
             return msg
     else:

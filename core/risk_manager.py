@@ -419,7 +419,7 @@ def check_daily_drawdown(chat_id: str, current_balance: float) -> tuple:
 def check_rr_ratio(entry: float, stop: float, direction: str,
                     atr: float, min_rr: float = MIN_RR_RATIO) -> tuple:
     """
-    Returns (passes: bool, rr_ratio: float).
+    Returns (passes: bool, rr_ratio: float, reason: str).
 
     Computes the natural RR of the setup:
       stop_distance = |entry - stop|
@@ -429,14 +429,21 @@ def check_rr_ratio(entry: float, stop: float, direction: str,
     (a move the market can realistically make in 1–3 sessions).
     A setup that cannot offer 1:2 is discarded before any order is sent.
     """
+    eps = 1e-9
     stop_dist = abs(entry - stop)
-    if stop_dist == 0 or atr <= 0:
-        return False, 0.0
+    if stop_dist <= eps or atr <= eps:
+        return False, 0.0, "invalid_stop_or_atr"
 
     target_dist = stop_dist * min_rr
     rr_ratio    = round(target_dist / stop_dist, 2)
 
-    # Target must be within 4 × ATR — beyond this it's unrealistic
-    achievable = target_dist <= (atr * 4)
+    # Target must be within 4 × ATR — beyond this it's unrealistic.
+    # Add tiny epsilon to avoid float-boundary false negatives.
+    achievable = target_dist <= (atr * 4 + eps)
+    rr_ok = rr_ratio + eps >= min_rr
 
-    return achievable and rr_ratio >= min_rr, rr_ratio
+    if not rr_ok:
+        return False, rr_ratio, "rr_below_minimum"
+    if not achievable:
+        return False, rr_ratio, "target_beyond_atr_limit"
+    return True, rr_ratio, "ok"
