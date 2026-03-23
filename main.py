@@ -101,14 +101,13 @@ def _heartbeat_loop():
 
 def _backup_loop():
     """Daemon thread: runs an encrypted cloud backup every BACKUP_INTERVAL seconds.
-    Skips when the market is CLOSED (weekends, holidays, off-hours) — no new trades
-    means no new data worth snapshotting."""
+    Runs only when the market is OPEN (no new trades during closed/off-hours)."""
     time.sleep(60)  # let main process stabilise before first backup
     while True:
         try:
-            from utils.market_hours import get_market_status, STATUS_CLOSED
-            if get_market_status() == STATUS_CLOSED:
-                print("[BACKUP] Skipped — market is CLOSED (no new data to snapshot).")
+            from utils.market_hours import get_market_status, STATUS_OPEN
+            if get_market_status() != STATUS_OPEN:
+                print("[BACKUP] Skipped — market is not OPEN (no new data to snapshot).")
             else:
                 from utils.backup import run_backup
                 print("[BACKUP] Starting hourly backup...")
