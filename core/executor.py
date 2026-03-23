@@ -272,6 +272,37 @@ def _sync_protection_to_broker(base_url, headers, deal_id, stop_level, profit_le
     return False, last_err or "unknown error"
 
 
+def _sanitize_protection_levels(action, entry_price, stop_level, target1, target2):
+    """
+    Ensure broker protection levels are valid and strictly ordered:
+      BUY  -> stop < entry < targets
+      SELL -> targets < entry < stop
+    Also ensures all levels are strictly positive.
+    """
+    eps = max(entry_price * 0.0005, 0.01)  # 0.05% or 1 cent minimum buffer
+
+    stop = float(stop_level or 0.0)
+    t1 = float(target1 or 0.0)
+    t2 = float(target2 or 0.0)
+
+    if action == "BUY":
+        if stop <= 0 or stop >= entry_price:
+            stop = max(0.01, entry_price - eps)
+        if t1 <= entry_price:
+            t1 = entry_price + eps
+        if t2 <= t1:
+            t2 = t1 + eps
+    else:
+        if stop <= entry_price:
+            stop = entry_price + eps
+        if t1 <= 0 or t1 >= entry_price:
+            t1 = max(0.01, entry_price - eps)
+        if t2 <= 0 or t2 >= t1:
+            t2 = max(0.01, t1 - eps)
+
+    return round(stop, 6), round(t1, 6), round(t2, 6)
+
+
 # ── Position monitoring — trailing stop + hard fallback ───────────────────────
 
 def monitor_and_close(chat_id):
@@ -509,6 +540,11 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
         target2 = entry_price - stop_dist * 1.33
         dir_ar   = 'بيع'
         sq_color = '🟥'
+
+    # Capital requires valid absolute levels; sanitize defensively.
+    stop_level, target1, target2 = _sanitize_protection_levels(
+        action, entry_price, stop_level, target1, target2
+    )
 
     # Split into two positions to support TP1 + TP2 on broker.
     # Capital applies one TP per position, so we split size intentionally.
