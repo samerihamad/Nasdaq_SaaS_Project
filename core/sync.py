@@ -170,3 +170,42 @@ def _fetch_closed_pnl(base_url, headers, deal_id):
     except Exception:
         pass
     return 0.0
+
+
+def backfill_closed_pnls(chat_id, base_url, headers, lookback: int = 200) -> int:
+    """
+    Backfill missing/zero PnL values for already CLOSED trades from broker history.
+    Useful when a deal was closed manually and initial reconciliation stored 0.0.
+    Returns number of rows updated.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT trade_id, deal_id, pnl FROM trades "
+        "WHERE chat_id=? AND status='CLOSED' "
+        "AND deal_id IS NOT NULL AND TRIM(deal_id) != '' "
+        "ORDER BY trade_id DESC LIMIT ?",
+        (chat_id, int(lookback)),
+    )
+    rows = c.fetchall()
+    if not rows:
+        conn.close()
+        return 0
+
+    updated = 0
+    for trade_id, deal_id, pnl in rows:
+        # Backfill only unknown/zero rows.
+        if pnl is not None and float(pnl) != 0.0:
+            continue
+        fetched = _fetch_closed_pnl(base_url, headers, str(deal_id))
+        # Skip when broker still returns zero/unknown.
+        if fetched == 0.0:
+            continue
+        c.execute("UPDATE trades SET pnl=? WHERE trade_id=?", (float(fetched), int(trade_id)))
+        if c.rowcount == 1:
+            updated += 1
+
+    if updated:
+        conn.commit()
+    conn.close()
+    return updated

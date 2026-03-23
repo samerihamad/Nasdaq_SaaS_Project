@@ -41,7 +41,7 @@ from core.risk_manager import (
     get_risk_state, STATE_USER_DAY_HALT,
 )
 from core.executor import get_user_credentials, get_session
-from core.sync import reconcile
+from core.sync import reconcile, backfill_closed_pnls
 from bot.admin import admin_handler
 from database.db_manager import (
     create_db, get_bank_details, get_user_tier,
@@ -1024,6 +1024,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 base_url, headers = get_session(creds)
                 if headers:
                     reconcile(chat_id, base_url, headers)
+                    backfill_closed_pnls(chat_id, base_url, headers, lookback=300)
         except Exception:
             pass
 
