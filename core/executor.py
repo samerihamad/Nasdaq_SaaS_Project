@@ -1,5 +1,6 @@
 import requests
 import sqlite3
+from datetime import datetime
 from bot.notifier import send_telegram_message
 from bot.licensing import safe_decrypt
 from database.db_manager import is_maintenance_mode
@@ -202,7 +203,7 @@ def monitor_and_close(chat_id):
 
 # ── Trade execution ───────────────────────────────────────────────────────────
 
-def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct=None):
+def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct=None, strategy_label=None):
     """
     Open a new position.
 
@@ -272,6 +273,10 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
     else:
         effective_sl_pct = stop_loss_pct or 0.01
         rr_ratio = 0.0
+        stop_price = (
+            entry_price * (1 - effective_sl_pct) if action == 'BUY'
+            else entry_price * (1 + effective_sl_pct)
+        )
 
     # ── Position size (1–2% risk, confidence-scaled) ──────────────────────────
     size = calculate_position_size(balance, confidence, entry_price, effective_sl_pct, chat_id)
@@ -298,17 +303,84 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
     # ── Record in local DB ────────────────────────────────────────────────────
     record_open_trade(chat_id, symbol, action, entry_price, size, deal_id, initial_stop)
 
-    # ── Notify ────────────────────────────────────────────────────────────────
+    # ── Notify (localized detailed trade report) ─────────────────────────────
     is_override  = (reason == STATE_MANUAL_OVERRIDE)
-    risk_used    = 1.0 + 1.0 * ((min(max(confidence, 70), 100) - 70) / 30)
-    stop_info    = f"{initial_stop:.4f}" if initial_stop else "computed next cycle"
+    _fmt_money = lambda v: f"${v:,.2f}"
 
-    send_telegram_message(
-        chat_id,
-        f"{'⚠️ Manual Override' if is_override else '✅'} *{action} — {symbol}*\n"
-        f"Size: {size} units\n"
-        f"Confidence: {confidence}%  |  Risk: {risk_used:.1f}%\n"
-        f"R:R ratio: {rr_ratio:.1f}:1\n"
-        f"Initial ATR stop: {stop_info}"
+    # For reporting we prefer ATR-based trailing stop if available,
+    # because that's the stop-level that evolves later.
+    stop_level = initial_stop if initial_stop is not None else stop_price
+    stop_dist  = abs(entry_price - stop_level)
+
+    qty_total = int(round(size))
+    qty1 = qty_total // 2
+    qty2 = qty_total - qty1
+
+    total_amount = entry_price * qty_total
+    risk_amount  = stop_dist * qty_total
+
+    # Targets: fixed scheme (1R and 1.33R) derived from the stop-distance.
+    if action == 'BUY':
+        target1 = entry_price + stop_dist * 1.00
+        target2 = entry_price + stop_dist * 1.33
+        dir_ar   = 'شراء'
+        sq_color = '🟩'
+    else:
+        target1 = entry_price - stop_dist * 1.00
+        target2 = entry_price - stop_dist * 1.33
+        dir_ar   = 'بيع'
+        sq_color = '🟥'
+
+    # Daily trade counter (for the "#N" label).
+    utc_today = datetime.utcnow().date().isoformat()
+    conn = sqlite3.connect('database/trading_saas.db')
+    c = conn.cursor()
+    c.execute(
+        "SELECT COUNT(*) FROM trades WHERE chat_id=? AND DATE(opened_at)=?",
+        (chat_id, utc_today),
     )
+    row = c.fetchone()
+    trade_index = row[0] if row else 0
+    conn.close()
+
+    # Strategy label mapping (main.py passes best_label into this function).
+    strategy_map = {
+        'MeanRev': 'Mean Reversion',
+        'MeanReversion': 'Mean Reversion',
+        'Momentum': 'Momentum',
+        'RF': 'RF',
+    }
+    strategy_name = strategy_map.get(strategy_label or '', None) or (strategy_label or 'Mean Reversion')
+
+    from utils.market_hours import _now_et
+    now_et_str = _now_et().strftime('%Y-%m-%d %H:%M %Z')
+
+    override_line = "⚠️ تجاوز يدوي — جاري فتح صفقة جديدة\n" if is_override else ""
+    header = (
+        f"🇦🇪 العربية\n"
+        f"{sq_color} {symbol}  اسم السهم\n"
+        f"📅 {now_et_str}\n"
+        f"------------------------------\n"
+        f"{override_line}"
+    )
+
+    msg = (
+        f"{header}"
+        f"🔔 صفقة جديدة #{trade_index} 🔔\n"
+        f"📊 الاستراتيجية  : {strategy_name}\n"
+        f"▶️  الاتجاه       : {dir_ar}\n"
+        f"💰 الدخول        : {_fmt_money(entry_price)}\n"
+        f"🔢 الكمية         : {qty_total} سهم\n"
+        f"💵 إجمالي المبلغ : {_fmt_money(total_amount)}\n"
+        f"🔴 وقف الخسارة   : {_fmt_money(stop_level)}\n"
+        f"----------\n"
+        f"🎯 الهدف 1 ({qty1} سهم) : {_fmt_money(target1)} (1R)\n"
+        f"🏆 الهدف 2 ({qty2} سهم) : {_fmt_money(target2)} (1.33R)\n"
+        f"---------\n"
+        f"⚠️  المخاطرة      : {_fmt_money(risk_amount)}"
+    )
+
+    send_telegram_message(chat_id, msg)
+
+    stop_info = f"{stop_level:.4f}" if stop_level is not None else "N/A"
     return f"✅ Opened — size: {size} | stop: {stop_info} | RR: {rr_ratio:.1f}"

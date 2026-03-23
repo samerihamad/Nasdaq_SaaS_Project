@@ -136,13 +136,13 @@ def _hybrid_approval_loop():
             conn = sqlite3.connect(db_path)
             c    = conn.cursor()
             c.execute(
-                "SELECT signal_id, chat_id, symbol, action, confidence "
+                "SELECT signal_id, chat_id, symbol, action, confidence, strategy_label, stop_loss_pct "
                 "FROM pending_signals WHERE status='APPROVED'"
             )
             approved = c.fetchall()
             conn.close()
 
-            for signal_id, chat_id, symbol, action, confidence in approved:
+            for signal_id, chat_id, symbol, action, confidence, strategy_label, stop_loss_pct in approved:
                 # Mark PROCESSING atomically to prevent duplicate execution
                 with sqlite3.connect(db_path) as cx:
                     cx.execute(
@@ -150,7 +150,14 @@ def _hybrid_approval_loop():
                         (signal_id,),
                     )
                 try:
-                    result = place_trade_for_user(chat_id, symbol, action, confidence=float(confidence))
+                    result = place_trade_for_user(
+                        chat_id,
+                        symbol,
+                        action,
+                        confidence=float(confidence),
+                        stop_loss_pct=stop_loss_pct,
+                        strategy_label=strategy_label,
+                    )
                     print(f"   [HYBRID {chat_id}] Signal #{signal_id} → {result}")
                 except Exception as exc:
                     print(f"   [HYBRID {chat_id}] Signal #{signal_id} execution error: {exc}")
@@ -266,7 +273,7 @@ def send_premarket_alert(watchlist_count: int):
 # ── Signal dispatch ───────────────────────────────────────────────────────────
 
 def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
-                    timeframes: dict = None, stop_loss_pct: float = None):
+                    timeframes: dict = None, stop_loss_pct: float = None, strategy_label: str = None):
     """
     Multi-tenant signal dispatcher.
 
@@ -309,6 +316,7 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
                 result = place_trade_for_user(
                     chat_id, symbol, action,
                     confidence=confidence, stop_loss_pct=stop_loss_pct,
+                    strategy_label=strategy_label,
                 )
                 print(f"   [AUTO  {chat_id}] {symbol} {action} → {result}")
                 dispatched += 1
@@ -316,7 +324,11 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
             else:
                 # HYBRID: post to DB, non-blocking.
                 # _hybrid_approval_loop() executes it when user approves.
-                sig_id = post_pending_signal(chat_id, symbol, action, confidence, reason)
+                sig_id = post_pending_signal(
+                    chat_id, symbol, action, confidence, reason,
+                    strategy_label=strategy_label,
+                    stop_loss_pct=stop_loss_pct,
+                )
                 print(f"   [HYBRID {chat_id}] Signal #{sig_id} posted — awaiting approval")
                 dispatched += 1
 
@@ -487,6 +499,7 @@ def run_trading_bot():
                     dispatch_signal(
                         symbol, best_action, best_conf, best_reason,
                         timeframes=timeframes, stop_loss_pct=best_sl_pct,
+                        strategy_label=best_label,
                     )
 
                     time.sleep(1)

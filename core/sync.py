@@ -31,7 +31,14 @@ def reconcile(chat_id, base_url, headers):
         return
 
     live_positions = pos_res.json().get('positions', [])
-    live_deal_ids  = {p['position']['dealId'] for p in live_positions}
+    # Normalize dealId types: broker may return int while DB stores str (or vice versa).
+    # If we don't normalize, membership checks will fail and we keep "re-syncing"
+    # the same position every monitoring cycle.
+    live_deal_ids = {
+        str(p['position']['dealId'])
+        for p in live_positions
+        if p.get('position', {}).get('dealId') is not None
+    }
 
     conn = sqlite3.connect(DB_PATH)
     c    = conn.cursor()
@@ -43,24 +50,28 @@ def reconcile(chat_id, base_url, headers):
         (chat_id,)
     )
     local_open = c.fetchall()
-    local_deal_ids = {row[1] for row in local_open if row[1]}
+    local_deal_ids = {str(row[1]) for row in local_open if row[1]}
 
     # ── Case 1: closed externally ─────────────────────────────────────────────
     for trade_id, deal_id, symbol, direction in local_open:
-        if deal_id and deal_id not in live_deal_ids:
-            pnl = _fetch_closed_pnl(base_url, headers, deal_id)
+        if deal_id and str(deal_id) not in live_deal_ids:
+            pnl = _fetch_closed_pnl(base_url, headers, str(deal_id))
             from datetime import datetime as _dt
             c.execute(
                 "UPDATE trades SET status='CLOSED', pnl=?, closed_at=? WHERE trade_id=?",
                 (pnl, _dt.now().isoformat(), trade_id)
             )
 
-            label  = "ربح" if pnl > 0 else "خسارة"
+            # Persist immediately so Telegram sync messages don't repeat
+            # if anything fails after updating this row.
+            conn.commit()
+
+            label  = "ربح" if pnl > 0 else ("تعادل" if pnl == 0 else "خسارة")
             send_telegram_message(
                 chat_id,
                 f"📋 *مزامنة — صفقة مغلقة تلقائياً*\n"
                 f"الأداة: {symbol} ({direction})\n"
-                f"{'الربح' if pnl > 0 else 'الخسارة'}: ${abs(pnl):.2f} ({label})\n"
+                f"{label}: ${abs(pnl):.2f}\n"
                 f"تم تحديث السجل المحلي."
             )
             # Feed into Circuit Breaker state machine
@@ -68,8 +79,11 @@ def reconcile(chat_id, base_url, headers):
 
     # ── Case 2: manually opened, not tracked ─────────────────────────────────
     for p in live_positions:
-        deal_id = p['position']['dealId']
-        if deal_id not in local_deal_ids:
+        deal_id = p.get('position', {}).get('dealId')
+        if deal_id is None:
+            continue
+        deal_id_str = str(deal_id)
+        if deal_id_str not in local_deal_ids:
             symbol    = p['market'].get('epic', p['market'].get('instrumentName', ''))
             direction = p['position']['direction']
             entry     = float(p['position'].get('level', 0))
@@ -79,7 +93,7 @@ def reconcile(chat_id, base_url, headers):
                 '''INSERT INTO trades
                    (chat_id, symbol, direction, entry_price, size, deal_id, status)
                    VALUES (?, ?, ?, ?, ?, ?, 'OPEN')''',
-                (chat_id, symbol, direction, entry, size, deal_id)
+                (chat_id, symbol, direction, entry, size, deal_id_str)
             )
             print(f"🔄 مزامنة: صفقة يدوية رُصدت في {symbol} ({direction}) — تم إضافتها للتتبع.")
 

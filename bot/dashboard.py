@@ -1359,13 +1359,15 @@ def _update_signal_status(signal_id: int, status: str):
 
 
 def post_pending_signal(chat_id: str, symbol: str, action: str,
-                        confidence: float, reason: str) -> int:
+                        confidence: float, reason: str,
+                        strategy_label: str = '', stop_loss_pct=None) -> int:
     conn = _db()
     c    = conn.cursor()
     c.execute(
-        '''INSERT INTO pending_signals (chat_id, symbol, action, confidence, reason, status, created_at)
-           VALUES (?, ?, ?, ?, ?, 'PENDING', datetime('now'))''',
-        (chat_id, symbol, action, confidence, reason)
+        '''INSERT INTO pending_signals
+              (chat_id, symbol, action, confidence, reason, strategy_label, stop_loss_pct, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', datetime('now'))''',
+        (chat_id, symbol, action, confidence, reason, strategy_label, stop_loss_pct)
     )
     signal_id = c.lastrowid
     conn.commit()
