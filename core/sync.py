@@ -18,6 +18,7 @@ import requests
 import re
 from bot.notifier import send_telegram_message
 from core.risk_manager import record_trade_result
+from database.db_manager import is_maintenance_mode
 
 DB_PATH = 'database/trading_saas.db'
 
@@ -101,7 +102,8 @@ def reconcile(chat_id, base_url, headers):
     conn.close()
 
     # Send one summary notification per reconcile cycle (less Telegram noise).
-    if closed_events:
+    # During maintenance mode, keep reconciliation silent for subscribers.
+    if closed_events and not is_maintenance_mode():
         net = sum(e[2] for e in closed_events)
         lines = [
             "📋 *مزامنة — تحديث الصفقات المغلقة*",
