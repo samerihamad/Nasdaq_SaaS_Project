@@ -51,6 +51,7 @@ def reconcile(chat_id, base_url, headers):
     )
     local_open = c.fetchall()
     local_deal_ids = {str(row[1]) for row in local_open if row[1]}
+    closed_events = []
 
     # ── Case 1: closed externally ─────────────────────────────────────────────
     for trade_id, deal_id, symbol, direction in local_open:
@@ -71,13 +72,7 @@ def reconcile(chat_id, base_url, headers):
             conn.commit()
 
             label  = "ربح" if pnl > 0 else ("تعادل" if pnl == 0 else "خسارة")
-            send_telegram_message(
-                chat_id,
-                f"📋 *مزامنة — صفقة مغلقة تلقائياً*\n"
-                f"الأداة: {symbol} ({direction})\n"
-                f"{label}: ${abs(pnl):.2f}\n"
-                f"تم تحديث السجل المحلي."
-            )
+            closed_events.append((symbol, direction, pnl, label))
             # Feed into Circuit Breaker state machine
             record_trade_result(chat_id, pnl)
 
@@ -103,6 +98,23 @@ def reconcile(chat_id, base_url, headers):
 
     conn.commit()
     conn.close()
+
+    # Send one summary notification per reconcile cycle (less Telegram noise).
+    if closed_events:
+        net = sum(e[2] for e in closed_events)
+        lines = [
+            "📋 *مزامنة — تحديث الصفقات المغلقة*",
+            f"• عدد الصفقات: {len(closed_events)}",
+            f"• الصافي: ${net:.2f}",
+            "",
+        ]
+        for symbol, direction, pnl, label in closed_events[:5]:
+            lines.append(f"• {symbol} ({direction}) — {label}: ${abs(pnl):.2f}")
+        if len(closed_events) > 5:
+            lines.append(f"• ... +{len(closed_events) - 5} صفقات إضافية")
+        lines.append("")
+        lines.append("تم تحديث السجل المحلي.")
+        send_telegram_message(chat_id, "\n".join(lines))
 
 
 def _fetch_closed_pnl(base_url, headers, deal_id):
