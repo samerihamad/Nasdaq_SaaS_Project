@@ -76,7 +76,7 @@ ATR_PERIOD           = 14
 # ── Signal Quality Gate ───────────────────────────────────────────────────────
 
 # Signals with confidence below this are discarded before risk checks
-MIN_CONFIDENCE       = 60.0
+MIN_CONFIDENCE       = 63.0
 
 # Hard cap on new positions per user per day (independent of circuit breaker)
 MAX_DAILY_TRADES     = 5
@@ -90,6 +90,32 @@ NEWS_QUALITY_SCORE   = 15      # bonus score when a high-quality news event exis
 # ── Scanning Scheduler ────────────────────────────────────────────────────────
 
 SCAN_INTERVAL_SEC    = 300     # run a full market scan every 5 minutes
+
+# ── Main Engine Runtime ────────────────────────────────────────────────────────
+
+# Live engine cycle interval (seconds)
+CHECK_INTERVAL = 60
+
+# Final watchlist size after L1/L2 filters
+MAX_WATCHLIST = 180
+
+# Hybrid mode approval TTL (seconds)
+HYBRID_SIGNAL_TTL = 600
+
+# Heartbeat write interval (seconds)
+HEARTBEAT_INTERVAL = 30
+
+# Cloud backup cycle interval (seconds)
+BACKUP_INTERVAL = 3600
+
+# Heartbeat state file written by main engine
+HEARTBEAT_FILE = "heartbeat.json"
+
+# Pre-market alert is sent when minutes_to_open <= this value
+PREMARKET_ALERT_WINDOW_MIN = 30
+
+# Refresh watchlist while market is open (seconds)
+WATCHLIST_REFRESH_SECONDS = 3600
 
 # ── Capital.com Broker ────────────────────────────────────────────────────────
 

@@ -317,9 +317,11 @@ def calculate_position_size(balance: float, confidence: float,
     Uses this user's risk_percent / max_risk_percent from the DB if chat_id
     is supplied; falls back to global MIN_RISK / MAX_RISK constants otherwise.
 
-    Scaling:
+    Scaling (stronger convex curve):
       confidence at MIN_CONF (70%)  → user's min_risk %
       confidence at MAX_CONF (100%) → user's max_risk %  (hard cap)
+      Mid-range confidence gets modest increases, while high-confidence
+      setups accelerate faster toward max risk.
 
     Leverage (tier cap vs user preference):
       Dollar risk at the stop is budgeted as
@@ -337,8 +339,11 @@ def calculate_position_size(balance: float, confidence: float,
     else:
         user_min, user_max = MIN_RISK, MAX_RISK
 
-    clamped  = max(MIN_CONF, min(MAX_CONF, confidence))
-    risk_pct = user_min + (user_max - user_min) * ((clamped - MIN_CONF) / (MAX_CONF - MIN_CONF))
+    clamped = max(MIN_CONF, min(MAX_CONF, confidence))
+    conf_norm = (clamped - MIN_CONF) / (MAX_CONF - MIN_CONF)  # 0..1
+    # Convex curve (>1 exponent) => stronger emphasis on high confidence.
+    conf_weight = conf_norm ** 1.8
+    risk_pct = user_min + (user_max - user_min) * conf_weight
 
     risk_budget = balance * (risk_pct / 100)
     if chat_id:

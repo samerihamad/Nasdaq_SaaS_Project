@@ -40,7 +40,7 @@ The **highest-confidence** signal that passes its threshold is dispatched.
 - Random Forest trained on 5 years of daily bars per ticker.
 - Features: EMA20/50/200 distances, RSI, MACD, VWAP, volume ratio.
 - Three-timeframe alignment required: 1D + 4H + 15M must all agree.
-- Threshold: `MIN_CONFIDENCE = 70%` (set in `main.py`).
+- Threshold: `MIN_CONFIDENCE = 63%` (set in `config.py`).
 
 ### 2. Mean Reversion (`core/strategy_meanrev.py`)
 - Entry: RSI < 30 (BUY) or RSI > 70 (SELL) on the 15m chart.

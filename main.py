@@ -4,8 +4,8 @@ NATB v2.0 — Trading Engine
 Run alongside the Telegram bot (bot/dashboard.py) as a separate process.
 Both processes share the SQLite database.
 
-Pre-market alert:  sent at 09:00 AM ET (14:00 UTC) daily.
-Daily scan:        runs at 09:00 AM ET after the alert.
+Pre-market alert:  sent ~30 minutes before market open (ET, DST-aware).
+Daily scan:        runs before open when alert window starts, with open fallback.
 Live cycle:        every CHECK_INTERVAL seconds during market hours.
 Heartbeat:         written every HEARTBEAT_INTERVAL seconds for watchdog.py.
 Backup:            hourly encrypted cloud backup in a background thread.
@@ -33,6 +33,17 @@ from core.strategy_momentum import analyze as analyze_momentum
 from bot.notifier import send_telegram_message
 from bot.dashboard import post_pending_signal, get_signal_status
 from bot.i18n import t
+from config import (
+    MIN_CONFIDENCE,
+    CHECK_INTERVAL,
+    MAX_WATCHLIST,
+    HYBRID_SIGNAL_TTL,
+    HEARTBEAT_INTERVAL,
+    BACKUP_INTERVAL,
+    HEARTBEAT_FILE,
+    PREMARKET_ALERT_WINDOW_MIN,
+    WATCHLIST_REFRESH_SECONDS,
+)
 
 # ── Single-instance lock ──────────────────────────────────────────────────────
 _LOCK_FILE = "main.pid"
@@ -68,14 +79,6 @@ create_db()
 
 # --- Configuration ---
 ADMIN_CHAT_ID      = os.getenv("ADMIN_CHAT_ID", "")   # admin-only notifications
-CHECK_INTERVAL     = 60     # seconds between live cycles
-DAILY_SCAN_HOUR    = 14     # UTC hour for daily scan + pre-market alert
-MIN_CONFIDENCE     = 70     # minimum combined RF confidence
-MAX_WATCHLIST      = 180    # top-N stocks into Level 3
-HYBRID_SIGNAL_TTL  = 600    # seconds before a pending hybrid signal expires (10 min)
-HEARTBEAT_INTERVAL = 30     # seconds between heartbeat writes
-BACKUP_INTERVAL    = 3600   # seconds between cloud backups (1 hour)
-HEARTBEAT_FILE     = "heartbeat.json"
 
 # --- State ---
 _watchlist          = []
@@ -84,6 +87,7 @@ _premarket_sent     = None   # date of last pre-market alert
 _daily_report_sent  = None   # date of last daily report
 _prev_market_status = None   # detect OPEN→CLOSED transition
 _closed_notified    = False  # sent "market closed" msg this session
+_last_watchlist_refresh_at = None  # UTC datetime of last in-session refresh
 
 
 # ── Heartbeat & backup threads ────────────────────────────────────────────────
@@ -379,7 +383,7 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def run_trading_bot():
-    global _watchlist, _last_scan_date, _prev_market_status, _closed_notified, _daily_report_sent
+    global _watchlist, _last_scan_date, _prev_market_status, _closed_notified, _daily_report_sent, _last_watchlist_refresh_at
 
     print("🚀 NATB v2.0 — محرك التداول الذكي")
     print(f"   الثقة الدنيا: {MIN_CONFIDENCE}% | فحص كل {CHECK_INTERVAL}s")
@@ -389,8 +393,8 @@ def run_trading_bot():
 
     while True:
         try:
+            now_utc       = datetime.now(timezone.utc)
             today         = date.today()
-            utc_hour      = datetime.now(timezone.utc).hour
             market_status = get_market_status()
 
             # ── Detect OPEN → CLOSED transition → send daily report ───────────
@@ -434,6 +438,22 @@ def run_trading_bot():
                     _closed_notified = True
                     print(f"[MARKET] Closed — opens in ~{mins} min")
 
+                # Build watchlist before open (once daily) so pre-market alert
+                # has a real count and models are warm.
+                mins = minutes_to_open()
+                if (_last_scan_date != today
+                        and 0 < mins <= PREMARKET_ALERT_WINDOW_MIN):
+                    _watchlist      = run_daily_scan()
+                    _last_scan_date = today
+                    if _watchlist:
+                        pretrain_models(_watchlist)
+
+                # DST-safe pre-market alert window.
+                if (_premarket_sent != today
+                        and 0 < mins <= PREMARKET_ALERT_WINDOW_MIN
+                        and _watchlist):
+                    send_premarket_alert(len(_watchlist))
+
                 run_watcher()   # monitors all users' open positions
                 time.sleep(300)
                 continue
@@ -447,17 +467,23 @@ def run_trading_bot():
 
             # ── Market is OPEN ────────────────────────────────────────────────
 
-            # Daily scan + pre-market alert (once per day)
-            if _last_scan_date != today and utc_hour >= DAILY_SCAN_HOUR:
+            # Fallback: if pre-open scan did not run for any reason,
+            # run once after open.
+            if _last_scan_date != today:
                 _watchlist      = run_daily_scan()
                 _last_scan_date = today
                 if _watchlist:
                     pretrain_models(_watchlist)
+                _last_watchlist_refresh_at = now_utc
 
-            if (_premarket_sent != today
-                    and utc_hour == DAILY_SCAN_HOUR
-                    and _watchlist):
-                send_premarket_alert(len(_watchlist))
+            # Hourly in-session refresh: captures intraday liquidity/volatility shifts.
+            if (_last_watchlist_refresh_at is None
+                    or (now_utc - _last_watchlist_refresh_at).total_seconds() >= WATCHLIST_REFRESH_SECONDS):
+                print("[WATCHLIST] Hourly refresh during open session...")
+                _watchlist = run_daily_scan()
+                if _watchlist:
+                    pretrain_models(_watchlist)
+                _last_watchlist_refresh_at = now_utc
 
             if not _watchlist:
                 print("⏳ في انتظار المسح اليومي...")
