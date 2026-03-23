@@ -105,6 +105,10 @@ def _backup_loop():
     time.sleep(60)  # let main process stabilise before first backup
     while True:
         try:
+            if is_maintenance_mode():
+                print("[BACKUP] Skipped — maintenance mode is active.")
+                time.sleep(BACKUP_INTERVAL)
+                continue
             from utils.market_hours import get_market_status, STATUS_OPEN
             if get_market_status() != STATUS_OPEN:
                 print("[BACKUP] Skipped — market is not OPEN (no new data to snapshot).")

@@ -338,6 +338,14 @@ STRINGS = {
             'To lift the block: *⚙️ Settings* → ▶ Resume trading (lift block).'
         ),
     },
+    'engine_status_maintenance': {
+        'ar': '🛠 *وضع الصيانة مفعّل* — لا صفقات جديدة حالياً. المراقبة فقط.',
+        'en': '🛠 *Maintenance mode active* — no new trades. Monitoring only.',
+    },
+    'maintenance_start_blocked': {
+        'ar': 'وضع الصيانة مفعّل من الإدارة — لا يمكن تشغيل المحرك حالياً.',
+        'en': 'Maintenance mode is active by admin — engine start is blocked.',
+    },
 
     # ── Trading start/stop notifications ──────────────────────────────────────
     'trading_engine_started': {

@@ -46,7 +46,7 @@ from database.db_manager import (
     create_db, get_bank_details, get_user_tier,
     get_trading_enabled, set_trading_enabled,
     apply_subscription_cancellation, get_preferred_leverage,
-    set_preferred_leverage, infer_subscription_start,
+    set_preferred_leverage, infer_subscription_start, is_maintenance_mode,
 )
 from utils.market_hours import (
     get_market_status,
@@ -359,6 +359,8 @@ def _build_bank_text(lang: str) -> str:
 
 def _engine_status_line(chat_id: str, lang: str) -> str:
     """Return the one-line engine status shown at the top of the dashboard."""
+    if is_maintenance_mode():
+        return t('engine_status_maintenance', lang)
     risk = get_risk_state(chat_id)
     if risk == STATE_USER_DAY_HALT:
         return t('engine_status_day_block', lang)
@@ -1084,6 +1086,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Toggle trading engine on / off ────────────────────────────────────
     elif data == 'toggle_engine':
+        if is_maintenance_mode():
+            await query.answer(t('maintenance_start_blocked', lang), show_alert=True)
+            return
         if get_risk_state(chat_id) == STATE_USER_DAY_HALT:
             await query.answer(t('use_resume_in_settings', lang), show_alert=True)
             return
