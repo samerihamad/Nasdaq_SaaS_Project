@@ -26,7 +26,7 @@ from utils.market_scanner import scan_multi_timeframe
 from utils.ai_model import analyze_multi_timeframe, load_or_train_model, validate_signal
 from utils.market_hours import get_market_status, minutes_to_open, STATUS_OPEN, STATUS_CLOSED
 from utils.daily_report import send_daily_reports
-from core.executor import place_trade_for_user, monitor_and_close
+from core.executor import place_trade_for_user, monitor_and_close, is_symbol_supported_for_user
 from core.watcher import run_watcher, get_all_active_subscribers, get_trading_subscribers
 from core.strategy_meanrev  import analyze as analyze_meanrev
 from core.strategy_momentum import analyze as analyze_momentum
@@ -163,6 +163,28 @@ def _hybrid_approval_loop():
                         strategy_label=strategy_label,
                     )
                     print(f"   [HYBRID {chat_id}] Signal #{signal_id} → {result}")
+                    # place_trade_for_user() sends its own rich message on success.
+                    # For non-open outcomes, send explicit feedback to the user here
+                    # so Hybrid mode never looks "silent" after approval.
+                    with sqlite3.connect(db_path) as cx:
+                        if isinstance(result, str) and result.startswith("✅ Opened"):
+                            cx.execute(
+                                "UPDATE pending_signals SET status='EXECUTED' WHERE signal_id=?",
+                                (signal_id,),
+                            )
+                        elif isinstance(result, str) and result.startswith("⏭️"):
+                            cx.execute(
+                                "UPDATE pending_signals SET status='SKIPPED' WHERE signal_id=?",
+                                (signal_id,),
+                            )
+                            send_telegram_message(chat_id, result)
+                        else:
+                            cx.execute(
+                                "UPDATE pending_signals SET status='FAILED' WHERE signal_id=?",
+                                (signal_id,),
+                            )
+                            if isinstance(result, str) and result.strip():
+                                send_telegram_message(chat_id, result)
                 except Exception as exc:
                     print(f"   [HYBRID {chat_id}] Signal #{signal_id} execution error: {exc}")
                     with sqlite3.connect(db_path) as cx:
@@ -170,6 +192,13 @@ def _hybrid_approval_loop():
                             "UPDATE pending_signals SET status='ERROR' WHERE signal_id=?",
                             (signal_id,),
                         )
+                    try:
+                        send_telegram_message(
+                            chat_id,
+                            f"❌ تعذر تنفيذ الصفقة بعد الموافقة.\n{symbol} {action}\n{exc}"
+                        )
+                    except Exception:
+                        pass
 
             # ── Expire stale pending signals ──────────────────────────────────
             with sqlite3.connect(db_path) as cx:
@@ -314,6 +343,11 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
     for row in subscribers:
         chat_id = str(row[0])
         try:
+            # Pre-filter: only dispatch symbols tradable on this user's broker account.
+            if not is_symbol_supported_for_user(chat_id, symbol):
+                print(f"   [SKIP  {chat_id}] {symbol} not supported on broker — filtered before dispatch")
+                continue
+
             mode = _get_user_mode(chat_id)
 
             if mode == 'AUTO':

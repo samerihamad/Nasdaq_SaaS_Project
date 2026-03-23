@@ -355,6 +355,50 @@ def _build_bank_text(lang: str) -> str:
     return t('bank_details_title', lang) + '\n\n' + body
 
 
+def _fetch_live_equity(base_url: str, headers: dict) -> tuple[float | None, str]:
+    """
+    Return live account equity (preferred) and currency.
+    Falls back to: balance + sum(open UPL) when equity is not provided.
+    """
+    res = requests.get(f"{base_url}/accounts", headers=headers, timeout=15)
+    if res.status_code != 200:
+        return None, 'USD'
+
+    accounts = (res.json() or {}).get('accounts', []) or []
+    if not accounts:
+        return None, 'USD'
+
+    acc = accounts[0]
+    bal = acc.get('balance', {}) or {}
+
+    currency = (
+        bal.get('currency')
+        or acc.get('currency')
+        or 'USD'
+    )
+
+    # 1) Prefer native equity field if present.
+    equity = bal.get('equity', acc.get('equity'))
+    if isinstance(equity, (int, float)):
+        return float(equity), currency
+
+    # 2) Fallback to balance + open UPL.
+    base_balance = bal.get('balance', acc.get('balance'))
+    if not isinstance(base_balance, (int, float)):
+        return None, currency
+
+    upl_sum = 0.0
+    try:
+        p_res = requests.get(f"{base_url}/positions", headers=headers, timeout=15)
+        if p_res.status_code == 200:
+            for p in (p_res.json() or {}).get('positions', []):
+                upl_sum += float(p.get('position', {}).get('upl', 0.0) or 0.0)
+    except Exception:
+        pass
+
+    return float(base_balance) + upl_sum, currency
+
+
 # ── Main menu display ──────────────────────────────────────────────────────────
 
 def _engine_status_line(chat_id: str, lang: str) -> str:
@@ -954,12 +998,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             base_url, headers = get_session(creds)
             if headers:
                 try:
-                    res = requests.get(f"{base_url}/accounts", headers=headers)
-                    if res.status_code == 200:
-                        acc  = res.json()['accounts'][0]
-                        bal  = acc['balance']['balance']
-                        curr = acc['balance'].get('currency', 'USD')
-                        text = t('balance_result', lang, amount=bal, currency=curr)
+                    live_equity, curr = _fetch_live_equity(base_url, headers)
+                    if live_equity is not None:
+                        text = t('balance_result', lang, amount=round(live_equity, 2), currency=curr)
                     else:
                         text = t('balance_error', lang)
                 except Exception:
@@ -992,7 +1033,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             from datetime import datetime
             wins   = sum(1 for p in rows if p > 0)
-            losses = len(rows) - wins
+            losses = sum(1 for p in rows if p < 0)
             text   = (
                 t('report_title', lang, date=datetime.now().strftime('%Y-%m-%d')) + '\n\n' +
                 t('report_body', lang,
@@ -1010,31 +1051,39 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Open positions ─────────────────────────────────────────────────────
     elif data == 'positions':
-        creds = get_user_credentials(chat_id)
-        if not creds:
+        positions = []
+        try:
+            creds = get_user_credentials(chat_id)
+            if not creds:
+                await query.edit_message_text(
+                    t('no_positions', lang),
+                    reply_markup=_back_keyboard(lang), parse_mode='Markdown'
+                )
+                return
+
+            base_url, headers = get_session(creds)
+            if not headers:
+                await query.edit_message_text(
+                    t('balance_error', lang),
+                    reply_markup=_back_keyboard(lang), parse_mode='Markdown'
+                )
+                return
+
+            # Keep callback responsive; avoid hanging "silent" button presses.
+            res = requests.get(f"{base_url}/positions", headers=headers, timeout=15)
+            if res.status_code == 200:
+                payload = res.json() if res.content else {}
+                positions = payload.get('positions', []) or []
+        except Exception:
+            positions = []
+
+        if not positions:
             await query.edit_message_text(
                 t('no_positions', lang),
                 reply_markup=_back_keyboard(lang), parse_mode='Markdown'
             )
             return
 
-        base_url, headers = get_session(creds)
-        if not headers:
-            await query.edit_message_text(
-                t('balance_error', lang),
-                reply_markup=_back_keyboard(lang), parse_mode='Markdown'
-            )
-            return
-
-        res = requests.get(f"{base_url}/positions", headers=headers)
-        if res.status_code != 200 or not res.json().get('positions'):
-            await query.edit_message_text(
-                t('no_positions', lang),
-                reply_markup=_back_keyboard(lang), parse_mode='Markdown'
-            )
-            return
-
-        positions = res.json()['positions']
         lines     = [t('positions_title', lang)]
         btns      = []
         for p in positions:

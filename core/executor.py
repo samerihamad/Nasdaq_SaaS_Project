@@ -16,6 +16,10 @@ from core.trailing_stop import (
 )
 from core.sync import reconcile
 
+# Daily per-user symbol→epic cache (and unsupported symbols) to avoid
+# repeating broker lookups for every signal cycle.
+_EPIC_CACHE = {}
+
 
 # ── Credentials & session ─────────────────────────────────────────────────────
 
@@ -93,6 +97,26 @@ def _get_current_price(base_url, headers, epic):
     except Exception:
         pass
     return 0.0
+
+
+def _epic_cache_key(chat_id, is_demo):
+    day = datetime.utcnow().strftime('%Y-%m-%d')
+    return f"{chat_id}|{'DEMO' if is_demo else 'LIVE'}|{day}"
+
+
+def _get_cache_bucket(chat_id, is_demo):
+    key = _epic_cache_key(chat_id, is_demo)
+    if key not in _EPIC_CACHE:
+        _EPIC_CACHE[key] = {"symbol_to_epic": {}, "unsupported": set()}
+    return _EPIC_CACHE[key]
+
+
+def _prune_old_epic_cache():
+    """Keep only today's cache buckets."""
+    today = datetime.utcnow().strftime('%Y-%m-%d')
+    stale = [k for k in _EPIC_CACHE.keys() if not k.endswith(f"|{today}")]
+    for k in stale:
+        _EPIC_CACHE.pop(k, None)
 
 
 def _resolve_epic(base_url, headers, symbol):
@@ -178,6 +202,51 @@ def _resolve_epic(base_url, headers, symbol):
         pass
 
     return None
+
+
+def resolve_epic_for_user(chat_id, symbol, base_url=None, headers=None, is_demo=None):
+    """
+    Resolve and cache broker epic for (chat_id, symbol) per day.
+    Returns epic or None if unsupported.
+    """
+    _prune_old_epic_cache()
+    s = str(symbol or "").strip().upper()
+    if not s:
+        return None
+
+    # If caller did not provide an authenticated session, create one.
+    local_session = False
+    if base_url is None or headers is None or is_demo is None:
+        creds = get_user_credentials(chat_id)
+        if not creds:
+            return None
+        is_demo = bool(creds[2])
+        base_url, headers = get_session(creds)
+        if not headers:
+            return None
+        local_session = True
+
+    bucket = _get_cache_bucket(chat_id, is_demo)
+    if s in bucket["symbol_to_epic"]:
+        return bucket["symbol_to_epic"][s]
+    if s in bucket["unsupported"]:
+        return None
+
+    epic = _resolve_epic(base_url, headers, s)
+    if epic:
+        bucket["symbol_to_epic"][s] = epic
+    else:
+        bucket["unsupported"].add(s)
+
+    if local_session:
+        # Nothing explicit to close; tokens are per-request headers.
+        pass
+    return epic
+
+
+def is_symbol_supported_for_user(chat_id, symbol) -> bool:
+    """True if we can resolve a valid broker epic for this user today."""
+    return bool(resolve_epic_for_user(chat_id, symbol))
 
 
 def _open_position_with_protection(base_url, headers, epic, action, size, stop_level, target_level):
@@ -530,10 +599,14 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
         return f"🔴 Daily drawdown limit reached ({dd_pct:.1f}%) — no new entries today."
 
     # ── Resolve broker epic from scanner ticker ────────────────────────────────
-    order_epic = _resolve_epic(base_url, headers, symbol)
+    order_epic = resolve_epic_for_user(
+        chat_id, symbol, base_url=base_url, headers=headers, is_demo=bool(creds[2])
+    )
     if not order_epic:
-        msg = f"❌ Order failed ({symbol} {action}): unable to resolve epic on broker"
-        send_telegram_message(chat_id, msg)
+        # Symbol is not tradable on this broker account/region.
+        # Skip quietly for subscribers to avoid noisy false "errors".
+        msg = f"⏭️ Skipped ({symbol} {action}): symbol not available on broker"
+        print(f"[BROKER SKIP] chat={chat_id} {msg}")
         return msg
 
     # ── Duplicate check (epic-first, robust) ─────────────────────────────────

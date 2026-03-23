@@ -15,6 +15,7 @@ Runs at the start of every monitoring cycle to fix any discrepancies:
 
 import sqlite3
 import requests
+import re
 from bot.notifier import send_telegram_message
 from core.risk_manager import record_trade_result
 
@@ -122,16 +123,48 @@ def _fetch_closed_pnl(base_url, headers, deal_id):
     Attempt to retrieve the realized PnL of a closed deal from broker history.
     Returns 0.0 if the endpoint is unavailable or the deal isn't found.
     """
-    try:
+    def _parse_pnl(tx: dict) -> float | None:
+        # Capital payloads may vary by account/region.
+        # Try several known keys and parse numeric strings safely.
+        for k in ("profitAndLoss", "profitAndLossValue", "pnl", "realisedPnl", "realizedPnl"):
+            if k not in tx or tx.get(k) is None:
+                continue
+            v = tx.get(k)
+            if isinstance(v, (int, float)):
+                return float(v)
+            s = str(v).strip()
+            m = re.search(r"[-+]?\d+(?:\.\d+)?", s.replace(",", ""))
+            if m:
+                try:
+                    return float(m.group(0))
+                except Exception:
+                    continue
+        return None
+
+    def _fetch(params: dict | None) -> list:
         res = requests.get(
             f"{base_url}/history/transactions",
-            params={"dealId": deal_id},
-            headers=headers
+            params=params or {},
+            headers=headers,
         )
-        if res.status_code == 200:
-            for tx in res.json().get('transactions', []):
-                if str(tx.get('dealId')) == str(deal_id):
-                    return float(tx.get('profitAndLoss', 0))
+        if res.status_code != 200:
+            return []
+        return (res.json() or {}).get("transactions", []) or []
+
+    try:
+        # Try direct dealId filter first.
+        txs = _fetch({"dealId": str(deal_id)})
+        # Fallback: fetch recent transactions window and match manually.
+        if not txs:
+            txs = _fetch({"max": 200})
+
+        for tx in txs:
+            tx_deal = tx.get("dealId")
+            tx_ref  = tx.get("dealReference")
+            if str(tx_deal) == str(deal_id) or str(tx_ref) == str(deal_id):
+                p = _parse_pnl(tx)
+                if p is not None:
+                    return p
     except Exception:
         pass
     return 0.0

@@ -452,8 +452,8 @@ STRINGS = {
         'en': '🔍 Fetching balance...',
     },
     'balance_result': {
-        'ar': '💰 *رصيدك الحالي:* `{amount} {currency}`',
-        'en': '💰 *Current Balance:* `{amount} {currency}`',
+        'ar': '💰 *الرصيد اللحظي (Equity):* `{amount} {currency}`',
+        'en': '💰 *Live Equity:* `{amount} {currency}`',
     },
     'balance_error': {
         'ar': '❌ تعذّر جلب الرصيد. تحقق من بياناتك.',

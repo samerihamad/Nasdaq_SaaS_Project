@@ -141,7 +141,7 @@ def build_report(chat_id: str, lang: str) -> str:
 
     if closed_pnls:
         wins   = sum(1 for p in closed_pnls if p > 0)
-        losses = len(closed_pnls) - wins
+        losses = sum(1 for p in closed_pnls if p < 0)
         net    = sum(closed_pnls)
         lines.append(_t('closed_section', lang,
                         total=len(closed_pnls),
