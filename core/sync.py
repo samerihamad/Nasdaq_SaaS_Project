@@ -57,10 +57,14 @@ def reconcile(chat_id, base_url, headers):
         if deal_id and str(deal_id) not in live_deal_ids:
             pnl = _fetch_closed_pnl(base_url, headers, str(deal_id))
             from datetime import datetime as _dt
-            c.execute(
-                "UPDATE trades SET status='CLOSED', pnl=?, closed_at=? WHERE trade_id=?",
-                (pnl, _dt.now().isoformat(), trade_id)
+            cur = c.execute(
+                "UPDATE trades SET status='CLOSED', pnl=?, closed_at=? "
+                "WHERE trade_id=? AND status='OPEN'",
+                (pnl, _dt.now().isoformat(), trade_id),
             )
+            # If rowcount is 0, another process updated it before this cycle.
+            if cur.rowcount != 1:
+                continue
 
             # Persist immediately so Telegram sync messages don't repeat
             # if anything fails after updating this row.
