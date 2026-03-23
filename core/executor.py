@@ -122,7 +122,11 @@ def _resolve_epic(base_url, headers, symbol):
         except Exception:
             continue
 
-    # 3) Search endpoint fallback.
+    def _tokens(text):
+        import re
+        return {t for t in re.split(r"[^A-Z0-9]+", str(text or "").upper()) if t}
+
+    # 3) Search endpoint fallback (strict matching to avoid wrong markets like CURY.L for PURR).
     try:
         res = requests.get(
             f"{base_url}/markets",
@@ -131,19 +135,45 @@ def _resolve_epic(base_url, headers, symbol):
         )
         if res.status_code == 200:
             markets = res.json().get("markets", [])
-            # Prefer exact ticker token matches in instrumentName,
-            # then any US stock market as fallback.
+            scored = []
             for m in markets:
+                epic = str(m.get("epic", "")).upper()
+                if not epic:
+                    continue
                 inst = str(m.get("instrumentName", "")).upper()
-                epic = m.get("epic")
-                if epic and f" {s}" in f" {inst} ":
-                    return epic
-            for m in markets:
-                epic = m.get("epic")
-                if epic and str(m.get("marketId", "")).upper() == "SHARES":
-                    return epic
-            if markets and markets[0].get("epic"):
-                return markets[0]["epic"]
+                market_id = str(m.get("marketId", "")).upper()
+                status = str(m.get("marketStatus", "")).upper()
+                country = str(m.get("countryCode", "")).upper()
+                currency = str(m.get("currency", "")).upper()
+
+                inst_tokens = _tokens(inst)
+                epic_tokens = _tokens(epic)
+
+                exact_token = (s in inst_tokens) or (s in epic_tokens)
+                exact_epic = (epic == s)
+                us_hint = (
+                    ".US." in f".{epic}." or
+                    country == "US" or
+                    currency == "USD"
+                )
+                share_hint = market_id in ("SHARES", "SHARE")
+                open_hint = status in ("TRADEABLE", "OPEN")
+
+                # Require at least an exact token match to avoid false positives.
+                if not (exact_token or exact_epic):
+                    continue
+
+                score = 0
+                score += 100 if exact_epic else 0
+                score += 60 if exact_token else 0
+                score += 25 if us_hint else 0
+                score += 10 if share_hint else 0
+                score += 8 if open_hint else 0
+                scored.append((score, epic))
+
+            if scored:
+                scored.sort(reverse=True)
+                return scored[0][1]
     except Exception:
         pass
 
@@ -371,25 +401,64 @@ def monitor_and_close(chat_id):
 
         # Calculate ATR (try yfinance with the epic as ticker symbol)
         atr = calculate_atr(symbol)
+        entry_price = float(trade.get('entry_price') or current_price)
+        base_stop = trade.get('trailing_stop')
+
+        # TP1 gate:
+        # Do NOT start trailing from the initial SL.
+        # Only after TP1 is reached, move SL to at least breakeven, then trail.
+        tp1_hit = False
+        tp1_price = None
+        if base_stop is not None:
+            stop_dist = abs(entry_price - float(base_stop))
+            if stop_dist > 0:
+                if direction == 'BUY':
+                    tp1_price = entry_price + stop_dist
+                    tp1_hit = current_price >= tp1_price
+                else:
+                    tp1_price = entry_price - stop_dist
+                    tp1_hit = current_price <= tp1_price
 
         if atr and atr > 0:
-            candidate    = compute_stop_candidate(direction, current_price, atr)
-            prev_stop    = trade['trailing_stop'] or candidate  # initialise on first run
-            new_stop     = advance_trailing_stop(prev_stop, candidate, direction)
-            update_trade_stop(trade['trade_id'], new_stop)
-            # Keep broker-side SL synced with local trailing stop.
-            if prev_stop != new_stop:
-                ok, info = _sync_stop_to_broker(base_url, headers, deal_id, new_stop)
-                if not ok:
-                    print(f"⚠️  Broker stop sync failed [{symbol} {deal_id}]: {info}")
+            if tp1_hit:
+                candidate = compute_stop_candidate(direction, current_price, atr)
+                prev_stop = float(base_stop if base_stop is not None else candidate)
+                breakeven = entry_price
+                if direction == 'BUY':
+                    prev_stop = max(prev_stop, breakeven)
+                else:
+                    prev_stop = min(prev_stop, breakeven)
 
-            stop_triggered = is_stop_hit(current_price, new_stop, direction)
-            stop_label = f"ATR trailing stop @ {new_stop:.4f}"
+                new_stop = advance_trailing_stop(prev_stop, candidate, direction)
+                if base_stop != new_stop:
+                    update_trade_stop(trade['trade_id'], new_stop)
+                    ok, info = _sync_stop_to_broker(base_url, headers, deal_id, new_stop)
+                    if not ok:
+                        print(f"⚠️  Broker stop sync failed [{symbol} {deal_id}]: {info}")
+                stop_triggered = is_stop_hit(current_price, new_stop, direction)
+                stop_label = f"ATR trailing stop @ {new_stop:.4f} (TP1 passed)"
+            else:
+                # Before TP1: keep initial SL unchanged.
+                new_stop = float(base_stop) if base_stop is not None else None
+                if new_stop is not None:
+                    stop_triggered = is_stop_hit(current_price, new_stop, direction)
+                    stop_label = (
+                        f"Initial SL @ {new_stop:.4f} "
+                        f"(waiting TP1{f' {tp1_price:.4f}' if tp1_price else ''})"
+                    )
+                else:
+                    # Fallback only when SL is missing
+                    stop_triggered = upl <= hard_stop_limit
+                    stop_label = f"وقف خسارة احتياطي (3%) @ UPL={upl:.2f}"
         else:
-            # Fallback: use hard 3% portfolio limit as the stop trigger
-            stop_triggered = upl <= hard_stop_limit
-            new_stop = None
-            stop_label = f"وقف خسارة احتياطي (3%) @ UPL={upl:.2f}"
+            # ATR unavailable: respect existing SL if present, else hard fallback.
+            new_stop = float(base_stop) if base_stop is not None else None
+            if new_stop is not None:
+                stop_triggered = is_stop_hit(current_price, new_stop, direction)
+                stop_label = f"Initial SL @ {new_stop:.4f} (ATR unavailable)"
+            else:
+                stop_triggered = upl <= hard_stop_limit
+                stop_label = f"وقف خسارة احتياطي (3%) @ UPL={upl:.2f}"
 
         print(
             f"📊 [{symbol} {direction}] "
