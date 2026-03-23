@@ -150,6 +150,69 @@ def _resolve_epic(base_url, headers, symbol):
     return None
 
 
+def _open_position_with_protection(base_url, headers, epic, action, size, stop_level, target_level):
+    """
+    Open one position with attached stop-loss and take-profit levels.
+    Returns (ok: bool, payload_or_error: dict|str).
+    """
+    payloads = [
+        {
+            "epic": epic,
+            "direction": action,
+            "size": size,
+            "orderType": "MARKET",
+            "forceOpen": True,
+            "stopLevel": stop_level,
+            "profitLevel": target_level,
+        },
+        {
+            "epic": epic,
+            "direction": action,
+            "size": size,
+            "stopLevel": stop_level,
+            "profitLevel": target_level,
+        },
+    ]
+    last_err = ""
+    for payload in payloads:
+        try:
+            res = requests.post(f"{base_url}/positions", json=payload, headers=headers)
+            if res.status_code == 200:
+                return True, res.json()
+            last_err = (res.text or "")[:300]
+        except Exception as exc:
+            last_err = str(exc)
+    return False, last_err or "unknown error"
+
+
+def _sync_stop_to_broker(base_url, headers, deal_id, stop_level):
+    """
+    Push updated trailing-stop level to Capital for an open position.
+    Returns (ok: bool, info: str).
+    """
+    if not deal_id:
+        return False, "missing deal_id"
+
+    payloads = [
+        {"stopLevel": stop_level},
+        {"stopLevel": stop_level, "trailingStop": False},
+    ]
+    last_err = ""
+    for payload in payloads:
+        try:
+            res = requests.put(
+                f"{base_url}/positions/{deal_id}",
+                json=payload,
+                headers=headers,
+            )
+            if res.status_code == 200:
+                return True, "ok"
+            last_err = (res.text or "")[:300]
+        except Exception as exc:
+            last_err = str(exc)
+    return False, last_err or "unknown error"
+
+
 # ── Position monitoring — trailing stop + hard fallback ───────────────────────
 
 def monitor_and_close(chat_id):
@@ -190,8 +253,12 @@ def monitor_and_close(chat_id):
     balance         = _get_balance(base_url, headers)
     hard_stop_limit = -(balance * 0.03)   # -3% of balance
 
-    # Index live positions by dealId for O(1) lookup
-    live_by_id = {p['position']['dealId']: p for p in live_positions}
+    # Index live positions by normalized dealId for O(1) lookup.
+    live_by_id = {
+        str(p.get('position', {}).get('dealId')): p
+        for p in live_positions
+        if p.get('position', {}).get('dealId') is not None
+    }
 
     closed_any = False
 
@@ -201,7 +268,7 @@ def monitor_and_close(chat_id):
         symbol    = trade['symbol']
         direction = trade['direction']
 
-        live = live_by_id.get(deal_id)
+        live = live_by_id.get(str(deal_id))
         if not live:
             continue   # already handled by reconcile above
 
@@ -220,6 +287,11 @@ def monitor_and_close(chat_id):
             prev_stop    = trade['trailing_stop'] or candidate  # initialise on first run
             new_stop     = advance_trailing_stop(prev_stop, candidate, direction)
             update_trade_stop(trade['trade_id'], new_stop)
+            # Keep broker-side SL synced with local trailing stop.
+            if prev_stop != new_stop:
+                ok, info = _sync_stop_to_broker(base_url, headers, deal_id, new_stop)
+                if not ok:
+                    print(f"⚠️  Broker stop sync failed [{symbol} {deal_id}]: {info}")
 
             stop_triggered = is_stop_hit(current_price, new_stop, direction)
             stop_label = f"ATR trailing stop @ {new_stop:.4f}"
@@ -298,19 +370,25 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
     if not within_dd:
         return f"🔴 Daily drawdown limit reached ({dd_pct:.1f}%) — no new entries today."
 
-    # ── Duplicate check ───────────────────────────────────────────────────────
-    pos_res = requests.get(f"{base_url}/positions", headers=headers)
-    if pos_res.status_code == 200:
-        for p in pos_res.json().get('positions', []):
-            if symbol.upper() in p['market']['instrumentName'].upper():
-                return f"⚠️ Position already open for {symbol} — monitoring."
-
     # ── Resolve broker epic from scanner ticker ────────────────────────────────
     order_epic = _resolve_epic(base_url, headers, symbol)
     if not order_epic:
         msg = f"❌ Order failed ({symbol} {action}): unable to resolve epic on broker"
         send_telegram_message(chat_id, msg)
         return msg
+
+    # ── Duplicate check (epic-first, robust) ─────────────────────────────────
+    pos_res = requests.get(f"{base_url}/positions", headers=headers)
+    if pos_res.status_code == 200:
+        for p in pos_res.json().get('positions', []):
+            m = p.get('market', {})
+            live_epic = str(m.get('epic', '')).upper()
+            live_name = str(m.get('instrumentName', '')).upper()
+            if live_epic == str(order_epic).upper() or symbol.upper() in live_name:
+                return (
+                    f"⚠️ Position already open for {symbol} "
+                    f"({order_epic}) — monitoring."
+                )
 
     # ── ATR fetch (used for both RR check and initial stop) ───────────────────
     entry_price = _get_current_price(base_url, headers, order_epic)
@@ -348,46 +426,20 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
 
     # ── Position size (1–2% risk, confidence-scaled) ──────────────────────────
     size = calculate_position_size(balance, confidence, entry_price, effective_sl_pct, chat_id)
+    # Protection levels used BOTH for broker order and Telegram report.
+    # Use strategy stop when available, otherwise ATR fallback.
+    if atr and entry_price > 0:
+        initial_stop = compute_stop_candidate(action, entry_price, atr)
+    else:
+        initial_stop = stop_price
 
-    # ── Place order ───────────────────────────────────────────────────────────
-    trade_res = requests.post(
-        f"{base_url}/positions",
-        json={"epic": order_epic, "direction": action, "size": size},
-        headers=headers,
-    )
-
-    if trade_res.status_code != 200:
-        msg = f"❌ Order failed ({symbol} {action}): {trade_res.text[:300]}"
+    stop_level = initial_stop if initial_stop is not None else stop_price
+    stop_dist  = abs(entry_price - stop_level)
+    if stop_dist <= 0:
+        msg = f"❌ Order failed ({symbol} {action}): invalid stop distance"
         send_telegram_message(chat_id, msg)
         return msg
 
-    deal_id = trade_res.json().get('dealId') or trade_res.json().get('dealReference', '')
-
-    # ── Initial ATR trailing stop ─────────────────────────────────────────────
-    initial_stop = None
-    if atr and entry_price > 0:
-        initial_stop = compute_stop_candidate(action, entry_price, atr)
-
-    # ── Record in local DB ────────────────────────────────────────────────────
-    record_open_trade(chat_id, symbol, action, entry_price, size, deal_id, initial_stop)
-
-    # ── Notify (localized detailed trade report) ─────────────────────────────
-    is_override  = (reason == STATE_MANUAL_OVERRIDE)
-    _fmt_money = lambda v: f"${v:,.2f}"
-
-    # For reporting we prefer ATR-based trailing stop if available,
-    # because that's the stop-level that evolves later.
-    stop_level = initial_stop if initial_stop is not None else stop_price
-    stop_dist  = abs(entry_price - stop_level)
-
-    qty_total = int(round(size))
-    qty1 = qty_total // 2
-    qty2 = qty_total - qty1
-
-    total_amount = entry_price * qty_total
-    risk_amount  = stop_dist * qty_total
-
-    # Targets: fixed scheme (1R and 1.33R) derived from the stop-distance.
     if action == 'BUY':
         target1 = entry_price + stop_dist * 1.00
         target2 = entry_price + stop_dist * 1.33
@@ -398,6 +450,49 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
         target2 = entry_price - stop_dist * 1.33
         dir_ar   = 'بيع'
         sq_color = '🟥'
+
+    # Split into two positions to support TP1 + TP2 on broker.
+    # Capital applies one TP per position, so we split size intentionally.
+    qty_total = max(1, int(round(size)))
+    qty1 = max(1, qty_total // 2)
+    qty2 = qty_total - qty1
+    if qty2 < 1:
+        qty2 = 0
+
+    legs = [(qty1, target1)]
+    if qty2 > 0:
+        legs.append((qty2, target2))
+
+    opened_legs = []
+    for leg_size, leg_target in legs:
+        ok, out = _open_position_with_protection(
+            base_url, headers, order_epic, action, leg_size, stop_level, leg_target
+        )
+        if not ok:
+            # If first leg fails, abort immediately. If second fails, keep first
+            # and warn user to avoid hidden exposure.
+            if not opened_legs:
+                msg = f"❌ Order failed ({symbol} {action}): {out}"
+                send_telegram_message(chat_id, msg)
+                return msg
+            send_telegram_message(
+                chat_id,
+                f"⚠️ {symbol}: first leg opened, second TP leg failed.\n"
+                f"Please review position manually.\n"
+                f"Error: {out}"
+            )
+            break
+
+        deal_id = out.get('dealId') or out.get('dealReference', '')
+        opened_legs.append((leg_size, leg_target, deal_id))
+        record_open_trade(chat_id, symbol, action, entry_price, leg_size, deal_id, stop_level)
+
+    # ── Notify (localized detailed trade report) ─────────────────────────────
+    is_override  = (reason == STATE_MANUAL_OVERRIDE)
+    _fmt_money = lambda v: f"${v:,.2f}"
+
+    total_amount = entry_price * qty_total
+    risk_amount  = stop_dist * qty_total
 
     # Daily trade counter (for the "#N" label).
     utc_today = datetime.utcnow().date().isoformat()
@@ -451,4 +546,4 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
     send_telegram_message(chat_id, msg)
 
     stop_info = f"{stop_level:.4f}" if stop_level is not None else "N/A"
-    return f"✅ Opened — size: {size} | stop: {stop_info} | RR: {rr_ratio:.1f}"
+    return f"✅ Opened — legs: {len(opened_legs)} | size: {qty_total} | stop: {stop_info} | RR: {rr_ratio:.1f}"
