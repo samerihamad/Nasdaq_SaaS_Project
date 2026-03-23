@@ -95,6 +95,61 @@ def _get_current_price(base_url, headers, epic):
     return 0.0
 
 
+def _resolve_epic(base_url, headers, symbol):
+    """
+    Resolve a Nasdaq ticker symbol (e.g. PAYP) to a Capital.com epic.
+    Returns epic string, or None if no tradable market is found.
+    """
+    s = str(symbol or "").strip().upper()
+    if not s:
+        return None
+
+    # 1) Fast path: assume provided symbol is already an epic.
+    try:
+        direct = requests.get(f"{base_url}/markets/{s}", headers=headers)
+        if direct.status_code == 200:
+            return s
+    except Exception:
+        pass
+
+    # 2) Try common US-share epic patterns.
+    candidates = [f"US.{s}.CASH", f"US.{s}.CFD", f"{s}.CASH", f"{s}.CFD"]
+    for epic in candidates:
+        try:
+            res = requests.get(f"{base_url}/markets/{epic}", headers=headers)
+            if res.status_code == 200:
+                return epic
+        except Exception:
+            continue
+
+    # 3) Search endpoint fallback.
+    try:
+        res = requests.get(
+            f"{base_url}/markets",
+            params={"searchTerm": s},
+            headers=headers,
+        )
+        if res.status_code == 200:
+            markets = res.json().get("markets", [])
+            # Prefer exact ticker token matches in instrumentName,
+            # then any US stock market as fallback.
+            for m in markets:
+                inst = str(m.get("instrumentName", "")).upper()
+                epic = m.get("epic")
+                if epic and f" {s}" in f" {inst} ":
+                    return epic
+            for m in markets:
+                epic = m.get("epic")
+                if epic and str(m.get("marketId", "")).upper() == "SHARES":
+                    return epic
+            if markets and markets[0].get("epic"):
+                return markets[0]["epic"]
+    except Exception:
+        pass
+
+    return None
+
+
 # ── Position monitoring — trailing stop + hard fallback ───────────────────────
 
 def monitor_and_close(chat_id):
@@ -250,8 +305,15 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             if symbol.upper() in p['market']['instrumentName'].upper():
                 return f"⚠️ Position already open for {symbol} — monitoring."
 
+    # ── Resolve broker epic from scanner ticker ────────────────────────────────
+    order_epic = _resolve_epic(base_url, headers, symbol)
+    if not order_epic:
+        msg = f"❌ Order failed ({symbol} {action}): unable to resolve epic on broker"
+        send_telegram_message(chat_id, msg)
+        return msg
+
     # ── ATR fetch (used for both RR check and initial stop) ───────────────────
-    entry_price = _get_current_price(base_url, headers, symbol)
+    entry_price = _get_current_price(base_url, headers, order_epic)
     atr         = calculate_atr(symbol)
 
     # ── R:R ratio gate ────────────────────────────────────────────────────────
@@ -284,7 +346,7 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
     # ── Place order ───────────────────────────────────────────────────────────
     trade_res = requests.post(
         f"{base_url}/positions",
-        json={"epic": symbol, "direction": action, "size": size},
+        json={"epic": order_epic, "direction": action, "size": size},
         headers=headers,
     )
 
