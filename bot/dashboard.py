@@ -41,6 +41,7 @@ from core.risk_manager import (
     get_risk_state, STATE_USER_DAY_HALT,
 )
 from core.executor import get_user_credentials, get_session
+from core.sync import reconcile
 from bot.admin import admin_handler
 from database.db_manager import (
     create_db, get_bank_details, get_user_tier,
@@ -268,7 +269,7 @@ def _main_keyboard(lang: str, mode: str, trading: bool):
          InlineKeyboardButton(t('btn_lang',     lang), callback_data='toggle_lang')],
         [InlineKeyboardButton(t('btn_tier_info', lang), callback_data='tier_info')],
         row_settings,
-        [InlineKeyboardButton(t('btn_support',      lang), callback_data='support')],
+        [InlineKeyboardButton(t('btn_support',      lang), url=SUPPORT_URL)],
     ])
 
 
@@ -1016,6 +1017,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Performance report ─────────────────────────────────────────────────
     elif data == 'report':
+        # On-demand sync so manual broker closes appear immediately in report.
+        try:
+            creds = get_user_credentials(chat_id)
+            if creds:
+                base_url, headers = get_session(creds)
+                if headers:
+                    reconcile(chat_id, base_url, headers)
+        except Exception:
+            pass
+
         conn = _db()
         c    = conn.cursor()
         c.execute(
