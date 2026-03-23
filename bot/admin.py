@@ -33,6 +33,7 @@ from database.db_manager import (
 from core.watcher import broadcast_to_all, run_watcher, get_all_active_subscribers
 from bot.licensing import issue_license
 from bot.notifier import send_telegram_message
+from bot.i18n import t
 
 ADMIN_CHAT_ID = os.getenv('ADMIN_CHAT_ID', '')
 DB_PATH       = 'database/trading_saas.db'
@@ -40,6 +41,26 @@ DB_PATH       = 'database/trading_saas.db'
 
 def _is_admin(chat_id: str) -> bool:
     return bool(ADMIN_CHAT_ID) and str(chat_id) == str(ADMIN_CHAT_ID)
+
+
+def _get_lang(chat_id: str) -> str:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT lang FROM subscribers WHERE chat_id=?", (str(chat_id),))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row and row[0] else 'ar'
+
+
+def _broadcast_localized(i18n_key: str) -> int:
+    """Broadcast a localized i18n message to each active subscriber."""
+    count = 0
+    for row in get_all_active_subscribers():
+        cid = str(row[0])
+        lang = _get_lang(cid)
+        send_telegram_message(cid, t(i18n_key, lang))
+        count += 1
+    return count
 
 
 async def admin_handler(update: Update, context):
@@ -82,22 +103,13 @@ async def admin_handler(update: Update, context):
         set_maintenance_mode(activate)
 
         if activate:
-            count = broadcast_to_all(
-                "*System Alert — Emergency Maintenance*\n\n"
-                "The system is now in maintenance mode.\n"
-                "New trade entries are temporarily suspended.\n"
-                "Open positions remain fully monitored."
-            )
+            count = _broadcast_localized('admin_maintenance_on_msg')
             await update.message.reply_text(
                 f"*Maintenance mode ON*\n{count} subscriber(s) notified.",
                 parse_mode='Markdown'
             )
         else:
-            count = broadcast_to_all(
-                "*Normal Trading Resumed*\n\n"
-                "Maintenance is complete.\n"
-                "The system is operating normally."
-            )
+            count = _broadcast_localized('admin_maintenance_off_msg')
             await update.message.reply_text(
                 f"*Maintenance mode OFF*\n{count} subscriber(s) notified.",
                 parse_mode='Markdown'

@@ -364,6 +364,32 @@ STRINGS = {
             'Any currently open positions remain monitored until closed.'
         ),
     },
+    'admin_maintenance_on_msg': {
+        'ar': (
+            '🚨 *تنبيه النظام — صيانة طارئة*\n\n'
+            'تم تفعيل وضع الصيانة الآن.\n'
+            'تم إيقاف فتح صفقات جديدة مؤقتاً.\n'
+            'الصفقات المفتوحة ستبقى تحت المراقبة بالكامل.'
+        ),
+        'en': (
+            '🚨 *System Alert — Emergency Maintenance*\n\n'
+            'The system is now in maintenance mode.\n'
+            'New trade entries are temporarily suspended.\n'
+            'Open positions remain fully monitored.'
+        ),
+    },
+    'admin_maintenance_off_msg': {
+        'ar': (
+            '✅ *استئناف التداول الطبيعي*\n\n'
+            'اكتملت أعمال الصيانة.\n'
+            'عاد النظام للعمل بشكل طبيعي.'
+        ),
+        'en': (
+            '*Normal Trading Resumed*\n\n'
+            'Maintenance is complete.\n'
+            'The system is operating normally.'
+        ),
+    },
     'btn_lang':            {'ar': '🌐 English',           'en': '🌐 عربي'},
     'btn_back':            {'ar': '↩️ رجوع',             'en': '↩️ Back'},
     'btn_license':         {'ar': '🔑 الترخيص',          'en': '🔑 License'},
