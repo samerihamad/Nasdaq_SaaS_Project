@@ -94,7 +94,8 @@ def get_open_trades(chat_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
-        "SELECT trade_id, deal_id, symbol, direction, entry_price, trailing_stop "
+        "SELECT trade_id, deal_id, symbol, direction, entry_price, size, trailing_stop, "
+        "COALESCE(leg_role,''), COALESCE(parent_session,''), stop_distance "
         "FROM trades WHERE chat_id=? AND status='OPEN'",
         (chat_id,)
     )
@@ -102,12 +103,16 @@ def get_open_trades(chat_id):
     conn.close()
     return [
         {
-            'trade_id':      r[0],
-            'deal_id':       r[1],
-            'symbol':        r[2],
-            'direction':     r[3],
-            'entry_price':   r[4],
-            'trailing_stop': r[5],
+            'trade_id':       r[0],
+            'deal_id':        r[1],
+            'symbol':         r[2],
+            'direction':      r[3],
+            'entry_price':    r[4],
+            'size':           r[5],
+            'trailing_stop':  r[6],
+            'leg_role':       r[7] or None,
+            'parent_session': r[8] or None,
+            'stop_distance':  r[9],
         }
         for r in rows
     ]
@@ -136,16 +141,39 @@ def close_trade_in_db(trade_id, pnl):
     conn.close()
 
 
-def record_open_trade(chat_id, symbol, direction, entry_price, size, deal_id, initial_stop):
+def record_open_trade(
+    chat_id,
+    symbol,
+    direction,
+    entry_price,
+    size,
+    deal_id,
+    initial_stop,
+    leg_role=None,
+    parent_session=None,
+    stop_distance=None,
+):
     """Insert a new trade into the local DB when a position is opened (UTC timestamp)."""
     from utils.market_hours import utc_now
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         '''INSERT INTO trades
-           (chat_id, symbol, direction, entry_price, size, deal_id, trailing_stop, status, opened_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)''',
-        (chat_id, symbol, direction, entry_price, size, deal_id, initial_stop,
-         utc_now().isoformat())
+           (chat_id, symbol, direction, entry_price, size, deal_id, trailing_stop, status, opened_at,
+            leg_role, parent_session, stop_distance)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?)''',
+        (
+            chat_id,
+            symbol,
+            direction,
+            entry_price,
+            size,
+            deal_id,
+            initial_stop,
+            utc_now().isoformat(),
+            leg_role,
+            parent_session,
+            stop_distance,
+        ),
     )
     conn.commit()
     conn.close()

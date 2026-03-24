@@ -1,6 +1,7 @@
 import requests
 import sqlite3
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from bot.notifier import send_telegram_message
 from bot.licensing import safe_decrypt
@@ -16,6 +17,10 @@ from core.trailing_stop import (
     close_trade_in_db, record_open_trade,
 )
 from core.sync import reconcile
+from core.trade_close_messages import (
+    send_bot_automated_close,
+    count_open_sibling_same_session,
+)
 
 # Daily per-user symbol→epic cache (and unsupported symbols) to avoid
 # repeating broker lookups for every signal cycle.
@@ -575,6 +580,11 @@ def monitor_and_close(chat_id):
         deal_id   = trade['deal_id']
         symbol    = trade['symbol']
         direction = trade['direction']
+        trade_id  = trade['trade_id']
+        leg_role  = trade.get('leg_role') or ''
+        parent_session = trade.get('parent_session')
+        size_leg  = float(trade.get('size') or 0)
+        sd_stored = trade.get('stop_distance')
 
         live = live_by_id.get(str(deal_id))
         if not live:
@@ -663,13 +673,31 @@ def monitor_and_close(chat_id):
                 close_trade_in_db(trade['trade_id'], upl)
                 record_trade_result(chat_id, upl)
 
-                send_telegram_message(
-                    chat_id,
-                    f"🔔 *إغلاق آلي — {symbol}*\n"
-                    f"الاتجاه: {direction}\n"
-                    f"السبب: {stop_label}\n"
-                    f"{'الربح' if upl >= 0 else 'الخسارة'}: ${upl:.2f}"
-                )
+                sd_eff = sd_stored
+                if sd_eff is None and base_stop is not None and entry_price:
+                    sd_eff = abs(float(entry_price) - float(base_stop))
+                sibling_tp2_open = False
+                if leg_role == "TP1" and parent_session:
+                    sibling_tp2_open = (
+                        count_open_sibling_same_session(
+                            parent_session, trade_id, "TP2"
+                        )
+                        > 0
+                    )
+                if not is_maintenance_mode():
+                    send_bot_automated_close(
+                        chat_id,
+                        symbol=symbol,
+                        direction=direction,
+                        entry_price=entry_price,
+                        size=size_leg or float(live["position"].get("size") or 0),
+                        pnl=upl,
+                        stop_distance=sd_eff,
+                        trailing_stop=float(base_stop) if base_stop is not None else None,
+                        stop_label=stop_label,
+                        sibling_tp2_open=sibling_tp2_open,
+                        leg_role=leg_role or "SINGLE",
+                    )
                 closed_any = True
 
     return closed_any
@@ -831,7 +859,9 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
     auto_upsized = qty_total > float(size)
 
     opened_legs = []
-    for leg_size, leg_target in legs:
+    parent_session = str(uuid.uuid4())
+    for idx, (leg_size, leg_target) in enumerate(legs):
+        leg_role = "TP1" if idx == 0 else "TP2"
         ok, out = _open_position_with_protection(
             base_url, headers, order_epic, action, leg_size, stop_level, leg_target
         )
@@ -868,7 +898,18 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             break
 
         opened_legs.append((leg_size, leg_target, deal_id))
-        record_open_trade(chat_id, symbol, action, entry_price, leg_size, deal_id, stop_level)
+        record_open_trade(
+            chat_id,
+            symbol,
+            action,
+            entry_price,
+            leg_size,
+            deal_id,
+            stop_level,
+            leg_role=leg_role,
+            parent_session=parent_session,
+            stop_distance=stop_dist,
+        )
         ok, info = _sync_protection_to_broker(
             base_url, headers, deal_id, stop_level, leg_target
         )

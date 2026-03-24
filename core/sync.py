@@ -16,8 +16,14 @@ Runs at the start of every monitoring cycle to fix any discrepancies:
 import sqlite3
 import requests
 import re
-from bot.notifier import send_telegram_message
+from datetime import datetime as _dt
+
 from core.risk_manager import record_trade_result
+from core.trade_close_messages import (
+    send_reconcile_generic_external,
+    send_reconcile_tp1_hit,
+    send_reconcile_tp2_final,
+)
 from database.db_manager import is_maintenance_mode
 
 DB_PATH = 'database/trading_saas.db'
@@ -47,19 +53,38 @@ def reconcile(chat_id, base_url, headers):
 
     # Fetch locally tracked open trades
     c.execute(
-        "SELECT trade_id, deal_id, symbol, direction FROM trades "
-        "WHERE chat_id=? AND status='OPEN'",
-        (chat_id,)
+        "SELECT trade_id, deal_id, symbol, direction, entry_price, size, "
+        "COALESCE(leg_role,''), COALESCE(parent_session,''), stop_distance, trailing_stop "
+        "FROM trades WHERE chat_id=? AND status='OPEN'",
+        (chat_id,),
     )
     local_open = c.fetchall()
+    # If TP1 and TP2 both closed on the broker in the same cycle, process TP1 first
+    # so TP1 is CLOSED in DB before TP2 final aggregates P&L.
+    local_open = sorted(
+        local_open,
+        key=lambda r: (
+            0 if (r[6] or "").strip() == "TP1" else 1 if (r[6] or "").strip() == "TP2" else 2,
+            r[0],
+        ),
+    )
     local_deal_ids = {str(row[1]) for row in local_open if row[1]}
-    closed_events = []
 
     # ── Case 1: closed externally ─────────────────────────────────────────────
-    for trade_id, deal_id, symbol, direction in local_open:
+    for (
+        trade_id,
+        deal_id,
+        symbol,
+        direction,
+        entry_price,
+        size,
+        leg_role,
+        parent_session,
+        stop_distance,
+        trailing_stop,
+    ) in local_open:
         if deal_id and str(deal_id) not in live_deal_ids:
             pnl = _fetch_closed_pnl(base_url, headers, str(deal_id))
-            from datetime import datetime as _dt
             cur = c.execute(
                 "UPDATE trades SET status='CLOSED', pnl=?, closed_at=? "
                 "WHERE trade_id=? AND status='OPEN'",
@@ -73,10 +98,95 @@ def reconcile(chat_id, base_url, headers):
             # if anything fails after updating this row.
             conn.commit()
 
-            label  = "ربح" if pnl > 0 else ("تعادل" if pnl == 0 else "خسارة")
-            closed_events.append((symbol, direction, pnl, label))
             # Feed into Circuit Breaker state machine
             record_trade_result(chat_id, pnl)
+
+            if is_maintenance_mode():
+                continue
+
+            ep = float(entry_price or 0)
+            sz = float(size or 0)
+            ts = float(trailing_stop) if trailing_stop is not None else None
+            sd = stop_distance
+            if sd is None and ts is not None and ep:
+                sd = abs(ep - ts)
+            lr = (leg_role or "").strip()
+            ps = (parent_session or "").strip()
+            pnl_f = float(pnl)
+
+            if lr == "TP1" and ps:
+                tp2_open = c.execute(
+                    "SELECT 1 FROM trades WHERE parent_session=? AND status='OPEN' "
+                    "AND COALESCE(leg_role,'')='TP2' LIMIT 1",
+                    (ps,),
+                ).fetchone()
+                send_reconcile_tp1_hit(
+                    chat_id,
+                    symbol=symbol,
+                    direction=direction,
+                    entry_price=ep,
+                    size=sz,
+                    pnl=pnl_f,
+                    stop_distance=sd,
+                    trailing_stop=ts,
+                    tp2_still_open=bool(tp2_open),
+                )
+            elif lr == "TP2" and ps:
+                c.execute(
+                    "SELECT COALESCE(SUM(pnl),0) FROM trades WHERE parent_session=? AND status='CLOSED'",
+                    (ps,),
+                )
+                total_pnl = float(c.fetchone()[0])
+                c.execute(
+                    "SELECT COALESCE(SUM(size),0) FROM trades WHERE parent_session=? AND status='CLOSED'",
+                    (ps,),
+                )
+                total_qty = float(c.fetchone()[0])
+                c.execute(
+                    "SELECT COALESCE(SUM(pnl),0) FROM trades WHERE parent_session=? "
+                    "AND COALESCE(leg_role,'')='TP1' AND status='CLOSED'",
+                    (ps,),
+                )
+                tp1_pnl = float(c.fetchone()[0])
+                tp2_pnl = pnl_f
+                c.execute(
+                    "SELECT symbol, direction, entry_price, stop_distance, trailing_stop "
+                    "FROM trades WHERE parent_session=? ORDER BY trade_id LIMIT 1",
+                    (ps,),
+                )
+                row0 = c.fetchone()
+                sym0 = row0[0] if row0 else symbol
+                dir0 = row0[1] if row0 else direction
+                ep0 = float(row0[2]) if row0 and row0[2] is not None else ep
+                sd0 = row0[3] if row0 else None
+                ts0 = float(row0[4]) if row0 and row0[4] is not None else ts
+                sd_use = sd0 if sd0 is not None else sd
+                if sd_use is None and ts0 is not None and ep0:
+                    sd_use = abs(ep0 - ts0)
+                send_reconcile_tp2_final(
+                    chat_id,
+                    symbol=sym0,
+                    direction=dir0,
+                    entry_price=ep0,
+                    total_qty=total_qty,
+                    tp1_pnl=tp1_pnl,
+                    tp2_pnl=tp2_pnl,
+                    total_pnl=total_pnl,
+                    stop_distance=sd_use,
+                    trailing_stop=ts0,
+                )
+            else:
+                send_reconcile_generic_external(
+                    chat_id,
+                    symbol=symbol,
+                    direction=direction,
+                    entry_price=ep,
+                    size=sz,
+                    pnl=pnl_f,
+                    stop_distance=sd,
+                    trailing_stop=ts,
+                    reason_hint="sync",
+                )
 
     # ── Case 2: manually opened, not tracked ─────────────────────────────────
     for p in live_positions:
@@ -100,24 +210,6 @@ def reconcile(chat_id, base_url, headers):
 
     conn.commit()
     conn.close()
-
-    # Send one summary notification per reconcile cycle (less Telegram noise).
-    # During maintenance mode, keep reconciliation silent for subscribers.
-    if closed_events and not is_maintenance_mode():
-        net = sum(e[2] for e in closed_events)
-        lines = [
-            "📋 *مزامنة — تحديث الصفقات المغلقة*",
-            f"• عدد الصفقات: {len(closed_events)}",
-            f"• الصافي: ${net:.2f}",
-            "",
-        ]
-        for symbol, direction, pnl, label in closed_events[:5]:
-            lines.append(f"• {symbol} ({direction}) — {label}: ${abs(pnl):.2f}")
-        if len(closed_events) > 5:
-            lines.append(f"• ... +{len(closed_events) - 5} صفقات إضافية")
-        lines.append("")
-        lines.append("تم تحديث السجل المحلي.")
-        send_telegram_message(chat_id, "\n".join(lines))
 
 
 def _fetch_closed_pnl(base_url, headers, deal_id):

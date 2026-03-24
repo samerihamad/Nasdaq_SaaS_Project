@@ -66,6 +66,9 @@ def create_db():
     for col, definition in [
         ('closed_at', 'TEXT'),
         ('opened_at', 'TEXT'),
+        ('leg_role', "TEXT"),
+        ('parent_session', "TEXT"),
+        ('stop_distance', "REAL"),
     ]:
         try:
             c.execute(f"ALTER TABLE trades ADD COLUMN {col} {definition}")
