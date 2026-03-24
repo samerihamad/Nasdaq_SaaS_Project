@@ -372,6 +372,7 @@ STRINGS = {
             'Any currently open positions remain monitored until closed.'
         ),
     },
+    # Sent when maintenance is activated while market is OPEN (emergency)
     'admin_maintenance_on_msg': {
         'ar': (
             '🚨 *تنبيه النظام — صيانة طارئة*\n\n'
@@ -381,9 +382,22 @@ STRINGS = {
         ),
         'en': (
             '🚨 *System Alert — Emergency Maintenance*\n\n'
-            'The system is now in maintenance mode.\n'
-            'New trade entries are temporarily suspended.\n'
-            'Open positions remain fully monitored.'
+            'Maintenance mode is now active.\n'
+            'Opening new trades has been temporarily disabled.\n'
+            'All open trades will remain fully monitored.'
+        ),
+    },
+    # Sent when maintenance is activated while market is CLOSED (scheduled)
+    'admin_maintenance_scheduled_msg': {
+        'ar': (
+            '🚨 *تنبيه النظام — صيانة مجدولة*\n\n'
+            '⚠️ تم تفعيل وضع الصيانة الآن.\n'
+            'شكراً لتحلّيكم بالصبر 🙏 نعمل على تحسين الأداء.'
+        ),
+        'en': (
+            '🚨 *System Alert — Scheduled Maintenance*\n\n'
+            '⚠️ Maintenance mode is now active.\n'
+            'Thank you for your patience 🙏 We are working to improve performance.'
         ),
     },
     'admin_maintenance_off_msg': {
@@ -461,6 +475,38 @@ STRINGS = {
     },
 
     # ── Performance report ────────────────────────────────────────────────────
+    'report_menu_title': {
+        'ar': '📊 *تقرير الأداء*\nاختر نوع التقرير:',
+        'en': '📊 *Performance Report*\nChoose report type:',
+    },
+    'btn_report_daily': {
+        'ar': '📅 تقرير يوم محدد',
+        'en': '📅 Extract Daily Report',
+    },
+    'btn_report_csv': {
+        'ar': '📁 تصدير قاعدة البيانات (CSV)',
+        'en': '📁 Export Full Database (CSV)',
+    },
+    'report_ask_date': {
+        'ar': 'أدخل التاريخ بالصيغة YYYY-MM-DD\nمثال: 2025-03-24',
+        'en': 'Enter the date in format YYYY-MM-DD\nExample: 2025-03-24',
+    },
+    'report_ask_start_date': {
+        'ar': 'أدخل *تاريخ البداية* بالصيغة YYYY-MM-DD\nمثال: 2025-01-01',
+        'en': 'Enter the *start date* in format YYYY-MM-DD\nExample: 2025-01-01',
+    },
+    'report_ask_end_date': {
+        'ar': 'أدخل *تاريخ النهاية* بالصيغة YYYY-MM-DD\nمثال: 2025-03-24',
+        'en': 'Enter the *end date* in format YYYY-MM-DD\nExample: 2025-03-24',
+    },
+    'report_invalid_date': {
+        'ar': 'صيغة التاريخ غير صحيحة. يرجى استخدام YYYY-MM-DD',
+        'en': 'Invalid date format. Please use YYYY-MM-DD',
+    },
+    'report_csv_empty': {
+        'ar': '📭 لا توجد صفقات في هذا النطاق الزمني.',
+        'en': '📭 No trades found in that date range.',
+    },
     'report_title': {
         'ar': '📊 *تقرير الأداء*\n{date}',
         'en': '📊 *Performance Report*\n{date}',
@@ -820,16 +866,30 @@ STRINGS = {
     # ── Trade notifications ───────────────────────────────────────────────────
     'trade_opened': {
         'ar': (
-            '✅ *صفقة مفتوحة — {symbol}*\n'
-            'الاتجاه: {action}\n'
-            'الحجم: {size} | الثقة: {confidence}%\n'
-            'المخاطرة: {risk}% | الوقف: {stop}'
+            '{sq_color} *صفقة جديدة #{index} — {symbol}*\n'
+            '━━━━━━━━━━━━━━━━━━━━\n'
+            '▶️  الاتجاه        :  *{action}*\n'
+            '💰  سعر الدخول    :  *{entry}*\n'
+            '🔢  الكمية         :  *{size} سهم*\n'
+            '━━━━━━━━━━━━━━━━━━━━\n'
+            '🔴  وقف الخسارة   :  *{stop}*\n'
+            '🎯  الهدف 1        :  *{target1}*\n'
+            '🏆  الهدف 2        :  *{target2}*\n'
+            '━━━━━━━━━━━━━━━━━━━━\n'
+            '⚠️  المخاطرة       :  *{risk}*'
         ),
         'en': (
-            '✅ *Position Opened — {symbol}*\n'
-            'Direction: {action}\n'
-            'Size: {size} | Confidence: {confidence}%\n'
-            'Risk: {risk}% | Stop: {stop}'
+            '{sq_color} *New Trade #{index} — {symbol}*\n'
+            '━━━━━━━━━━━━━━━━━━━━\n'
+            '▶️  Direction    :  *{action}*\n'
+            '💰  Entry Price  :  *{entry}*\n'
+            '🔢  Quantity     :  *{size} shares*\n'
+            '━━━━━━━━━━━━━━━━━━━━\n'
+            '🔴  Stop Loss    :  *{stop}*\n'
+            '🎯  Target 1     :  *{target1}*\n'
+            '🏆  Target 2     :  *{target2}*\n'
+            '━━━━━━━━━━━━━━━━━━━━\n'
+            '⚠️  Risk Amount  :  *{risk}*'
         ),
     },
     'trade_closed_sl': {

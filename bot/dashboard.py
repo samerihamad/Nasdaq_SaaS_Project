@@ -12,11 +12,13 @@ Existing subscriber:
 """
 
 import os
+import io
+import csv
 import asyncio
 import sqlite3
 import requests
 import sys
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 from dotenv import load_dotenv
 
 from telegram import (
@@ -1015,51 +1017,33 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text, reply_markup=_back_keyboard(lang), parse_mode='Markdown'
         )
 
-    # ── Performance report ─────────────────────────────────────────────────
+    # ── Performance report sub-menu ────────────────────────────────────────
     elif data == 'report':
-        # On-demand sync so manual broker closes appear immediately in report.
-        try:
-            creds = get_user_credentials(chat_id)
-            if creds:
-                base_url, headers = get_session(creds)
-                if headers:
-                    reconcile(chat_id, base_url, headers)
-                    backfill_closed_pnls(chat_id, base_url, headers, lookback=300)
-        except Exception:
-            pass
-
-        conn = _db()
-        c    = conn.cursor()
-        c.execute(
-            "SELECT pnl FROM trades WHERE chat_id=? AND status='CLOSED'",
-            (chat_id,)
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(t('btn_report_daily', lang), callback_data='report_daily')],
+            [InlineKeyboardButton(t('btn_report_csv',   lang), callback_data='report_csv')],
+            [InlineKeyboardButton(t('btn_back',         lang), callback_data='main_menu')],
+        ])
+        await query.edit_message_text(
+            t('report_menu_title', lang),
+            reply_markup=keyboard, parse_mode='Markdown'
         )
-        rows = [r[0] for r in c.fetchall() if r[0] is not None]
-        conn.close()
 
-        if not rows:
-            await query.edit_message_text(
-                t('report_empty', lang),
-                reply_markup=_back_keyboard(lang), parse_mode='Markdown'
-            )
-        else:
-            from datetime import datetime
-            wins   = sum(1 for p in rows if p > 0)
-            losses = sum(1 for p in rows if p < 0)
-            text   = (
-                t('report_title', lang, date=datetime.now().strftime('%Y-%m-%d')) + '\n\n' +
-                t('report_body', lang,
-                  total=len(rows), wins=wins,
-                  win_rate=round(wins / len(rows) * 100, 1),
-                  losses=losses,
-                  loss_rate=round(losses / len(rows) * 100, 1),
-                  net_pnl=round(sum(rows), 2),
-                  best=round(max(rows), 2),
-                  worst=round(min(rows), 2))
-            )
-            await query.edit_message_text(
-                text, reply_markup=_back_keyboard(lang), parse_mode='Markdown'
-            )
+    # ── Daily report: ask for date ─────────────────────────────────────────
+    elif data == 'report_daily':
+        context.user_data['report_state'] = 'AWAIT_DAILY_DATE'
+        await query.edit_message_text(
+            t('report_ask_date', lang),
+            reply_markup=_back_keyboard(lang), parse_mode='Markdown'
+        )
+
+    # ── CSV export: ask for start date ────────────────────────────────────
+    elif data == 'report_csv':
+        context.user_data['report_state'] = 'AWAIT_CSV_START'
+        await query.edit_message_text(
+            t('report_ask_start_date', lang),
+            reply_markup=_back_keyboard(lang), parse_mode='Markdown'
+        )
 
     # ── Open positions ─────────────────────────────────────────────────────
     elif data == 'positions':
@@ -1396,6 +1380,172 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass  # tapping the current-mode label does nothing
 
 
+# ── Report text-input handler ──────────────────────────────────────────────────
+
+def _get_subscriber_name(chat_id: str) -> str:
+    conn = _db()
+    c    = conn.cursor()
+    c.execute("SELECT first_name, last_name FROM subscribers WHERE chat_id=?", (chat_id,))
+    row  = c.fetchone()
+    conn.close()
+    if row:
+        name = f"{row[0] or ''} {row[1] or ''}".strip()
+        return name or chat_id
+    return chat_id
+
+
+def _build_daily_report_text(chat_id: str, lang: str, date_str: str) -> str:
+    """Build a daily P&L report for a specific date and return it as a Telegram message."""
+    conn = _db()
+    c    = conn.cursor()
+    c.execute(
+        "SELECT pnl FROM trades WHERE chat_id=? AND status='CLOSED' AND closed_at LIKE ?",
+        (chat_id, f"{date_str}%")
+    )
+    closed_pnls = [row[0] for row in c.fetchall() if row[0] is not None]
+    conn.close()
+
+    title = t('report_title', lang, date=date_str) + '\n\n'
+
+    if not closed_pnls:
+        return title + t('report_empty', lang)
+
+    wins   = sum(1 for p in closed_pnls if p > 0)
+    losses = sum(1 for p in closed_pnls if p <= 0)
+    net    = round(sum(closed_pnls), 2)
+    return (
+        title +
+        t('report_body', lang,
+          total=len(closed_pnls),
+          wins=wins,
+          win_rate=round(wins / len(closed_pnls) * 100, 1),
+          losses=losses,
+          loss_rate=round(losses / len(closed_pnls) * 100, 1),
+          net_pnl=net,
+          best=round(max(closed_pnls), 2),
+          worst=round(min(closed_pnls), 2))
+    )
+
+
+async def report_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles text messages for the report date-collection flow."""
+    state = context.user_data.get('report_state')
+    if not state:
+        return  # not in a report flow — let other handlers process
+
+    chat_id = str(update.message.chat_id)
+    lang    = _get_lang(chat_id)
+    text    = (update.message.text or '').strip()
+
+    def _valid_date(s: str) -> bool:
+        try:
+            datetime.strptime(s, '%Y-%m-%d')
+            return True
+        except ValueError:
+            return False
+
+    # ── Waiting for date of daily report ────────────────────────────────────
+    if state == 'AWAIT_DAILY_DATE':
+        if not _valid_date(text):
+            await update.message.reply_text(
+                t('report_invalid_date', lang), parse_mode='Markdown'
+            )
+            return
+
+        context.user_data.pop('report_state', None)
+
+        # On-demand sync so recent broker closes appear
+        try:
+            from core.executor import get_user_credentials, get_session
+            from core.sync import reconcile, backfill_closed_pnls
+            creds = get_user_credentials(chat_id)
+            if creds:
+                base_url, headers = get_session(creds)
+                if headers:
+                    reconcile(chat_id, base_url, headers)
+                    backfill_closed_pnls(chat_id, base_url, headers, lookback=300)
+        except Exception:
+            pass
+
+        report = _build_daily_report_text(chat_id, lang, text)
+        await update.message.reply_text(report, parse_mode='Markdown')
+
+    # ── Waiting for CSV start date ───────────────────────────────────────────
+    elif state == 'AWAIT_CSV_START':
+        if not _valid_date(text):
+            await update.message.reply_text(
+                t('report_invalid_date', lang), parse_mode='Markdown'
+            )
+            return
+
+        context.user_data['report_state']     = 'AWAIT_CSV_END'
+        context.user_data['report_csv_start'] = text
+        await update.message.reply_text(
+            t('report_ask_end_date', lang), parse_mode='Markdown'
+        )
+
+    # ── Waiting for CSV end date — generate and send file ───────────────────
+    elif state == 'AWAIT_CSV_END':
+        if not _valid_date(text):
+            await update.message.reply_text(
+                t('report_invalid_date', lang), parse_mode='Markdown'
+            )
+            return
+
+        start_date = context.user_data.pop('report_csv_start', '')
+        end_date   = text
+        context.user_data.pop('report_state', None)
+
+        # Ensure start <= end
+        if start_date > end_date:
+            start_date, end_date = end_date, start_date
+
+        conn = _db()
+        c    = conn.cursor()
+        c.execute(
+            """SELECT trade_id, symbol, direction, entry_price, size, deal_id,
+                      pnl, status, opened_at, closed_at
+               FROM trades
+               WHERE chat_id=?
+                 AND (
+                       (closed_at IS NOT NULL AND closed_at BETWEEN ? AND ?)
+                    OR (status='OPEN' AND opened_at BETWEEN ? AND ?)
+                 )
+               ORDER BY COALESCE(closed_at, opened_at)""",
+            (chat_id, f"{start_date} 00:00:00", f"{end_date} 23:59:59",
+                      f"{start_date} 00:00:00", f"{end_date} 23:59:59")
+        )
+        rows = c.fetchall()
+        conn.close()
+
+        if not rows:
+            await update.message.reply_text(
+                t('report_csv_empty', lang), parse_mode='Markdown'
+            )
+            return
+
+        # Build CSV in memory
+        output   = io.StringIO()
+        writer   = csv.writer(output)
+        writer.writerow(['Trade ID', 'Symbol', 'Direction', 'Entry Price',
+                         'Size', 'Deal ID', 'P&L', 'Status',
+                         'Opened At', 'Closed At'])
+        for row in rows:
+            writer.writerow(row)
+
+        csv_bytes = output.getvalue().encode('utf-8-sig')  # BOM for Excel
+        buf       = io.BytesIO(csv_bytes)
+
+        client_name = _get_subscriber_name(chat_id).replace(' ', '_') or chat_id
+        filename    = f"{client_name}_{start_date}_to_{end_date}.csv"
+
+        await update.message.reply_document(
+            document=buf,
+            filename=filename,
+            caption=f"Report: {start_date} → {end_date}  |  {len(rows)} trade(s)",
+        )
+
+
 # ── Circuit Breaker commands ───────────────────────────────────────────────────
 
 async def override_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1530,6 +1680,9 @@ if __name__ == "__main__":
     )
 
     app.add_handler(conv)
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND, report_input_handler
+    ))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(CommandHandler('override',   override_handler))
     app.add_handler(CommandHandler('stop_today', stop_today_handler))

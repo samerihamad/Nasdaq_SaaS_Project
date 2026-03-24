@@ -31,6 +31,7 @@ from database.db_manager import (
     get_user_risk_params, get_bank_details, set_bank_field, BANK_FIELDS,
 )
 from core.watcher import broadcast_to_all, run_watcher, get_all_active_subscribers
+from utils.market_hours import get_market_status, STATUS_OPEN
 from bot.licensing import issue_license
 from bot.notifier import send_telegram_message
 from bot.i18n import t
@@ -103,9 +104,17 @@ async def admin_handler(update: Update, context):
         set_maintenance_mode(activate)
 
         if activate:
-            count = _broadcast_localized('admin_maintenance_on_msg')
+            # Choose message based on whether the market is currently open
+            market_is_open = get_market_status() == STATUS_OPEN
+            msg_key = (
+                'admin_maintenance_on_msg'        # emergency — market is live
+                if market_is_open else
+                'admin_maintenance_scheduled_msg' # scheduled — market is closed
+            )
+            count = _broadcast_localized(msg_key)
+            label = "Emergency" if market_is_open else "Scheduled"
             await update.message.reply_text(
-                f"*Maintenance mode ON*\n{count} subscriber(s) notified.",
+                f"*Maintenance mode ON* ({label})\n{count} subscriber(s) notified.",
                 parse_mode='Markdown'
             )
         else:

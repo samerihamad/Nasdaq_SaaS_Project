@@ -3,7 +3,7 @@ import sqlite3
 from datetime import datetime
 from bot.notifier import send_telegram_message
 from bot.licensing import safe_decrypt
-from database.db_manager import is_maintenance_mode
+from database.db_manager import is_maintenance_mode, get_subscriber_lang
 from core.risk_manager import (
     can_open_trade, record_trade_result,
     calculate_position_size, STATE_MANUAL_OVERRIDE,
@@ -734,7 +734,7 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
 
     # ── Notify (localized detailed trade report) ─────────────────────────────
     is_override  = (reason == STATE_MANUAL_OVERRIDE)
-    _fmt_money = lambda v: f"${v:,.2f}"
+    _fmt_money   = lambda v: f"${v:,.2f}"
 
     total_amount = entry_price * qty_total
     risk_amount  = stop_dist * qty_total
@@ -751,42 +751,48 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
     trade_index = row[0] if row else 0
     conn.close()
 
-    # Strategy label mapping (main.py passes best_label into this function).
-    strategy_map = {
-        'MeanRev': 'Mean Reversion',
-        'MeanReversion': 'Mean Reversion',
-        'Momentum': 'Momentum',
-        'RF': 'RF',
-    }
-    strategy_name = strategy_map.get(strategy_label or '', None) or (strategy_label or 'Mean Reversion')
-
     from utils.market_hours import _now_et
-    now_et_str = _now_et().strftime('%Y-%m-%d %H:%M %Z')
+    now_et_str = _now_et().strftime('%Y-%m-%d %H:%M ET')
 
-    override_line = "⚠️ تجاوز يدوي — جاري فتح صفقة جديدة\n" if is_override else ""
-    header = (
-        f"🇦🇪 العربية\n"
-        f"{sq_color} {symbol}  اسم السهم\n"
-        f"📅 {now_et_str}\n"
-        f"------------------------------\n"
-        f"{override_line}"
-    )
+    lang = get_subscriber_lang(chat_id)
 
-    msg = (
-        f"{header}"
-        f"🔔 صفقة جديدة #{trade_index} 🔔\n"
-        f"📊 الاستراتيجية  : {strategy_name}\n"
-        f"▶️  الاتجاه       : {dir_ar}\n"
-        f"💰 الدخول        : {_fmt_money(entry_price)}\n"
-        f"🔢 الكمية         : {qty_total} سهم\n"
-        f"💵 إجمالي المبلغ : {_fmt_money(total_amount)}\n"
-        f"🔴 وقف الخسارة   : {_fmt_money(stop_level)}\n"
-        f"----------\n"
-        f"🎯 الهدف 1 ({qty1} سهم) : {_fmt_money(target1)} (1R)\n"
-        f"🏆 الهدف 2 ({qty2} سهم) : {_fmt_money(target2)} (1.33R)\n"
-        f"---------\n"
-        f"⚠️  المخاطرة      : {_fmt_money(risk_amount)}"
-    )
+    if lang == 'en':
+        dir_label   = 'BUY' if action == 'BUY' else 'SELL'
+        override_line = "⚠️ Manual Override — New trade initiated\n\n" if is_override else ""
+        msg = (
+            f"{sq_color} *New Trade #{trade_index} — {symbol}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{override_line}"
+            f"▶️  Direction    :  *{dir_label}*\n"
+            f"💰  Entry Price  :  *{_fmt_money(entry_price)}*\n"
+            f"🔢  Quantity     :  *{qty_total} shares*\n"
+            f"💵  Total Value  :  *{_fmt_money(total_amount)}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔴  Stop Loss    :  *{_fmt_money(stop_level)}*\n"
+            f"🎯  Target 1     :  *{_fmt_money(target1)}*  ({qty1} shares — 1R)\n"
+            f"🏆  Target 2     :  *{_fmt_money(target2)}*  ({qty2} shares — 1.33R)\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚠️  Risk Amount  :  *{_fmt_money(risk_amount)}*\n"
+            f"🕐  Time (ET)    :  {now_et_str}"
+        )
+    else:
+        override_line = "⚠️ تجاوز يدوي — جاري فتح صفقة جديدة\n\n" if is_override else ""
+        msg = (
+            f"{sq_color} *صفقة جديدة #{trade_index} — {symbol}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{override_line}"
+            f"▶️  الاتجاه        :  *{dir_ar}*\n"
+            f"💰  سعر الدخول    :  *{_fmt_money(entry_price)}*\n"
+            f"🔢  الكمية         :  *{qty_total} سهم*\n"
+            f"💵  إجمالي المبلغ  :  *{_fmt_money(total_amount)}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔴  وقف الخسارة   :  *{_fmt_money(stop_level)}*\n"
+            f"🎯  الهدف 1        :  *{_fmt_money(target1)}*  ({qty1} سهم — 1R)\n"
+            f"🏆  الهدف 2        :  *{_fmt_money(target2)}*  ({qty2} سهم — 1.33R)\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚠️  المخاطرة       :  *{_fmt_money(risk_amount)}*\n"
+            f"🕐  التوقيت (ET)   :  {now_et_str}"
+        )
 
     send_telegram_message(chat_id, msg)
 
