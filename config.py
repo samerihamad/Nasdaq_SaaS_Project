@@ -114,6 +114,20 @@ HEARTBEAT_FILE = "heartbeat.json"
 # Pre-market alert is sent when minutes_to_open <= this value
 PREMARKET_ALERT_WINDOW_MIN = 30
 
+# ── AI Gate Tuning (soft-gate mode) ──────────────────────────────────────────
+#
+# Per-strategy minimum AI probability thresholds (%).
+# These apply in dispatch_signal() as an execution gate after strategy confidence.
+AI_MIN_PROB_RF = 60.0
+AI_MIN_PROB_MOMENTUM = 52.0
+AI_MIN_PROB_MEANREV = 48.0
+
+# Soft override:
+# Allow high-confidence strategy signals to pass even if AI probability is below
+# the per-strategy threshold, as long as market regime is not VOLATILE.
+AI_SOFT_OVERRIDE_CONFIDENCE = 75.0
+AI_SOFT_OVERRIDE_MIN_PROB = 20.0
+
 # Refresh watchlist while market is open (seconds)
 WATCHLIST_REFRESH_SECONDS = 3600
 

@@ -50,6 +50,11 @@ from config import (
     HEARTBEAT_FILE,
     PREMARKET_ALERT_WINDOW_MIN,
     WATCHLIST_REFRESH_SECONDS,
+    AI_MIN_PROB_RF,
+    AI_MIN_PROB_MOMENTUM,
+    AI_MIN_PROB_MEANREV,
+    AI_SOFT_OVERRIDE_CONFIDENCE,
+    AI_SOFT_OVERRIDE_MIN_PROB,
 )
 
 # ── Single-instance lock ──────────────────────────────────────────────────────
@@ -385,13 +390,46 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
     # ── AI Gatekeeper (evaluated once, applies to all users) ──────────────────
     if timeframes:
         ai_approved, ai_prob, regime = validate_signal(symbol, action, timeframes)
-        if not ai_approved:
+        strategy_key = (strategy_label or "RF").strip()
+        ai_min_by_strategy = {
+            "RF": AI_MIN_PROB_RF,
+            "Momentum": AI_MIN_PROB_MOMENTUM,
+            "MeanRev": AI_MIN_PROB_MEANREV,
+        }
+        ai_min_prob = ai_min_by_strategy.get(strategy_key, AI_MIN_PROB_RF)
+
+        # Soft-gate logic:
+        # 1) Normal pass: AI probability meets per-strategy threshold.
+        # 2) Soft override: very strong technical confidence can pass despite a
+        #    lower AI probability, but never in VOLATILE regime.
+        ai_pass_by_threshold = ai_prob >= ai_min_prob
+        ai_pass_by_override = (
+            confidence >= AI_SOFT_OVERRIDE_CONFIDENCE
+            and ai_prob >= AI_SOFT_OVERRIDE_MIN_PROB
+            and regime != "VOLATILE"
+            and strategy_key in ("Momentum", "MeanRev")
+        )
+
+        if not (ai_pass_by_threshold or ai_pass_by_override):
             print(
                 f"   [AI BLOCK] {symbol} {action} — "
-                f"probability {ai_prob:.1f}% < {AI_PROBABILITY_THRESHOLD:.1f}% | regime={regime}"
+                f"probability {ai_prob:.1f}% < min({strategy_key})={ai_min_prob:.1f}% "
+                f"| regime={regime} | conf={confidence:.1f}%"
             )
             return
-        print(f"   [AI OK] {symbol} {action} — probability={ai_prob:.1f}% | regime={regime}")
+
+        if ai_pass_by_override and not ai_pass_by_threshold:
+            print(
+                f"   [AI OVERRIDE] {symbol} {action} — "
+                f"probability={ai_prob:.1f}% < min({strategy_key})={ai_min_prob:.1f}% "
+                f"but confidence={confidence:.1f}% >= {AI_SOFT_OVERRIDE_CONFIDENCE:.1f}% "
+                f"| regime={regime}"
+            )
+        else:
+            print(
+                f"   [AI OK] {symbol} {action} — probability={ai_prob:.1f}% "
+                f"| min({strategy_key})={ai_min_prob:.1f}% | regime={regime}"
+            )
 
     # ── Iterate only subscribers who have started their trading engine ─────────
     subscribers = get_trading_subscribers()
