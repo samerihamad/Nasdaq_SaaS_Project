@@ -36,7 +36,7 @@ log = logging.getLogger(__name__)
 
 MODEL_DIR             = "models"
 MODEL_VERSION         = 2          # bump whenever build_features() columns change
-AI_PROBABILITY_THRESHOLD = 65.0    # minimum probability to approve a trade
+AI_PROBABILITY_THRESHOLD = 60.0    # minimum probability to approve a trade
 MIN_TRAIN_BARS        = 220        # supports EMA200 + labeling while allowing newer listings
 TRAIN_RETRY_HOURS     = 6          # avoid retry spam for symbols with short history
 
@@ -354,7 +354,7 @@ def validate_signal(symbol: str, direction: str, timeframes: dict) -> tuple:
 
     # Regime penalty: high volatility = uncertain environment
     if regime['type'] == 'VOLATILE':
-        probability = round(probability * 0.92, 1)   # -8% penalty
+        probability = round(probability * 0.95, 1)   # -5% penalty
         log.info(
             "[AI Gate %s] VOLATILE regime penalty applied → probability=%.1f%%",
             symbol, probability,
