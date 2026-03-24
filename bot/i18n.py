@@ -479,6 +479,10 @@ STRINGS = {
         'ar': '📊 *تقرير الأداء*\nاختر نوع التقرير:',
         'en': '📊 *Performance Report*\nChoose report type:',
     },
+    'report_loading': {
+        'ar': '⏳ الرجاء الانتظار جاري العمل على تجهيز التقرير ..',
+        'en': '⏳ Please wait, we are preparing your report...',
+    },
     'btn_report_daily': {
         'ar': '📅 تقرير يوم محدد',
         'en': '📅 Extract Daily Report',
@@ -506,6 +510,10 @@ STRINGS = {
     'report_csv_empty': {
         'ar': '📭 لا توجد صفقات في هذا النطاق الزمني.',
         'en': '📭 No trades found in that date range.',
+    },
+    'report_csv_ready': {
+        'ar': '✅ تم تجهيز التقرير وإرساله.',
+        'en': '✅ The report is ready and has been sent.',
     },
     'report_title': {
         'ar': '📊 *تقرير الأداء*\n{date}',

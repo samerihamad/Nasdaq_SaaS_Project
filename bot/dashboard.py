@@ -60,8 +60,8 @@ from utils.market_hours import (
 
 load_dotenv()
 
-_support_username = (os.getenv('SUPPORT_USERNAME') or 'NATBSupport').strip().lstrip('@')
-SUPPORT_URL = 'https://t.me/' + _support_username
+# Always route support actions to the official company support bot.
+SUPPORT_URL = 'https://t.me/NATBSupport_bot'
 
 try:
     sys.stdout.reconfigure(encoding='utf-8')
@@ -1019,6 +1019,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Performance report sub-menu ────────────────────────────────────────
     elif data == 'report':
+        await query.edit_message_text(t('report_loading', lang), parse_mode='Markdown')
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton(t('btn_report_daily', lang), callback_data='report_daily')],
             [InlineKeyboardButton(t('btn_report_csv',   lang), callback_data='report_csv')],
@@ -1031,6 +1032,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Daily report: ask for date ─────────────────────────────────────────
     elif data == 'report_daily':
+        await query.edit_message_text(t('report_loading', lang), parse_mode='Markdown')
         context.user_data['report_state'] = 'AWAIT_DAILY_DATE'
         await query.edit_message_text(
             t('report_ask_date', lang),
@@ -1039,6 +1041,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── CSV export: ask for start date ────────────────────────────────────
     elif data == 'report_csv':
+        await query.edit_message_text(t('report_loading', lang), parse_mode='Markdown')
         context.user_data['report_state'] = 'AWAIT_CSV_START'
         await query.edit_message_text(
             t('report_ask_start_date', lang),
@@ -1453,6 +1456,9 @@ async def report_input_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             return
 
         context.user_data.pop('report_state', None)
+        loading_msg = await update.message.reply_text(
+            t('report_loading', lang), parse_mode='Markdown'
+        )
 
         # On-demand sync so recent broker closes appear
         try:
@@ -1463,12 +1469,18 @@ async def report_input_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 base_url, headers = get_session(creds)
                 if headers:
                     reconcile(chat_id, base_url, headers)
-                    backfill_closed_pnls(chat_id, base_url, headers, lookback=300)
+                    # Use a wider lookback to avoid "all zeros" when requested date
+                    # has older closed trades whose PnL was not backfilled before.
+                    backfill_closed_pnls(chat_id, base_url, headers, lookback=5000)
         except Exception:
             pass
 
         report = _build_daily_report_text(chat_id, lang, text)
-        await update.message.reply_text(report, parse_mode='Markdown')
+        await loading_msg.edit_text(
+            report,
+            reply_markup=_back_keyboard(lang),
+            parse_mode='Markdown',
+        )
 
     # ── Waiting for CSV start date ───────────────────────────────────────────
     elif state == 'AWAIT_CSV_START':
@@ -1500,6 +1512,10 @@ async def report_input_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         if start_date > end_date:
             start_date, end_date = end_date, start_date
 
+        loading_msg = await update.message.reply_text(
+            t('report_loading', lang), parse_mode='Markdown'
+        )
+
         conn = _db()
         c    = conn.cursor()
         c.execute(
@@ -1519,7 +1535,7 @@ async def report_input_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         conn.close()
 
         if not rows:
-            await update.message.reply_text(
+            await loading_msg.edit_text(
                 t('report_csv_empty', lang), parse_mode='Markdown'
             )
             return
@@ -1543,6 +1559,11 @@ async def report_input_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             document=buf,
             filename=filename,
             caption=f"Report: {start_date} → {end_date}  |  {len(rows)} trade(s)",
+        )
+        await loading_msg.edit_text(
+            t('report_csv_ready', lang),
+            reply_markup=_back_keyboard(lang),
+            parse_mode='Markdown',
         )
 
 
