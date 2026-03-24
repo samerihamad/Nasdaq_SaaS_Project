@@ -606,7 +606,7 @@ def run_trading_bot():
             if _last_scan_date != today:
                 _watchlist      = run_daily_scan()
                 _last_scan_date = today
-                    _unsupported_all_day.clear()
+                _unsupported_all_day.clear()
                 if _watchlist:
                     pretrain_models(_watchlist)
                 _last_watchlist_refresh_at = now_utc
