@@ -30,9 +30,11 @@ from core.executor import place_trade_for_user, monitor_and_close, is_symbol_sup
 from core.watcher import run_watcher, get_all_active_subscribers, get_trading_subscribers
 from core.strategy_meanrev  import analyze as analyze_meanrev
 from core.strategy_momentum import analyze as analyze_momentum
+from core.risk_manager import get_risk_state, STATE_USER_DAY_HALT
 from bot.notifier import send_telegram_message
 from bot.dashboard import post_pending_signal, get_signal_status
 from bot.i18n import t
+from database.db_manager import set_trading_enabled
 from config import (
     MIN_CONFIDENCE,
     CHECK_INTERVAL,
@@ -250,6 +252,55 @@ def _get_user_mode(chat_id: str) -> str:
     return row[0] if row and row[0] else 'AUTO'
 
 
+def _is_license_valid_for_user(chat_id: str) -> bool:
+    """Lightweight license check for engine auto-enable decisions."""
+    conn = sqlite3.connect('database/trading_saas.db')
+    c    = conn.cursor()
+    c.execute(
+        "SELECT payment_status, expiry_date FROM subscribers WHERE chat_id=?",
+        (chat_id,),
+    )
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return False
+    payment_status, expiry_date = row
+    if payment_status != 'APPROVED' or not expiry_date:
+        return False
+    try:
+        return date.fromisoformat(expiry_date) >= date.today()
+    except Exception:
+        return False
+
+
+def _auto_resume_trading_at_open():
+    """
+    Safety net at market open:
+    Re-enable trading for eligible users so an accidental pause does not
+    silently waste a full trading day.
+    """
+    resumed = 0
+    for row in get_all_active_subscribers():
+        chat_id = str(row[0])
+        try:
+            # Respect explicit user day-halt; only auto-resume normal users.
+            if get_risk_state(chat_id) == STATE_USER_DAY_HALT:
+                continue
+            if _get_user_mode(chat_id) != 'AUTO':
+                continue
+            if not _is_license_valid_for_user(chat_id):
+                continue
+
+            set_trading_enabled(chat_id, True)
+            resumed += 1
+
+        except Exception as exc:
+            print(f"[AUTO-RESUME] Skip {chat_id}: {exc}")
+
+    if resumed:
+        print(f"[AUTO-RESUME] Enabled trading for {resumed} eligible subscriber(s) at market open.")
+
+
 # ── Daily scan ────────────────────────────────────────────────────────────────
 
 def run_daily_scan():
@@ -407,6 +458,7 @@ def run_trading_bot():
             # ── Detect CLOSED → OPEN transition → reset closed flag ───────────
             if _prev_market_status != STATUS_OPEN and market_status == STATUS_OPEN:
                 _closed_notified = False
+                _auto_resume_trading_at_open()
 
             _prev_market_status = market_status
 
