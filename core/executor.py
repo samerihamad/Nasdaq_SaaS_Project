@@ -1,7 +1,7 @@
 import requests
 import sqlite3
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from bot.notifier import send_telegram_message
 from bot.licensing import safe_decrypt
 from database.db_manager import is_maintenance_mode, get_subscriber_lang
@@ -20,6 +20,8 @@ from core.sync import reconcile
 # Daily per-user symbol→epic cache (and unsupported symbols) to avoid
 # repeating broker lookups for every signal cycle.
 _EPIC_CACHE = {}
+_SESSION_CACHE = {}
+SESSION_TTL_SECONDS = 45
 
 
 # ── Credentials & session ─────────────────────────────────────────────────────
@@ -54,6 +56,13 @@ def get_session(creds):
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
+
+    cache_key = f"{api_key}|{is_demo}|{user_email}"
+    now = datetime.now(timezone.utc)
+    cached = _SESSION_CACHE.get(cache_key)
+    if cached and cached.get("expires_at") and cached["expires_at"] > now:
+        return cached["base_url"], cached["headers"]
+
     auth_res = None
     # Capital auth can fail transiently (network edge / temporary backend errors).
     # Retry briefly before surfacing an authentication failure to the user.
@@ -69,11 +78,17 @@ def get_session(creds):
             auth_res = None
             print(f"[Capital Auth Exception] attempt={attempt + 1}/3 error={exc}")
         if auth_res is not None and auth_res.status_code == 200:
-            return base_url, {
+            session_headers = {
                 **headers,
                 "CST": auth_res.headers.get("CST"),
                 "X-SECURITY-TOKEN": auth_res.headers.get("X-SECURITY-TOKEN"),
             }
+            _SESSION_CACHE[cache_key] = {
+                "base_url": base_url,
+                "headers": session_headers,
+                "expires_at": now + timedelta(seconds=SESSION_TTL_SECONDS),
+            }
+            return base_url, session_headers
         if attempt < 2:
             time.sleep(0.7 * (attempt + 1))
 
@@ -140,6 +155,12 @@ def _resolve_epic(base_url, headers, symbol):
     Returns epic string, or None if no tradable market is found.
     """
     s = str(symbol or "").strip().upper()
+    # Common ticker aliases / typo normalization
+    # PAYP frequently appears in screener output while broker uses PYPL.
+    symbol_aliases = {
+        "PAYP": "PYPL",
+    }
+    s = symbol_aliases.get(s, s)
     if not s:
         return None
 

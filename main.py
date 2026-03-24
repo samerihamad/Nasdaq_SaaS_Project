@@ -31,7 +31,7 @@ from utils.ai_model import (
 )
 from utils.market_hours import get_market_status, minutes_to_open, STATUS_OPEN, STATUS_CLOSED
 from utils.daily_report import send_daily_reports
-from core.executor import place_trade_for_user, monitor_and_close, is_symbol_supported_for_user
+from core.executor import place_trade_for_user, monitor_and_close
 from core.watcher import run_watcher, get_all_active_subscribers, get_trading_subscribers
 from core.strategy_meanrev  import analyze as analyze_meanrev
 from core.strategy_momentum import analyze as analyze_momentum
@@ -100,6 +100,7 @@ _daily_report_sent  = None   # date of last daily report
 _prev_market_status = None   # detect OPEN→CLOSED transition
 _closed_notified    = False  # sent "market closed" msg this session
 _last_watchlist_refresh_at = None  # UTC datetime of last in-session refresh
+_unsupported_all_day: set[str] = set()  # symbols unsupported for all users today
 
 
 # ── Heartbeat & backup threads ────────────────────────────────────────────────
@@ -436,26 +437,38 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
     if not subscribers:
         print(f"   [DISPATCH] No subscribers with trading enabled — skipping signal.")
         return
+    if symbol in _unsupported_all_day:
+        print(f"   [DISPATCH] {symbol} marked unsupported-for-all today — skipping.")
+        return
 
-    dispatched = 0
+    attempted = 0
+    opened = 0
+    skipped = 0
+    failed = 0
+    unsupported_for_all = True
     for row in subscribers:
         chat_id = str(row[0])
         try:
-            # Pre-filter: only dispatch symbols tradable on this user's broker account.
-            if not is_symbol_supported_for_user(chat_id, symbol):
-                print(f"   [SKIP  {chat_id}] {symbol} not supported on broker — filtered before dispatch")
-                continue
-
             mode = _get_user_mode(chat_id)
 
             if mode == 'AUTO':
+                attempted += 1
                 result = place_trade_for_user(
                     chat_id, symbol, action,
                     confidence=confidence, stop_loss_pct=stop_loss_pct,
                     strategy_label=strategy_label,
                 )
                 print(f"   [AUTO  {chat_id}] {symbol} {action} → {result}")
-                dispatched += 1
+                if isinstance(result, str) and result.startswith("✅ Opened"):
+                    opened += 1
+                    unsupported_for_all = False
+                elif isinstance(result, str) and result.startswith("⏭️"):
+                    skipped += 1
+                    if "symbol not available on broker" not in result:
+                        unsupported_for_all = False
+                else:
+                    failed += 1
+                    unsupported_for_all = False
 
             else:
                 # HYBRID: post to DB, non-blocking.
@@ -466,18 +479,29 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
                     stop_loss_pct=stop_loss_pct,
                 )
                 print(f"   [HYBRID {chat_id}] Signal #{sig_id} posted — awaiting approval")
-                dispatched += 1
+                attempted += 1
+                # In HYBRID mode this means "queued", not opened yet.
+                skipped += 1
+                unsupported_for_all = False
 
         except Exception as exc:
             print(f"   [ERROR  {chat_id}] dispatch failed: {exc}")
+            failed += 1
+            unsupported_for_all = False
 
-    print(f"   Signal dispatched to {dispatched}/{len(subscribers)} subscribers")
+    print(
+        f"   Signal outcome: attempted={attempted}/{len(subscribers)} | "
+        f"opened={opened} | skipped={skipped} | failed={failed}"
+    )
+    if attempted > 0 and unsupported_for_all:
+        _unsupported_all_day.add(symbol)
+        print(f"   [WATCHLIST PRUNE] {symbol} marked unsupported for all users today.")
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def run_trading_bot():
-    global _watchlist, _last_scan_date, _prev_market_status, _closed_notified, _daily_report_sent, _last_watchlist_refresh_at
+    global _watchlist, _last_scan_date, _prev_market_status, _closed_notified, _daily_report_sent, _last_watchlist_refresh_at, _unsupported_all_day
 
     print("🚀 NATB v2.0 — محرك التداول الذكي")
     print(f"   الثقة الدنيا: {MIN_CONFIDENCE}% | فحص كل {CHECK_INTERVAL}s")
@@ -524,6 +548,7 @@ def run_trading_bot():
                         and 0 < mins <= PREMARKET_ALERT_WINDOW_MIN):
                     _watchlist = run_daily_scan()
                     _last_scan_date = today
+                    _unsupported_all_day.clear()
                     if _watchlist:
                         pretrain_models(_watchlist)
 
@@ -581,6 +606,7 @@ def run_trading_bot():
             if _last_scan_date != today:
                 _watchlist      = run_daily_scan()
                 _last_scan_date = today
+                    _unsupported_all_day.clear()
                 if _watchlist:
                     pretrain_models(_watchlist)
                 _last_watchlist_refresh_at = now_utc
