@@ -112,7 +112,7 @@ BACKUP_INTERVAL = 3600
 HEARTBEAT_FILE = "heartbeat.json"
 
 # Pre-market alert is sent when minutes_to_open <= this value
-PREMARKET_ALERT_WINDOW_MIN = 20
+PREMARKET_ALERT_WINDOW_MIN = 30
 
 # Refresh watchlist while market is open (seconds)
 WATCHLIST_REFRESH_SECONDS = 3600
