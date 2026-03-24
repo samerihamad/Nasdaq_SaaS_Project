@@ -1,5 +1,6 @@
 import requests
 import sqlite3
+import time
 from datetime import datetime
 from bot.notifier import send_telegram_message
 from bot.licensing import safe_decrypt
@@ -53,25 +54,39 @@ def get_session(creds):
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
-    auth_res = requests.post(
-        f"{base_url}/session",
-        json={"identifier": user_email, "password": password},
-        headers=headers,
-    )
-    if auth_res.status_code == 200:
-        return base_url, {
-            **headers,
-            "CST": auth_res.headers.get("CST"),
-            "X-SECURITY-TOKEN": auth_res.headers.get("X-SECURITY-TOKEN"),
-        }
+    auth_res = None
+    # Capital auth can fail transiently (network edge / temporary backend errors).
+    # Retry briefly before surfacing an authentication failure to the user.
+    for attempt in range(3):
+        try:
+            auth_res = requests.post(
+                f"{base_url}/session",
+                json={"identifier": user_email, "password": password},
+                headers=headers,
+                timeout=20,
+            )
+        except Exception as exc:
+            auth_res = None
+            print(f"[Capital Auth Exception] attempt={attempt + 1}/3 error={exc}")
+        if auth_res is not None and auth_res.status_code == 200:
+            return base_url, {
+                **headers,
+                "CST": auth_res.headers.get("CST"),
+                "X-SECURITY-TOKEN": auth_res.headers.get("X-SECURITY-TOKEN"),
+            }
+        if attempt < 2:
+            time.sleep(0.7 * (attempt + 1))
+
     # Print useful debugging info (kept simple; avoid dumping full secrets).
     try:
-        err_text = (auth_res.text or "").strip()
+        err_text = (auth_res.text or "").strip() if auth_res is not None else "no response"
         err_text = err_text[:400] + ("..." if len(err_text) > 400 else "")
+        status = auth_res.status_code if auth_res is not None else "N/A"
     except Exception:
         err_text = ""
+        status = "N/A"
     print(
-        f"[Capital Auth Failed] status={auth_res.status_code} "
+        f"[Capital Auth Failed] status={status} "
         f"is_demo={is_demo} base_url={base_url}\n"
         f"response={err_text}"
     )
@@ -202,6 +217,30 @@ def _resolve_epic(base_url, headers, symbol):
         pass
 
     return None
+
+
+def _get_min_deal_size(base_url, headers, epic) -> float:
+    """
+    Fetch broker minimum deal size for an epic.
+    Returns 1.0 if unavailable.
+    """
+    try:
+        res = requests.get(f"{base_url}/markets/{epic}", headers=headers, timeout=20)
+        if res.status_code != 200:
+            return 1.0
+        data = res.json() or {}
+        rules = data.get("dealingRules", {}) or {}
+        md = rules.get("minDealSize")
+        if isinstance(md, dict):
+            val = md.get("value")
+        else:
+            val = md
+        if val is None:
+            val = rules.get("minStepDistance")
+        v = float(val) if val is not None else 1.0
+        return max(1.0, v)
+    except Exception:
+        return 1.0
 
 
 def resolve_epic_for_user(chat_id, symbol, base_url=None, headers=None, is_demo=None):
@@ -690,15 +729,26 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
 
     # Split into two positions to support TP1 + TP2 on broker.
     # Capital applies one TP per position, so we split size intentionally.
-    qty_total = max(1, int(round(size)))
-    qty1 = max(1, qty_total // 2)
-    qty2 = qty_total - qty1
-    if qty2 < 1:
-        qty2 = 0
+    min_deal_size = _get_min_deal_size(base_url, headers, order_epic)
+    required_for_two_legs = max(2.0, 2.0 * min_deal_size)
+    qty_total = max(required_for_two_legs, float(size))
+    # Keep integer-style execution to match current reporting semantics.
+    qty_total = float(int(round(qty_total)))
+    if qty_total < required_for_two_legs:
+        qty_total = required_for_two_legs
 
-    legs = [(qty1, target1)]
-    if qty2 > 0:
-        legs.append((qty2, target2))
+    qty1 = float(int(round(qty_total / 2)))
+    qty2 = float(int(round(qty_total - qty1)))
+    if qty1 < min_deal_size:
+        qty1 = min_deal_size
+        qty2 = max(min_deal_size, qty_total - qty1)
+    if qty2 < min_deal_size:
+        qty2 = min_deal_size
+        qty1 = max(min_deal_size, qty_total - qty2)
+
+    qty_total = qty1 + qty2
+    legs = [(qty1, target1), (qty2, target2)]
+    auto_upsized = qty_total > float(size)
 
     opened_legs = []
     for leg_size, leg_target in legs:
@@ -765,15 +815,16 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             f"{override_line}"
             f"▶️  Direction    :  *{dir_label}*\n"
             f"💰  Entry Price  :  *{_fmt_money(entry_price)}*\n"
-            f"🔢  Quantity     :  *{qty_total} shares*\n"
+            f"🔢  Quantity     :  *{int(qty_total)} shares*\n"
             f"💵  Total Value  :  *{_fmt_money(total_amount)}*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🔴  Stop Loss    :  *{_fmt_money(stop_level)}*\n"
-            f"🎯  Target 1     :  *{_fmt_money(target1)}*  ({qty1} shares — 1R)\n"
-            f"🏆  Target 2     :  *{_fmt_money(target2)}*  ({qty2} shares — 1.33R)\n"
+            f"🎯  Target 1     :  *{_fmt_money(target1)}*  ({int(qty1)} shares — 1R)\n"
+            f"🏆  Target 2     :  *{_fmt_money(target2)}*  ({int(qty2)} shares — 1.33R)\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⚠️  Risk Amount  :  *{_fmt_money(risk_amount)}*\n"
             f"🕐  Time (ET)    :  {now_et_str}"
+            f"{f'\\nℹ️  Size auto-adjusted to broker minimum for TP1/TP2: {int(qty_total)} shares' if auto_upsized else ''}"
         )
     else:
         override_line = "⚠️ تجاوز يدوي — جاري فتح صفقة جديدة\n\n" if is_override else ""
@@ -783,15 +834,16 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             f"{override_line}"
             f"▶️  الاتجاه        :  *{dir_ar}*\n"
             f"💰  سعر الدخول    :  *{_fmt_money(entry_price)}*\n"
-            f"🔢  الكمية         :  *{qty_total} سهم*\n"
+            f"🔢  الكمية         :  *{int(qty_total)} سهم*\n"
             f"💵  إجمالي المبلغ  :  *{_fmt_money(total_amount)}*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🔴  وقف الخسارة   :  *{_fmt_money(stop_level)}*\n"
-            f"🎯  الهدف 1        :  *{_fmt_money(target1)}*  ({qty1} سهم — 1R)\n"
-            f"🏆  الهدف 2        :  *{_fmt_money(target2)}*  ({qty2} سهم — 1.33R)\n"
+            f"🎯  الهدف 1        :  *{_fmt_money(target1)}*  ({int(qty1)} سهم — 1R)\n"
+            f"🏆  الهدف 2        :  *{_fmt_money(target2)}*  ({int(qty2)} سهم — 1.33R)\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⚠️  المخاطرة       :  *{_fmt_money(risk_amount)}*\n"
             f"🕐  التوقيت (ET)   :  {now_et_str}"
+            f"{f'\\nℹ️  تم تعديل الكمية تلقائيًا للحد الأدنى لدى الوسيط للحفاظ على الهدفين: {int(qty_total)} سهم' if auto_upsized else ''}"
         )
 
     send_telegram_message(chat_id, msg)
