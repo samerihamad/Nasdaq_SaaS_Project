@@ -18,7 +18,7 @@ import requests
 import re
 from datetime import datetime as _dt
 
-from core.risk_manager import record_trade_result
+from core.trade_session_finalize import after_trade_leg_closed
 from core.trade_close_messages import (
     send_reconcile_generic_external,
     send_reconcile_tp1_hit,
@@ -98,8 +98,10 @@ def reconcile(chat_id, base_url, headers):
             # if anything fails after updating this row.
             conn.commit()
 
-            # Feed into Circuit Breaker state machine
-            record_trade_result(chat_id, pnl)
+            ps = (parent_session or "").strip()
+            pnl_f = float(pnl)
+            # One risk outcome per session (not per leg) for TP1+TP2 splits.
+            after_trade_leg_closed(chat_id, ps, pnl_f)
 
             if is_maintenance_mode():
                 continue
@@ -111,8 +113,6 @@ def reconcile(chat_id, base_url, headers):
             if sd is None and ts is not None and ep:
                 sd = abs(ep - ts)
             lr = (leg_role or "").strip()
-            ps = (parent_session or "").strip()
-            pnl_f = float(pnl)
 
             if lr == "TP1" and ps:
                 tp2_open = c.execute(

@@ -12,6 +12,7 @@ Report includes:
 
 import sqlite3
 import requests
+from collections import defaultdict
 from datetime import date
 
 from bot.notifier import send_telegram_message
@@ -32,16 +33,30 @@ _STRINGS = {
     },
     'closed_section': {
         'ar': (
-            '\n*الصفقات المغلقة اليوم:*\n'
+            '\n*الصفقات المغلقة اليوم (حسب الجلسة — TP1+TP2 = صفقة واحدة):*\n'
             '• العدد الإجمالي: {total}\n'
-            '• ✅ رابحة: {wins} | ❌ خاسرة: {losses}\n'
-            '• 💵 صافي اليوم: *{sign}{net:.2f}$*'
+            '• ✅ رابحة: {wins} | ❌ خاسرة: {losses}'
+            '{be_line}'
+            '\n• 💵 صافي اليوم: *{sign}{net:.2f}$*'
         ),
         'en': (
-            '\n*Closed Trades Today:*\n'
+            '\n*Closed Today (by session — TP1+TP2 counts as one trade):*\n'
             '• Total: {total}\n'
-            '• ✅ Wins: {wins} | ❌ Losses: {losses}\n'
-            '• 💵 Net P&L: *{sign}{net:.2f}$*'
+            '• ✅ Wins: {wins} | ❌ Losses: {losses}'
+            '{be_line}'
+            '\n• 💵 Net P&L: *{sign}{net:.2f}$*'
+        ),
+    },
+    'tp_session_stats': {
+        'ar': (
+            '\n*تفصيل أهداف متعددة (من السجلات):*\n'
+            '• هدف أول فقط (لم يُحقق الهدف الثاني): {tp1_only}\n'
+            '• هدفان محققان: {both_tp}\n'
+        ),
+        'en': (
+            '\n*Multi-target breakdown (from logs):*\n'
+            '• TP1 only (TP2 not hit): {tp1_only}\n'
+            '• Both targets hit: {both_tp}\n'
         ),
     },
     'open_section_title': {
@@ -133,22 +148,62 @@ def build_report(chat_id: str, lang: str) -> str:
     conn = sqlite3.connect(DB_PATH)
     c    = conn.cursor()
     c.execute(
-        "SELECT pnl FROM trades WHERE chat_id=? AND status='CLOSED' AND closed_at LIKE ?",
-        (chat_id, f"{today_str}%")
+        "SELECT trade_id, COALESCE(parent_session,''), pnl FROM trades "
+        "WHERE chat_id=? AND status='CLOSED' AND closed_at LIKE ?",
+        (chat_id, f"{today_str}%"),
     )
-    closed_pnls = [row[0] for row in c.fetchall() if row[0] is not None]
+    rows = c.fetchall()
+    groups = defaultdict(float)
+    for tid, ps, pnl in rows:
+        key = ps if (ps or "").strip() else f"single:{tid}"
+        groups[key] += float(pnl or 0)
+
+    try:
+        c.execute(
+            "SELECT "
+            "COALESCE(SUM(CASE WHEN tp1_hit=1 AND tp2_hit=0 THEN 1 ELSE 0 END),0), "
+            "COALESCE(SUM(CASE WHEN tp1_hit=1 AND tp2_hit=1 THEN 1 ELSE 0 END),0) "
+            "FROM trade_sessions WHERE chat_id=? AND closed_at LIKE ?",
+            (chat_id, f"{today_str}%"),
+        )
+        tp_row = c.fetchone()
+        tp1_only = int(tp_row[0] or 0) if tp_row else 0
+        both_tp = int(tp_row[1] or 0) if tp_row else 0
+    except sqlite3.OperationalError:
+        tp1_only, both_tp = 0, 0
     conn.close()
 
-    if closed_pnls:
-        wins   = sum(1 for p in closed_pnls if p > 0)
-        losses = sum(1 for p in closed_pnls if p < 0)
-        net    = sum(closed_pnls)
-        lines.append(_t('closed_section', lang,
-                        total=len(closed_pnls),
-                        wins=wins,
-                        losses=losses,
-                        sign='+' if net >= 0 else '',
-                        net=net))
+    if groups:
+        wins = sum(1 for v in groups.values() if v > 0)
+        losses = sum(1 for v in groups.values() if v < 0)
+        be = sum(1 for v in groups.values() if v == 0)
+        net = sum(groups.values())
+        if be:
+            be_line = "\n• ⚖️ Breakeven: {be}" if lang == "en" else "\n• ⚖️ متعادلة: {be}"
+            be_line = be_line.format(be=be)
+        else:
+            be_line = ""
+        lines.append(
+            _t(
+                'closed_section',
+                lang,
+                total=len(groups),
+                wins=wins,
+                losses=losses,
+                be_line=be_line,
+                sign='+' if net >= 0 else '',
+                net=net,
+            )
+        )
+        if (tp1_only + both_tp) > 0:
+            lines.append(
+                _t(
+                    'tp_session_stats',
+                    lang,
+                    tp1_only=tp1_only,
+                    both_tp=both_tp,
+                )
+            )
     else:
         lines.append(_t('no_activity', lang))
 

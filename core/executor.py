@@ -7,10 +7,11 @@ from bot.notifier import send_telegram_message
 from bot.licensing import safe_decrypt
 from database.db_manager import is_maintenance_mode, get_subscriber_lang
 from core.risk_manager import (
-    can_open_trade, record_trade_result,
+    can_open_trade,
     calculate_position_size, STATE_MANUAL_OVERRIDE,
     check_daily_drawdown, check_rr_ratio,
 )
+from core.trade_session_finalize import after_trade_leg_closed
 from core.trailing_stop import (
     calculate_atr, compute_stop_candidate, advance_trailing_stop,
     is_stop_hit, get_open_trades, update_trade_stop,
@@ -671,7 +672,7 @@ def monitor_and_close(chat_id):
             )
             if del_res.status_code == 200:
                 close_trade_in_db(trade['trade_id'], upl)
-                record_trade_result(chat_id, upl)
+                after_trade_leg_closed(chat_id, parent_session, upl)
 
                 sd_eff = sd_stored
                 if sd_eff is None and base_stop is not None and entry_price:

@@ -174,7 +174,11 @@ def can_open_trade(chat_id):
 
 def record_trade_result(chat_id, pnl: float):
     """
-    Call this every time a position closes.
+    Call when a *risk outcome* is final for the user.
+
+    For split TP1/TP2 positions sharing `parent_session`, call this **once** with
+    the session total P&L (after all legs are closed), not per leg — see
+    `trade_session_finalize.after_trade_leg_closed`.
 
     Transitions:
       NORMAL          + 2nd consecutive loss  → CIRCUIT_BREAKER (sends Telegram prompt)

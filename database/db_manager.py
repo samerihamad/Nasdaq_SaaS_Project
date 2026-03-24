@@ -75,6 +75,22 @@ def create_db():
         except Exception:
             pass
 
+    # ── Session aggregates (TP1+TP2 = one risk/report outcome) ────────────────
+    c.execute(
+        '''CREATE TABLE IF NOT EXISTS trade_sessions
+           (session_id   TEXT PRIMARY KEY,
+            chat_id      TEXT NOT NULL,
+            symbol       TEXT,
+            direction    TEXT,
+            opened_at    TEXT,
+            closed_at    TEXT,
+            total_pnl    REAL,
+            outcome      TEXT,
+            tp1_hit      INTEGER DEFAULT 0,
+            tp2_hit      INTEGER DEFAULT 0,
+            leg_count    INTEGER DEFAULT 0)'''
+    )
+
     # ── Per-user per-day risk state ───────────────────────────────────────────
     c.execute('''CREATE TABLE IF NOT EXISTS daily_risk_state
                  (chat_id            TEXT PRIMARY KEY,
