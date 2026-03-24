@@ -355,6 +355,17 @@ def _open_position_with_protection(base_url, headers, epic, action, size, stop_l
     return False, last_err or "unknown error"
 
 
+def _deal_id_from_position_row(p: dict) -> str | None:
+    """Capital payloads may nest dealId under position or at top level."""
+    if not isinstance(p, dict):
+        return None
+    pos = p.get("position") or {}
+    did = pos.get("dealId") if isinstance(pos, dict) else None
+    if did is None:
+        did = p.get("dealId")
+    return str(did) if did is not None else None
+
+
 def _position_has_deal(base_url, headers, deal_id: str) -> bool:
     """True if GET /positions lists this dealId (real open position)."""
     if not deal_id:
@@ -364,19 +375,97 @@ def _position_has_deal(base_url, headers, deal_id: str) -> bool:
         if res.status_code != 200:
             return False
         for p in res.json().get("positions", []):
-            if str(p.get("position", {}).get("dealId")) == str(deal_id):
+            row_id = _deal_id_from_position_row(p)
+            if row_id and str(row_id) == str(deal_id):
                 return True
     except Exception:
         pass
     return False
 
 
+def _position_get_by_deal_id(base_url, headers, deal_id: str) -> bool:
+    """Some regions return 200 on GET /positions/{dealId} before the list updates."""
+    if not deal_id:
+        return False
+    try:
+        res = requests.get(
+            f"{base_url}/positions/{deal_id}", headers=headers, timeout=15
+        )
+        if res.status_code == 200:
+            data = res.json() or {}
+            if data.get("errorCode"):
+                return False
+            return bool(
+                _deal_id_from_position_row(data)
+                or (data.get("position") or {}).get("dealId")
+            )
+    except Exception:
+        pass
+    return False
+
+
+def _epic_last_token(ep: str) -> str:
+    """Compare ADMA, ADMA.US, NASDAQ:ADMA, etc."""
+    e = str(ep or "").upper().strip()
+    return e.split(".")[-1].split(":")[-1]
+
+
+def _find_open_deal_by_epic_size(
+    base_url, headers, epic: str, direction: str, leg_size: float
+) -> str | None:
+    """
+    Last-resort: match one open row by epic + direction + size (Capital list lag).
+    Returns dealId only if exactly one row matches (avoids ambiguity).
+    """
+    if not epic or not direction or leg_size is None:
+        return None
+    try:
+        res = requests.get(f"{base_url}/positions", headers=headers, timeout=20)
+        if res.status_code != 200:
+            return None
+        want_tok = _epic_last_token(epic)
+        matches: list[str] = []
+        for p in res.json().get("positions", []):
+            m = p.get("market") or {}
+            pos = p.get("position") or {}
+            row_epic = str(m.get("epic", "") or "").upper()
+            if not row_epic:
+                continue
+            row_tok = _epic_last_token(row_epic)
+            epic_ok = want_tok == row_tok or want_tok in row_epic or row_tok in epic
+            if not epic_ok:
+                continue
+            if str(pos.get("direction")) != str(direction):
+                continue
+            try:
+                sz = float(pos.get("size") or 0)
+            except (TypeError, ValueError):
+                continue
+            if abs(sz - float(leg_size)) > 0.51:
+                continue
+            did = _deal_id_from_position_row(p)
+            if did:
+                matches.append(did)
+        if len(matches) == 1:
+            return matches[0]
+    except Exception:
+        pass
+    return None
+
+
 def _confirm_deal_and_visibility(
-    base_url, headers, order_response: dict, timeout_sec: float = 22.0
+    base_url,
+    headers,
+    order_response: dict,
+    timeout_sec: float = 45.0,
+    *,
+    order_epic: str | None = None,
+    direction: str | None = None,
+    leg_size: float | None = None,
 ):
     """
     Resolve a real dealId (via /confirms when needed) and ensure the position
-    appears in GET /positions. Never treats dealReference alone as a valid dealId.
+    exists on the broker (list, GET-by-id, or epic/size match).
 
     Returns (ok, deal_id, error_message).
     """
@@ -393,12 +482,19 @@ def _confirm_deal_and_visibility(
     deal_id = order_response.get("dealId")
     deal_ref = order_response.get("dealReference")
 
+    def _visible(did: str) -> bool:
+        if not did:
+            return False
+        if _position_has_deal(base_url, headers, str(did)):
+            return True
+        return _position_get_by_deal_id(base_url, headers, str(did))
+
     if deal_id:
         deal_id = str(deal_id)
         while _time.time() < deadline:
-            if _position_has_deal(base_url, headers, deal_id):
+            if _visible(deal_id):
                 return True, deal_id, ""
-            _time.sleep(0.35)
+            _time.sleep(0.45)
 
     # Poll /confirms for dealReference until we get dealId or rejection.
     while deal_ref and _time.time() < deadline:
@@ -417,7 +513,7 @@ def _confirm_deal_and_visibility(
                 did = data.get("dealId")
                 if did:
                     deal_id = str(did)
-                    if _position_has_deal(base_url, headers, deal_id):
+                    if _visible(deal_id):
                         return True, deal_id, ""
                 st = str(
                     data.get("dealStatus") or data.get("status") or ""
@@ -426,10 +522,22 @@ def _confirm_deal_and_visibility(
                     return False, "", f"deal rejected ({st})"
         except Exception:
             pass
-        _time.sleep(0.4)
+        _time.sleep(0.45)
 
-    if deal_id and _position_has_deal(base_url, headers, str(deal_id)):
+    if deal_id and _visible(str(deal_id)):
         return True, str(deal_id), ""
+
+    # Epic + direction + size (single match) when list/API lags after a 200 POST.
+    if order_epic and direction and leg_size is not None:
+        alt = _find_open_deal_by_epic_size(
+            base_url, headers, order_epic, direction, float(leg_size)
+        )
+        if alt:
+            if deal_id and str(deal_id) != str(alt):
+                print(
+                    f"[VERIFY] Using epic/size match dealId={alt} (POST had {deal_id})"
+                )
+            return True, str(alt), ""
 
     return (
         False,
@@ -883,7 +991,12 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
 
         payload = out if isinstance(out, dict) else {}
         ok_deal, deal_id, cerr = _confirm_deal_and_visibility(
-            base_url, headers, payload
+            base_url,
+            headers,
+            payload,
+            order_epic=order_epic,
+            direction=action,
+            leg_size=float(leg_size),
         )
         if not ok_deal or not deal_id:
             if not opened_legs:
