@@ -337,41 +337,100 @@ def _open_position_with_protection(base_url, headers, epic, action, size, stop_l
         try:
             res = requests.post(f"{base_url}/positions", json=payload, headers=headers)
             if res.status_code == 200:
-                return True, res.json()
+                data = res.json() or {}
+                # Capital sometimes returns HTTP 200 with an error payload.
+                if data.get("errorCode"):
+                    last_err = f"{data.get('errorCode')}: {str(data.get('message', ''))[:200]}"
+                    continue
+                return True, data
             last_err = (res.text or "")[:300]
         except Exception as exc:
             last_err = str(exc)
     return False, last_err or "unknown error"
 
 
-def _resolve_confirmed_deal_id(base_url, headers, order_response):
-    """
-    Resolve a real dealId from order response.
-    Capital may return dealReference first, while /positions uses dealId.
-    """
-    deal_id = order_response.get("dealId")
-    if deal_id:
-        return str(deal_id)
+def _position_has_deal(base_url, headers, deal_id: str) -> bool:
+    """True if GET /positions lists this dealId (real open position)."""
+    if not deal_id:
+        return False
+    try:
+        res = requests.get(f"{base_url}/positions", headers=headers, timeout=20)
+        if res.status_code != 200:
+            return False
+        for p in res.json().get("positions", []):
+            if str(p.get("position", {}).get("dealId")) == str(deal_id):
+                return True
+    except Exception:
+        pass
+    return False
 
-    deal_ref = order_response.get("dealReference")
-    if not deal_ref:
-        return ""
 
-    # Confirmation can lag briefly after order placement.
+def _confirm_deal_and_visibility(
+    base_url, headers, order_response: dict, timeout_sec: float = 22.0
+):
+    """
+    Resolve a real dealId (via /confirms when needed) and ensure the position
+    appears in GET /positions. Never treats dealReference alone as a valid dealId.
+
+    Returns (ok, deal_id, error_message).
+    """
+    if not isinstance(order_response, dict):
+        return False, "", "Invalid order response"
+
+    ec = order_response.get("errorCode")
+    if ec:
+        return False, "", f"{ec}: {str(order_response.get('message', ''))[:200]}"
+
     import time as _time
-    for _ in range(5):
+
+    deadline = _time.time() + timeout_sec
+    deal_id = order_response.get("dealId")
+    deal_ref = order_response.get("dealReference")
+
+    if deal_id:
+        deal_id = str(deal_id)
+        while _time.time() < deadline:
+            if _position_has_deal(base_url, headers, deal_id):
+                return True, deal_id, ""
+            _time.sleep(0.35)
+
+    # Poll /confirms for dealReference until we get dealId or rejection.
+    while deal_ref and _time.time() < deadline:
         try:
-            res = requests.get(f"{base_url}/confirms/{deal_ref}", headers=headers)
+            res = requests.get(
+                f"{base_url}/confirms/{deal_ref}", headers=headers, timeout=20
+            )
             if res.status_code == 200:
                 data = res.json() or {}
+                if data.get("errorCode"):
+                    return (
+                        False,
+                        "",
+                        f"{data.get('errorCode')}: {str(data.get('message', ''))[:160]}",
+                    )
                 did = data.get("dealId")
                 if did:
-                    return str(did)
+                    deal_id = str(did)
+                    if _position_has_deal(base_url, headers, deal_id):
+                        return True, deal_id, ""
+                st = str(
+                    data.get("dealStatus") or data.get("status") or ""
+                ).upper()
+                if st in ("REJECTED", "FAILED"):
+                    return False, "", f"deal rejected ({st})"
         except Exception:
             pass
         _time.sleep(0.4)
 
-    return str(deal_ref)
+    if deal_id and _position_has_deal(base_url, headers, str(deal_id)):
+        return True, str(deal_id), ""
+
+    return (
+        False,
+        "",
+        "Could not verify an open position on the broker (check demo vs live account, "
+        "or that the instrument is enabled).",
+    )
 
 
 def _sync_stop_to_broker(base_url, headers, deal_id, stop_level):
@@ -791,7 +850,23 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             )
             break
 
-        deal_id = _resolve_confirmed_deal_id(base_url, headers, out)
+        payload = out if isinstance(out, dict) else {}
+        ok_deal, deal_id, cerr = _confirm_deal_and_visibility(
+            base_url, headers, payload
+        )
+        if not ok_deal or not deal_id:
+            if not opened_legs:
+                msg = f"❌ Order failed ({symbol} {action}): {cerr}"
+                send_telegram_message(chat_id, msg)
+                return msg
+            send_telegram_message(
+                chat_id,
+                f"⚠️ {symbol}: first leg is open, second leg not confirmed on broker.\n"
+                f"{cerr}\n"
+                f"Please verify positions manually."
+            )
+            break
+
         opened_legs.append((leg_size, leg_target, deal_id))
         record_open_trade(chat_id, symbol, action, entry_price, leg_size, deal_id, stop_level)
         ok, info = _sync_protection_to_broker(
@@ -803,12 +878,25 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
                 f"[{symbol} {deal_id}] sl={stop_level:.4f} tp={leg_target:.4f} :: {info}"
             )
 
+    if not opened_legs:
+        err = f"❌ Order failed ({symbol} {action}): no verified open position on broker"
+        send_telegram_message(chat_id, err)
+        return err
+
+    verified_qty = float(sum(l[0] for l in opened_legs))
+    partial_only_one_leg = len(opened_legs) < len(legs)
+    if partial_only_one_leg:
+        total_amount = entry_price * verified_qty
+        risk_amount = stop_dist * verified_qty
+    else:
+        total_amount = entry_price * qty_total
+        risk_amount = stop_dist * qty_total
+
+    qty_display = int(verified_qty)
+
     # ── Notify (localized detailed trade report) ─────────────────────────────
     is_override  = (reason == STATE_MANUAL_OVERRIDE)
     _fmt_money   = lambda v: f"${v:,.2f}"
-
-    total_amount = entry_price * qty_total
-    risk_amount  = stop_dist * qty_total
 
     # Daily trade counter (for the "#N" label).
     utc_today = datetime.utcnow().date().isoformat()
@@ -826,6 +914,16 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
     now_et_str = _now_et().strftime('%Y-%m-%d %H:%M ET')
 
     lang = get_subscriber_lang(chat_id)
+    partial_note_ar = (
+        "\n⚠️ *تنبيه:* فُتح حد طلب واحد فقط على الوسيط — راجع الصفقات المفتوحة."
+        if partial_only_one_leg
+        else ""
+    )
+    partial_note_en = (
+        "\n⚠️ *Note:* Only one TP leg opened on the broker — check open positions."
+        if partial_only_one_leg
+        else ""
+    )
 
     if lang == 'en':
         dir_label   = 'BUY' if action == 'BUY' else 'SELL'
@@ -836,7 +934,7 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             f"{override_line}"
             f"▶️  Direction    :  *{dir_label}*\n"
             f"💰  Entry Price  :  *{_fmt_money(entry_price)}*\n"
-            f"🔢  Quantity     :  *{int(qty_total)} shares*\n"
+            f"🔢  Quantity     :  *{qty_display} shares*\n"
             f"💵  Total Value  :  *{_fmt_money(total_amount)}*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🔴  Stop Loss    :  *{_fmt_money(stop_level)}*\n"
@@ -845,6 +943,7 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⚠️  Risk Amount  :  *{_fmt_money(risk_amount)}*\n"
             f"🕐  Time (ET)    :  {now_et_str}"
+            f"{partial_note_en}"
             f"{f'\\nℹ️  Size auto-adjusted to broker minimum for TP1/TP2: {int(qty_total)} shares' if auto_upsized else ''}"
         )
     else:
@@ -855,7 +954,7 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             f"{override_line}"
             f"▶️  الاتجاه        :  *{dir_ar}*\n"
             f"💰  سعر الدخول    :  *{_fmt_money(entry_price)}*\n"
-            f"🔢  الكمية         :  *{int(qty_total)} سهم*\n"
+            f"🔢  الكمية         :  *{qty_display} سهم*\n"
             f"💵  إجمالي المبلغ  :  *{_fmt_money(total_amount)}*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🔴  وقف الخسارة   :  *{_fmt_money(stop_level)}*\n"
@@ -864,10 +963,14 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⚠️  المخاطرة       :  *{_fmt_money(risk_amount)}*\n"
             f"🕐  التوقيت (ET)   :  {now_et_str}"
+            f"{partial_note_ar}"
             f"{f'\\nℹ️  تم تعديل الكمية تلقائيًا للحد الأدنى لدى الوسيط للحفاظ على الهدفين: {int(qty_total)} سهم' if auto_upsized else ''}"
         )
 
     send_telegram_message(chat_id, msg)
 
     stop_info = f"{stop_level:.4f}" if stop_level is not None else "N/A"
-    return f"✅ Opened — legs: {len(opened_legs)} | size: {qty_total} | stop: {stop_info} | RR: {rr_ratio:.1f}"
+    return (
+        f"✅ Opened — legs: {len(opened_legs)} | size: {verified_qty} | "
+        f"stop: {stop_info} | RR: {rr_ratio:.1f}"
+    )
