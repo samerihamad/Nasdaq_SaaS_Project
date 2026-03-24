@@ -419,6 +419,36 @@ def run_trading_bot():
                 time.sleep(CHECK_INTERVAL)
                 continue
 
+            # ── Pre-open prep/alerts (works in CLOSED and PRE_MARKET) ─────────
+            if market_status != STATUS_OPEN:
+                mins = minutes_to_open()
+
+                # Build watchlist before open (once daily) so pre-market alert
+                # has a real count and models are warm.
+                if (_last_scan_date != today
+                        and 0 < mins <= PREMARKET_ALERT_WINDOW_MIN):
+                    _watchlist = run_daily_scan()
+                    _last_scan_date = today
+                    if _watchlist:
+                        pretrain_models(_watchlist)
+
+                # If scan failed earlier and we are still inside alert window,
+                # one lazy retry allows alert dispatch in PRE_MARKET as well.
+                if (_premarket_sent != today
+                        and 0 < mins <= PREMARKET_ALERT_WINDOW_MIN
+                        and not _watchlist
+                        and _last_scan_date != today):
+                    _watchlist = run_daily_scan()
+                    _last_scan_date = today
+                    if _watchlist:
+                        pretrain_models(_watchlist)
+
+                # DST-safe pre-market alert window.
+                if (_premarket_sent != today
+                        and 0 < mins <= PREMARKET_ALERT_WINDOW_MIN
+                        and _watchlist):
+                    send_premarket_alert(len(_watchlist))
+
             # ── Market CLOSED: notify once, run watcher for all users ─────────
             if market_status == STATUS_CLOSED:
                 if not _closed_notified:
@@ -437,22 +467,6 @@ def run_trading_bot():
                         )
                     _closed_notified = True
                     print(f"[MARKET] Closed — opens in ~{mins} min")
-
-                # Build watchlist before open (once daily) so pre-market alert
-                # has a real count and models are warm.
-                mins = minutes_to_open()
-                if (_last_scan_date != today
-                        and 0 < mins <= PREMARKET_ALERT_WINDOW_MIN):
-                    _watchlist      = run_daily_scan()
-                    _last_scan_date = today
-                    if _watchlist:
-                        pretrain_models(_watchlist)
-
-                # DST-safe pre-market alert window.
-                if (_premarket_sent != today
-                        and 0 < mins <= PREMARKET_ALERT_WINDOW_MIN
-                        and _watchlist):
-                    send_premarket_alert(len(_watchlist))
 
                 run_watcher()   # monitors all users' open positions
                 time.sleep(300)
