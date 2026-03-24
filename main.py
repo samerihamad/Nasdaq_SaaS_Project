@@ -23,7 +23,12 @@ from datetime import datetime, date, timezone
 from database.db_manager import create_db, is_maintenance_mode
 from utils.filters import get_nasdaq_tickers, level1_filter, level2_filter
 from utils.market_scanner import scan_multi_timeframe
-from utils.ai_model import analyze_multi_timeframe, load_or_train_model, validate_signal
+from utils.ai_model import (
+    analyze_multi_timeframe,
+    load_or_train_model,
+    validate_signal,
+    AI_PROBABILITY_THRESHOLD,
+)
 from utils.market_hours import get_market_status, minutes_to_open, STATUS_OPEN, STATUS_CLOSED
 from utils.daily_report import send_daily_reports
 from core.executor import place_trade_for_user, monitor_and_close, is_symbol_supported_for_user
@@ -383,7 +388,7 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
         if not ai_approved:
             print(
                 f"   [AI BLOCK] {symbol} {action} — "
-                f"probability {ai_prob:.1f}% < 70% | regime={regime}"
+                f"probability {ai_prob:.1f}% < {AI_PROBABILITY_THRESHOLD:.1f}% | regime={regime}"
             )
             return
         print(f"   [AI OK] {symbol} {action} — probability={ai_prob:.1f}% | regime={regime}")

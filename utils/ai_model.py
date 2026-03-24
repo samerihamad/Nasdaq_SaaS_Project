@@ -24,6 +24,7 @@ produce wrong scores.
 import os
 import pickle
 import logging
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -36,8 +37,11 @@ log = logging.getLogger(__name__)
 MODEL_DIR             = "models"
 MODEL_VERSION         = 2          # bump whenever build_features() columns change
 AI_PROBABILITY_THRESHOLD = 65.0    # minimum probability to approve a trade
+MIN_TRAIN_BARS        = 220        # supports EMA200 + labeling while allowing newer listings
+TRAIN_RETRY_HOURS     = 6          # avoid retry spam for symbols with short history
 
 os.makedirs(MODEL_DIR, exist_ok=True)
+_train_retry_after: dict[str, datetime] = {}
 
 # Label parameters
 FUTURE_BARS      = 5       # look-ahead bars for labeling
@@ -186,11 +190,22 @@ def train_model(symbol: str):
     Train a Random Forest classifier on 5 years of daily data.
     Saves model + scaler to disk. Returns (model, scaler) or (None, None).
     """
+    now = datetime.now(timezone.utc)
+    retry_at = _train_retry_after.get(symbol)
+    if retry_at and now < retry_at:
+        return None, None
+
     log.info("Training RF model for %s (5y daily)...", symbol)
     df = yf.download(symbol, period="5y", interval="1d",
                      progress=False, auto_adjust=True)
-    if df is None or len(df) < 250:
-        log.warning("Insufficient data for %s (%s bars)", symbol, len(df) if df is not None else 0)
+    bars = len(df) if df is not None else 0
+    if df is None or bars < MIN_TRAIN_BARS:
+        # Retry later instead of re-attempting every scan cycle.
+        _train_retry_after[symbol] = now + timedelta(hours=TRAIN_RETRY_HOURS)
+        log.warning(
+            "Insufficient data for %s (%s bars, need >= %s). Retry after %sh.",
+            symbol, bars, MIN_TRAIN_BARS, TRAIN_RETRY_HOURS
+        )
         return None, None
 
     df = _flatten(df)
