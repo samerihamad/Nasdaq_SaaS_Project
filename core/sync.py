@@ -16,6 +16,7 @@ Runs at the start of every monitoring cycle to fix any discrepancies:
 import sqlite3
 import requests
 import re
+import time
 from datetime import datetime as _dt
 
 from core.trade_session_finalize import after_trade_leg_closed
@@ -84,7 +85,15 @@ def reconcile(chat_id, base_url, headers):
         trailing_stop,
     ) in local_open:
         if deal_id and str(deal_id) not in live_deal_ids:
-            pnl = _fetch_closed_pnl(base_url, headers, str(deal_id))
+            # Broker realizedPnL can be delayed right after a manual close.
+            # If we read too early, we may incorrectly get 0.0 and send
+            # "Breakeven" to Telegram even though the final realized P&L is > 0.
+            pnl = _fetch_closed_pnl(
+                base_url,
+                headers,
+                str(deal_id),
+                wait_for_realized=True,
+            )
             cur = c.execute(
                 "UPDATE trades SET status='CLOSED', pnl=?, closed_at=? "
                 "WHERE trade_id=? AND status='OPEN'",
@@ -212,7 +221,13 @@ def reconcile(chat_id, base_url, headers):
     conn.close()
 
 
-def _fetch_closed_pnl(base_url, headers, deal_id):
+def _fetch_closed_pnl(
+    base_url,
+    headers,
+    deal_id,
+    *,
+    wait_for_realized: bool = False,
+):
     """
     Attempt to retrieve the realized PnL of a closed deal from broker history.
     Returns 0.0 if the endpoint is unavailable or the deal isn't found.
@@ -245,23 +260,47 @@ def _fetch_closed_pnl(base_url, headers, deal_id):
             return []
         return (res.json() or {}).get("transactions", []) or []
 
-    try:
-        # Try direct dealId filter first.
-        txs = _fetch({"dealId": str(deal_id)})
-        # Fallback: fetch recent transactions window and match manually.
-        if not txs:
-            txs = _fetch({"max": 200})
+    # When called from sync for externally-closed deals, the broker may not
+    # have the realized PnL populated yet. We can safely retry briefly.
+    attempts = 1
+    delay_s = 0.0
+    if wait_for_realized:
+        attempts = 5
+        delay_s = 0.7
 
-        for tx in txs:
-            tx_deal = tx.get("dealId")
-            tx_ref  = tx.get("dealReference")
-            if str(tx_deal) == str(deal_id) or str(tx_ref) == str(deal_id):
-                p = _parse_pnl(tx)
-                if p is not None:
-                    return p
-    except Exception:
-        pass
-    return 0.0
+    pnl_zero_candidate: float | None = None
+
+    for attempt in range(attempts):
+        try:
+            # Try direct dealId filter first.
+            txs = _fetch({"dealId": str(deal_id)})
+            # Fallback: fetch recent transactions window and match manually.
+            if not txs:
+                txs = _fetch({"max": 200})
+
+            for tx in txs:
+                tx_deal = tx.get("dealId")
+                tx_ref  = tx.get("dealReference")
+                if str(tx_deal) == str(deal_id) or str(tx_ref) == str(deal_id):
+                    p = _parse_pnl(tx)
+                    if p is None:
+                        continue
+                    p_f = float(p)
+
+                    # If realizedPnL is still not ready, broker may temporarily
+                    # return 0.0. Retry when we got 0.0.
+                    if p_f == 0.0:
+                        pnl_zero_candidate = 0.0
+                        continue
+                    return p_f
+        except Exception:
+            # On transient API/network issues we retry (when enabled).
+            pass
+
+        if delay_s and attempt < attempts - 1:
+            time.sleep(delay_s)
+
+    return float(pnl_zero_candidate) if pnl_zero_candidate is not None else 0.0
 
 
 def backfill_closed_pnls(chat_id, base_url, headers, lookback: int = 200) -> int:
