@@ -136,7 +136,10 @@ AI_MIN_PROB_MEANREV = 48.0
 # Soft override:
 # Allow high-confidence strategy signals to pass even if AI probability is below
 # the per-strategy threshold, as long as market regime is not VOLATILE.
-AI_SOFT_OVERRIDE_CONFIDENCE = 75.0
+# Soft override gate:
+# lower confidence threshold to allow more executions when AI probability is low
+# but technical confidence is still strong (unless regime is VOLATILE).
+AI_SOFT_OVERRIDE_CONFIDENCE = 65.0
 AI_SOFT_OVERRIDE_MIN_PROB = 20.0
 
 # Refresh watchlist while market is open (seconds)
