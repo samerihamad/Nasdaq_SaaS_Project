@@ -18,6 +18,7 @@ import asyncio
 import sqlite3
 import requests
 import sys
+import re
 from datetime import date, timedelta, datetime
 from dotenv import load_dotenv
 
@@ -79,6 +80,7 @@ create_db()
     LANG_SELECT,
     GET_FIRSTNAME,
     GET_LASTNAME,
+    GET_PHONE,
     SELECT_TIER,
     AWAIT_BANK_ACK,
     UPLOAD_PROOF,
@@ -86,7 +88,7 @@ create_db()
     GET_EMAIL,
     GET_PASS,
     GET_APIKEY,
-) = range(10)
+) = range(11)
 
 TIER_DAYS = {1: 30, 2: 30}   # days of validity per tier on approval
 
@@ -101,7 +103,7 @@ def _get_subscriber(chat_id: str) -> dict:
     conn = _db()
     c    = conn.cursor()
     c.execute(
-        """SELECT lang, first_name, last_name, tier, payment_status,
+        """SELECT lang, first_name, last_name, phone, tier, payment_status,
                   payment_proof, license_key, email, expiry_date, mode
            FROM subscribers WHERE chat_id=?""",
         (str(chat_id),)
@@ -110,9 +112,35 @@ def _get_subscriber(chat_id: str) -> dict:
     conn.close()
     if not row:
         return {}
-    keys = ['lang', 'first_name', 'last_name', 'tier', 'payment_status',
-            'payment_proof', 'license_key', 'email', 'expiry_date', 'mode']
+    keys = [
+        'lang', 'first_name', 'last_name', 'phone', 'tier', 'payment_status',
+        'payment_proof', 'license_key', 'email', 'expiry_date', 'mode'
+    ]
     return dict(zip(keys, row))
+
+
+def _normalize_spaces(s: str) -> str:
+    return ' '.join((s or '').split()).strip()
+
+
+def _is_valid_name_input(s: str) -> bool:
+    """
+    Allow letters + spaces + common name separators (hyphen/apostrophe).
+    Reject digits and all other symbols to protect stored customer data.
+    """
+    s = _normalize_spaces(s)
+    if len(s) < 2:
+        return False
+    if any(ch.isdigit() for ch in s):
+        return False
+    allowed_separators = {" ", "-", "'"}
+    for ch in s:
+        if ch in allowed_separators:
+            continue
+        # .isalpha() covers Arabic and Latin letters.
+        if not ch.isalpha():
+            return False
+    return True
 
 
 def _get_lang(chat_id: str) -> str:
@@ -177,6 +205,7 @@ def _get_user_onboarding_state(chat_id: str) -> str:
       PAYMENT_PENDING  — proof uploaded, awaiting admin review
       PAYMENT_REJECTED — admin rejected the payment
       HAS_TIER         — chose tier, bank shown, needs to upload proof
+      NEEDS_PHONE     — provided names but missing phone number
       HAS_LAST_NAME    — has both names, needs to pick tier
       HAS_FIRST_NAME   — has first name, needs last name
       NEW              — brand new, show language picker
@@ -208,6 +237,9 @@ def _get_user_onboarding_state(chat_id: str) -> str:
 
     if sub.get('tier'):
         return 'HAS_TIER'
+
+    if sub.get('last_name') and not sub.get('phone'):
+        return 'NEEDS_PHONE'
 
     if sub.get('last_name'):
         return 'HAS_LAST_NAME'
@@ -609,6 +641,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return AWAIT_BANK_ACK
 
     # ── Has last name, show tier selection ─────────────────────────────────
+    if state == 'NEEDS_PHONE':
+        await update.message.reply_text(t('ask_phone', lang), parse_mode='Markdown')
+        return GET_PHONE
+
+    # ── Has last name, show tier selection ─────────────────────────────────
     if state == 'HAS_LAST_NAME':
         await update.message.reply_text(
             t('select_tier_title', lang),
@@ -653,6 +690,10 @@ async def get_firstname(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(t('ask_firstname', lang), parse_mode='Markdown')
         return GET_FIRSTNAME
 
+    if not _is_valid_name_input(first_name):
+        await update.message.reply_text(t('invalid_name', lang), parse_mode='Markdown')
+        return GET_FIRSTNAME
+
     _update_subscriber(chat_id, first_name=first_name)
     await update.message.reply_text(t('ask_lastname', lang), parse_mode='Markdown')
     return GET_LASTNAME
@@ -669,6 +710,10 @@ async def get_lastname(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(t('ask_lastname', lang), parse_mode='Markdown')
         return GET_LASTNAME
 
+    if not _is_valid_name_input(last_name):
+        await update.message.reply_text(t('invalid_name', lang), parse_mode='Markdown')
+        return GET_LASTNAME
+
     _update_subscriber(chat_id, last_name=last_name)
     sub  = _get_subscriber(chat_id)
     name = sub.get('first_name', '')
@@ -677,6 +722,32 @@ async def get_lastname(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         t('welcome_name', lang, name=name), parse_mode='Markdown'
     )
+    await update.message.reply_text(t('ask_phone', lang), parse_mode='Markdown')
+    return GET_PHONE
+
+
+# ── Onboarding: phone number ─────────────────────────────────────────────
+
+async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.message.chat_id)
+    lang    = _get_lang(chat_id)
+    phone   = update.message.text.strip()
+
+    # Phone: digits only (no +, no symbols).
+    if '+' in phone:
+        await update.message.reply_text(t('invalid_phone', lang), parse_mode='Markdown')
+        return GET_PHONE
+
+    digits = phone
+
+    digits = digits.replace(' ', '')
+    if not digits.isdigit() or len(digits) < 6:
+        await update.message.reply_text(t('invalid_phone', lang), parse_mode='Markdown')
+        return GET_PHONE
+
+    phone_norm = digits
+    _update_subscriber(chat_id, phone=phone_norm)
+
     await update.message.reply_text(
         t('select_tier_title', lang),
         reply_markup=_tier_keyboard(lang),
@@ -975,6 +1046,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith('onboard_tier_'):
         tier = 1 if data == 'onboard_tier_1' else 2
+        # Enforce phone registration before tier selection.
+        sub = _get_subscriber(chat_id)
+        if not sub.get('phone'):
+            await query.edit_message_text(
+                t('onboard_phone_missing_restart', lang),
+                parse_mode='Markdown',
+            )
+            return
+
         _update_subscriber(chat_id, tier=tier)
         await query.edit_message_text(
             ('تم اختيار الباقة. أرسل /start للمتابعة.'
@@ -1687,6 +1767,7 @@ if __name__ == "__main__":
             LANG_SELECT:    [CallbackQueryHandler(lang_selected,  pattern='^onboard_lang_')],
             GET_FIRSTNAME:  [MessageHandler(filters.TEXT & ~filters.COMMAND, get_firstname)],
             GET_LASTNAME:   [MessageHandler(filters.TEXT & ~filters.COMMAND, get_lastname)],
+            GET_PHONE:      [MessageHandler(filters.TEXT & ~filters.COMMAND, get_phone)],
             SELECT_TIER:    [CallbackQueryHandler(tier_selected,  pattern='^onboard_tier_')],
             AWAIT_BANK_ACK: [CallbackQueryHandler(bank_acked,     pattern='^onboard_paid$')],
             UPLOAD_PROOF:   [MessageHandler(filters.PHOTO, upload_proof)],

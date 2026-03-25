@@ -22,7 +22,13 @@ def get_user_from_db(chat_id):
     conn = sqlite3.connect('database/trading_saas.db')
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS subscribers
-                 (chat_id TEXT PRIMARY KEY, email TEXT, api_password TEXT, api_key TEXT, is_demo INTEGER DEFAULT 1, is_active INTEGER DEFAULT 1)''')
+                 (chat_id TEXT PRIMARY KEY,
+                  email TEXT,
+                  api_password TEXT,
+                  api_key TEXT,
+                  is_demo INTEGER DEFAULT 1,
+                  is_active INTEGER DEFAULT 1,
+                  phone TEXT)''')
     c.execute("SELECT email, api_password, api_key FROM subscribers WHERE chat_id=?", (str(chat_id),))
     user = c.fetchone()
     conn.close()

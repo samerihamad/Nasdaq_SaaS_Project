@@ -25,6 +25,22 @@ STRINGS = {
         'ar': '🎉 مرحباً *{name}* في نظام NATB!',
         'en': '🎉 Welcome *{name}* to the NATB System!',
     },
+    'ask_phone': {
+        'ar': '📞 ممتاز! الآن أرسل *رقم الهاتف* للتواصل (بدون مسافات):',
+        'en': '📞 Great! Now send your *Phone Number* (digits only, without spaces):',
+    },
+    'invalid_phone': {
+        'ar': '❌ رقم هاتف غير صحيح. أدخل أرقاماً فقط بدون مسافات أو علامات.',
+        'en': '❌ Invalid phone number. Enter digits only (no spaces or symbols).',
+    },
+    'invalid_name': {
+        'ar': '❌ الاسم غير صحيح. يُسمح بالأحرف فقط (بدون أرقام).',
+        'en': '❌ Invalid name. Letters only are allowed (no numbers).',
+    },
+    'onboard_phone_missing_restart': {
+        'ar': '⚠️ رقم الهاتف غير مسجل. أرسل /start لإكمال الخطوات.',
+        'en': '⚠️ Phone is not registered. Send /start to continue.',
+    },
 
     # ── Tier selection ────────────────────────────────────────────────────────
     'select_tier_title': {
