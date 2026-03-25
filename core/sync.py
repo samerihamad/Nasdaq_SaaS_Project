@@ -93,6 +93,11 @@ def reconcile(chat_id, base_url, headers):
                 headers,
                 str(deal_id),
                 wait_for_realized=True,
+                fallback_calc={
+                    "direction": direction,
+                    "entry_price": entry_price,
+                    "size": size,
+                },
             )
             cur = c.execute(
                 "UPDATE trades SET status='CLOSED', pnl=?, closed_at=? "
@@ -227,6 +232,7 @@ def _fetch_closed_pnl(
     deal_id,
     *,
     wait_for_realized: bool = False,
+    fallback_calc: dict | None = None,
 ):
     """
     Attempt to retrieve the realized PnL of a closed deal from broker history.
@@ -249,6 +255,60 @@ def _fetch_closed_pnl(
                 except Exception:
                     continue
         return None
+
+    def _parse_price(tx: dict, keys: tuple[str, ...]) -> float | None:
+        for k in keys:
+            if k not in tx or tx.get(k) is None:
+                continue
+            v = tx.get(k)
+            if isinstance(v, (int, float)):
+                return float(v)
+            s = str(v).strip()
+            m = re.search(r"[-+]?\d+(?:\.\d+)?", s.replace(",", ""))
+            if m:
+                try:
+                    return float(m.group(0))
+                except Exception:
+                    continue
+        return None
+
+    def _fallback_compute(tx: dict) -> float | None:
+        """
+        If broker doesn't return realised PnL yet (or ever), attempt to compute it.
+        Uses entry_price/size/direction from the DB row and a close price from tx.
+        """
+        if not fallback_calc:
+            return None
+        try:
+            direction = str(fallback_calc.get("direction") or "").strip().upper()
+            entry = float(fallback_calc.get("entry_price") or 0)
+            qty = float(fallback_calc.get("size") or 0)
+            if not direction or entry <= 0 or qty <= 0:
+                return None
+        except Exception:
+            return None
+
+        # Try to locate an execution/close price in the transaction payload.
+        close_px = _parse_price(
+            tx,
+            (
+                "level",
+                "price",
+                "closeLevel",
+                "closingLevel",
+                "closePrice",
+                "executionPrice",
+            ),
+        )
+        if close_px is None or close_px <= 0:
+            return None
+
+        diff = (close_px - entry) if direction == "BUY" else (entry - close_px)
+        pnl_est = diff * qty
+        # Avoid rounding noise being treated as "real".
+        if abs(pnl_est) < 0.005:
+            return 0.0
+        return float(pnl_est)
 
     def _fetch(params: dict | None) -> list:
         res = requests.get(
@@ -284,7 +344,11 @@ def _fetch_closed_pnl(
                 if str(tx_deal) == str(deal_id) or str(tx_ref) == str(deal_id):
                     p = _parse_pnl(tx)
                     if p is None:
-                        continue
+                        # Try fallback compute when realisedPnL is absent.
+                        f = _fallback_compute(tx)
+                        if f is None:
+                            continue
+                        p = f
                     p_f = float(p)
 
                     # If realizedPnL is still not ready, broker may temporarily
@@ -312,7 +376,7 @@ def backfill_closed_pnls(chat_id, base_url, headers, lookback: int = 200) -> int
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
-        "SELECT trade_id, deal_id, pnl FROM trades "
+        "SELECT trade_id, deal_id, pnl, direction, entry_price, size FROM trades "
         "WHERE chat_id=? AND status='CLOSED' "
         "AND deal_id IS NOT NULL AND TRIM(deal_id) != '' "
         "ORDER BY trade_id DESC LIMIT ?",
@@ -324,11 +388,23 @@ def backfill_closed_pnls(chat_id, base_url, headers, lookback: int = 200) -> int
         return 0
 
     updated = 0
-    for trade_id, deal_id, pnl in rows:
+    for trade_id, deal_id, pnl, direction, entry_price, size in rows:
         # Backfill only unknown/zero rows.
         if pnl is not None and float(pnl) != 0.0:
             continue
         fetched = _fetch_closed_pnl(base_url, headers, str(deal_id))
+        if fetched == 0.0:
+            fetched = _fetch_closed_pnl(
+                base_url,
+                headers,
+                str(deal_id),
+                wait_for_realized=True,
+                fallback_calc={
+                    "direction": direction,
+                    "entry_price": entry_price,
+                    "size": size,
+                },
+            )
         # Skip when broker still returns zero/unknown.
         if fetched == 0.0:
             continue

@@ -156,7 +156,7 @@ def record_open_trade(
     """Insert a new trade into the local DB when a position is opened (UTC timestamp)."""
     from utils.market_hours import utc_now
     conn = sqlite3.connect(DB_PATH)
-    conn.execute(
+    cur = conn.execute(
         '''INSERT INTO trades
            (chat_id, symbol, direction, entry_price, size, deal_id, trailing_stop, status, opened_at,
             leg_role, parent_session, stop_distance)
@@ -175,5 +175,7 @@ def record_open_trade(
             stop_distance,
         ),
     )
+    trade_id = cur.lastrowid
     conn.commit()
     conn.close()
+    return trade_id

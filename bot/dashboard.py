@@ -45,6 +45,8 @@ from core.risk_manager import (
 )
 from core.executor import get_user_credentials, get_session
 from core.sync import reconcile, backfill_closed_pnls
+from core.trailing_stop import close_trade_in_db
+from core.trade_session_finalize import after_trade_leg_closed
 from bot.admin import admin_handler
 from database.db_manager import (
     create_db, get_bank_details, get_user_tier,
@@ -296,7 +298,7 @@ def _main_keyboard(lang: str, mode: str, trading: bool):
         row_engine,
         [InlineKeyboardButton(t('btn_balance',  lang), callback_data='balance'),
          InlineKeyboardButton(t('btn_report',   lang), callback_data='report')],
-        [InlineKeyboardButton(t('btn_positions', lang), callback_data='positions')],
+        [InlineKeyboardButton(t('btn_manage_trades', lang), callback_data='manage_trades')],
         [InlineKeyboardButton(mode_btn,                callback_data='mode_info'),
          InlineKeyboardButton(switch_btn,              callback_data='toggle_mode')],
         [InlineKeyboardButton(t('btn_license',  lang), callback_data='license'),
@@ -305,6 +307,120 @@ def _main_keyboard(lang: str, mode: str, trading: bool):
         row_settings,
         [InlineKeyboardButton(t('btn_support',      lang), url=SUPPORT_URL)],
     ])
+
+
+def _fetch_open_trades(chat_id: str) -> list[dict]:
+    """
+    Dashboard source-of-truth for open trades: local DB.
+    This avoids false "no positions" when broker /positions is temporarily empty/failing.
+    """
+    conn = _db()
+    c = conn.cursor()
+    c.execute(
+        "SELECT trade_id, symbol, direction, entry_price, size, deal_id, trailing_stop, "
+        "COALESCE(leg_role,''), COALESCE(parent_session,''), stop_distance "
+        "FROM trades WHERE chat_id=? AND status='OPEN' ORDER BY trade_id ASC",
+        (str(chat_id),),
+    )
+    rows = c.fetchall()
+    conn.close()
+
+    out: list[dict] = []
+    for r in rows:
+        out.append({
+            "trade_id": int(r[0]),
+            "symbol": r[1],
+            "direction": r[2],
+            "entry_price": float(r[3] or 0),
+            "size": float(r[4] or 0),
+            "deal_id": str(r[5] or ""),
+            "trailing_stop": float(r[6]) if r[6] is not None else None,
+            "leg_role": (r[7] or "").strip(),
+            "parent_session": (r[8] or "").strip(),
+            "stop_distance": float(r[9]) if r[9] is not None else None,
+        })
+    return out
+
+
+def _group_open_trades(rows: list[dict]) -> list[dict]:
+    """
+    Group TP1/TP2 legs into a single display card by parent_session.
+    Single-leg trades are keyed by their own trade_id.
+    """
+    groups: dict[str, list[dict]] = {}
+    for r in rows:
+        key = r["parent_session"] if r.get("parent_session") else f"single:{r['trade_id']}"
+        groups.setdefault(key, []).append(r)
+
+    cards: list[dict] = []
+    for key, legs in groups.items():
+        legs = sorted(legs, key=lambda x: x["trade_id"])
+        first = legs[0]
+        symbol = first["symbol"]
+        direction = first["direction"]
+        entry = float(first["entry_price"] or 0)
+        qty_total = float(sum(l.get("size", 0) for l in legs))
+
+        stops = [l.get("trailing_stop") for l in legs if l.get("trailing_stop") is not None]
+        stop = None
+        if stops:
+            stop = min(stops) if direction == "BUY" else max(stops)
+
+        cards.append({
+            "key": key,
+            "trade_id": int(first["trade_id"]),
+            "symbol": symbol,
+            "direction": direction,
+            "entry_price": entry,
+            "qty": qty_total,
+            "stop": stop,
+        })
+
+    return sorted(cards, key=lambda c: int(c["trade_id"]))
+
+
+def _format_manage_trade_card(card: dict, lang: str) -> str:
+    from config import TP1_PCT, TP2_PCT
+    symbol = card["symbol"]
+    direction = card["direction"]
+    entry = float(card["entry_price"] or 0)
+    qty = float(card["qty"] or 0)
+    stop = card.get("stop")
+    total_amount = entry * qty if entry and qty else 0.0
+
+    if direction == "BUY":
+        tp1 = entry * (1 + TP1_PCT)
+        tp2 = entry * (1 + TP2_PCT)
+        dir_ar = "شراء"
+        dir_label = "BUY"
+    else:
+        tp1 = entry * (1 - TP1_PCT)
+        tp2 = entry * (1 - TP2_PCT)
+        dir_ar = "بيع"
+        dir_label = "SELL"
+
+    stop_s = f"${stop:,.2f}" if isinstance(stop, (int, float)) else "—"
+    if lang == "en":
+        return (
+            f"📋 *Trade #{card['trade_id']} — {symbol}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"▶️ *Direction*   : *{dir_label}*\n"
+            f"💰 *Entry*       : *${entry:,.2f}*\n"
+            f"💵 *Amount*      : *${total_amount:,.2f}*\n"
+            f"🔴 *Stop*        : *{stop_s}*\n"
+            f"🎯 *TP1*         : *${tp1:,.2f}*  (+1.00%)\n"
+            f"🏆 *TP2*         : *${tp2:,.2f}*  (+1.50%)\n"
+        )
+    return (
+        f"📋 *صفقة #{card['trade_id']} — {symbol}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"▶️ *الاتجاه*      : *{dir_ar}*\n"
+        f"💰 *سعر الدخول*   : *${entry:,.2f}*\n"
+        f"💵 *إجمالي المبلغ*: *${total_amount:,.2f}*\n"
+        f"🔴 *وقف الخسارة*  : *{stop_s}*\n"
+        f"🎯 *الهدف 1*      : *${tp1:,.2f}*  (+1.00%)\n"
+        f"🏆 *الهدف 2*      : *${tp2:,.2f}*  (+1.50%)\n"
+    )
 
 
 def _back_keyboard(lang: str):
@@ -1128,8 +1244,174 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=_back_keyboard(lang), parse_mode='Markdown'
         )
 
-    # ── Open positions ─────────────────────────────────────────────────────
-    elif data == 'positions':
+    # ── Manage trades (replaces Open Positions) ────────────────────────────
+    elif data in ('positions', 'manage_trades'):
+        # Backward-compat: old callback 'positions' now routes to Manage Trades.
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(t('btn_show_open_trades', lang), callback_data='manage_show_open')],
+            [InlineKeyboardButton(t('btn_close_all_trades', lang), callback_data='manage_close_all')],
+            [InlineKeyboardButton(t('btn_view_trade_by_id', lang), callback_data='manage_view_trade')],
+            [InlineKeyboardButton(t('btn_back', lang), callback_data='main_menu')],
+        ])
+        await query.edit_message_text(
+            t('manage_menu_title', lang),
+            reply_markup=keyboard,
+            parse_mode='Markdown',
+        )
+
+    elif data == 'manage_show_open':
+        rows = _fetch_open_trades(chat_id)
+        cards = _group_open_trades(rows)
+        if not cards:
+            await query.edit_message_text(
+                t('manage_no_open_trades', lang),
+                reply_markup=_back_keyboard(lang),
+                parse_mode='Markdown',
+            )
+            return
+        context.user_data['manage_cards'] = cards
+        context.user_data['manage_idx'] = 0
+        card = cards[0]
+        nav = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(t('btn_prev', lang), callback_data='manage_prev'),
+                InlineKeyboardButton(t('btn_next', lang), callback_data='manage_next'),
+            ],
+            [InlineKeyboardButton(t('btn_back', lang), callback_data='manage_trades')],
+        ])
+        await query.edit_message_text(
+            _format_manage_trade_card(card, lang),
+            reply_markup=nav,
+            parse_mode='Markdown',
+        )
+
+    elif data in ('manage_prev', 'manage_next'):
+        cards = context.user_data.get('manage_cards') or []
+        if not cards:
+            await query.edit_message_text(
+                t('manage_no_open_trades', lang),
+                reply_markup=_back_keyboard(lang),
+                parse_mode='Markdown',
+            )
+            return
+        idx = int(context.user_data.get('manage_idx') or 0)
+        idx = max(0, idx - 1) if data == 'manage_prev' else min(len(cards) - 1, idx + 1)
+        context.user_data['manage_idx'] = idx
+        card = cards[idx]
+        nav = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(t('btn_prev', lang), callback_data='manage_prev'),
+                InlineKeyboardButton(t('btn_next', lang), callback_data='manage_next'),
+            ],
+            [InlineKeyboardButton(t('btn_back', lang), callback_data='manage_trades')],
+        ])
+        await query.edit_message_text(
+            _format_manage_trade_card(card, lang),
+            reply_markup=nav,
+            parse_mode='Markdown',
+        )
+
+    elif data == 'manage_close_all':
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(t('btn_confirm_yes', lang), callback_data='manage_close_all_yes')],
+            [InlineKeyboardButton(t('btn_confirm_no',  lang), callback_data='manage_close_all_no')],
+        ])
+        await query.edit_message_text(
+            t('manage_close_all_confirm', lang),
+            reply_markup=keyboard,
+            parse_mode='Markdown',
+        )
+
+    elif data == 'manage_close_all_no':
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(t('btn_show_open_trades', lang), callback_data='manage_show_open')],
+            [InlineKeyboardButton(t('btn_close_all_trades', lang), callback_data='manage_close_all')],
+            [InlineKeyboardButton(t('btn_view_trade_by_id', lang), callback_data='manage_view_trade')],
+            [InlineKeyboardButton(t('btn_back', lang), callback_data='main_menu')],
+        ])
+        await query.edit_message_text(
+            t('manage_menu_title', lang),
+            reply_markup=keyboard,
+            parse_mode='Markdown',
+        )
+
+    elif data == 'manage_close_all_yes':
+        rows = _fetch_open_trades(chat_id)
+        if not rows:
+            await query.edit_message_text(
+                t('manage_no_open_trades', lang),
+                reply_markup=_back_keyboard(lang),
+                parse_mode='Markdown',
+            )
+            return
+
+        creds = get_user_credentials(chat_id)
+        if not creds:
+            await query.edit_message_text(
+                t('balance_error', lang),
+                reply_markup=_back_keyboard(lang),
+                parse_mode='Markdown',
+            )
+            return
+        base_url, headers = get_session(creds)
+        if not headers:
+            await query.edit_message_text(
+                t('balance_error', lang),
+                reply_markup=_back_keyboard(lang),
+                parse_mode='Markdown',
+            )
+            return
+
+        upl_by_id: dict[str, float] = {}
+        try:
+            res = requests.get(f"{base_url}/positions", headers=headers, timeout=15)
+            if res.status_code == 200:
+                for p in (res.json() or {}).get('positions', []) or []:
+                    did = str(p.get('position', {}).get('dealId') or '')
+                    if not did:
+                        continue
+                    try:
+                        upl_by_id[did] = float(p.get('position', {}).get('upl') or 0.0)
+                    except Exception:
+                        upl_by_id[did] = 0.0
+        except Exception:
+            pass
+
+        closed = 0
+        failed = 0
+        for r in rows:
+            deal_id = str(r.get("deal_id") or "")
+            if not deal_id:
+                failed += 1
+                continue
+            try:
+                del_res = requests.delete(f"{base_url}/positions/{deal_id}", headers=headers, timeout=20)
+                if del_res.status_code != 200:
+                    failed += 1
+                    continue
+                upl = float(upl_by_id.get(deal_id, 0.0))
+                close_trade_in_db(int(r["trade_id"]), upl)
+                after_trade_leg_closed(chat_id, r.get("parent_session"), upl)
+                closed += 1
+            except Exception:
+                failed += 1
+
+        await query.edit_message_text(
+            t('manage_close_all_result', lang, closed=closed, failed=failed),
+            reply_markup=_back_keyboard(lang),
+            parse_mode='Markdown',
+        )
+
+    elif data == 'manage_view_trade':
+        context.user_data['manage_trade_state'] = 'AWAIT_TRADE_ID'
+        await query.edit_message_text(
+            t('manage_trade_prompt_id', lang),
+            reply_markup=_back_keyboard(lang),
+            parse_mode='Markdown',
+        )
+
+    # ── Open positions (legacy) ────────────────────────────────────────────
+    elif data == 'positions_legacy':
         positions = []
         try:
             creds = get_user_credentials(chat_id)
@@ -1511,10 +1793,11 @@ def _build_daily_report_text(chat_id: str, lang: str, date_str: str) -> str:
 
 
 async def report_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles text messages for the report date-collection flow."""
+    """Handles text messages for the report date-collection flow and manage-trade flows."""
     state = context.user_data.get('report_state')
-    if not state:
-        return  # not in a report flow — let other handlers process
+    mstate = context.user_data.get('manage_trade_state')
+    if not state and not mstate:
+        return  # not in a handled text flow — let other handlers process
 
     chat_id = str(update.message.chat_id)
     lang    = _get_lang(chat_id)
@@ -1642,6 +1925,70 @@ async def report_input_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         await loading_msg.edit_text(
             t('report_csv_ready', lang),
+            reply_markup=_back_keyboard(lang),
+            parse_mode='Markdown',
+        )
+
+    # ── Manage trades: view specific trade by id ────────────────────────────
+    elif mstate == 'AWAIT_TRADE_ID':
+        context.user_data.pop('manage_trade_state', None)
+        m = re.search(r"\d+", text)
+        if not m:
+            await update.message.reply_text(t('manage_trade_not_found', lang), parse_mode='Markdown')
+            return
+        tid = int(m.group(0))
+
+        conn = _db()
+        c = conn.cursor()
+        c.execute(
+            "SELECT trade_id, symbol, direction, entry_price, size, trailing_stop, "
+            "COALESCE(parent_session,'') "
+            "FROM trades WHERE chat_id=? AND trade_id=?",
+            (chat_id, tid),
+        )
+        row = c.fetchone()
+        if not row:
+            conn.close()
+            await update.message.reply_text(t('manage_trade_not_found', lang), parse_mode='Markdown')
+            return
+        parent_session = (row[6] or "").strip()
+        if parent_session:
+            # If this is a leg in a session, show aggregated OPEN legs if present,
+            # else show the single row.
+            c.execute(
+                "SELECT trade_id, symbol, direction, entry_price, size, trailing_stop, parent_session "
+                "FROM trades WHERE chat_id=? AND parent_session=? AND status='OPEN' ORDER BY trade_id ASC",
+                (chat_id, parent_session),
+            )
+            legs = c.fetchall() or []
+        else:
+            legs = []
+        conn.close()
+
+        if legs:
+            rows = []
+            for lr in legs:
+                rows.append({
+                    "trade_id": int(lr[0]),
+                    "symbol": lr[1],
+                    "direction": lr[2],
+                    "entry_price": float(lr[3] or 0),
+                    "size": float(lr[4] or 0),
+                    "trailing_stop": float(lr[5]) if lr[5] is not None else None,
+                    "parent_session": (lr[6] or "").strip(),
+                })
+            card = _group_open_trades(rows)[0]
+        else:
+            card = {
+                "trade_id": int(row[0]),
+                "symbol": row[1],
+                "direction": row[2],
+                "entry_price": float(row[3] or 0),
+                "qty": float(row[4] or 0),
+                "stop": float(row[5]) if row[5] is not None else None,
+            }
+        await update.message.reply_text(
+            _format_manage_trade_card(card, lang),
             reply_markup=_back_keyboard(lang),
             parse_mode='Markdown',
         )

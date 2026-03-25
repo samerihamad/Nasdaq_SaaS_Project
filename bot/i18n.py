@@ -298,7 +298,51 @@ STRINGS = {
     },
     'btn_balance':         {'ar': '💰 رصيدي',            'en': '💰 My Balance'},
     'btn_report':          {'ar': '📊 تقرير الأداء',     'en': '📊 Performance Report'},
-    'btn_positions':       {'ar': '📋 الصفقات المفتوحة', 'en': '📋 Open Positions'},
+    'btn_manage_trades':   {'ar': '🧩 إدارة الصفقات',     'en': '🧩 Manage Trades'},
+    'manage_menu_title': {
+        'ar': '🧩 *إدارة الصفقات*\nاختر عملية:',
+        'en': '🧩 *Manage Trades*\nChoose an action:',
+    },
+    'btn_show_open_trades': {
+        'ar': '📋 عرض الصفقات المفتوحة',
+        'en': '📋 View open trades',
+    },
+    'btn_close_all_trades': {
+        'ar': '🛑 إغلاق جميع الصفقات المفتوحة',
+        'en': '🛑 Close all open trades',
+    },
+    'btn_view_trade_by_id': {
+        'ar': '🔎 عرض صفقة محددة',
+        'en': '🔎 View specific trade',
+    },
+    'manage_no_open_trades': {
+        'ar': '📭 لا توجد صفقات مفتوحة للإدارة.',
+        'en': '📭 No open trades to manage.',
+    },
+    'manage_trade_prompt_id': {
+        'ar': '✍️ اكتب *رقم الصفقة* (Trade ID) لعرضها. مثال: `1234`',
+        'en': '✍️ Enter the *Trade ID* to view. Example: `1234`',
+    },
+    'manage_trade_not_found': {
+        'ar': '❌ لم يتم العثور على صفقة بهذا الرقم.',
+        'en': '❌ No trade found with that ID.',
+    },
+    'manage_nav': {
+        'ar': '⬅️ السابق | ➡️ التالي',
+        'en': '⬅️ Prev | ➡️ Next',
+    },
+    'btn_prev': {'ar': '⬅️ السابق', 'en': '⬅️ Prev'},
+    'btn_next': {'ar': '➡️ التالي', 'en': '➡️ Next'},
+    'manage_close_all_confirm': {
+        'ar': '⚠️ *تأكيد*\nهل أنت متأكد من إغلاق *جميع الصفقات المفتوحة*؟',
+        'en': '⚠️ *Confirm*\nAre you sure you want to close *all open trades*?',
+    },
+    'btn_confirm_yes': {'ar': '✅ نعم، أغلق الكل', 'en': '✅ Yes, close all'},
+    'btn_confirm_no':  {'ar': '❎ إلغاء',          'en': '❎ Cancel'},
+    'manage_close_all_result': {
+        'ar': '✅ تم إرسال أوامر الإغلاق.\nتم الإغلاق: *{closed}* | فشل: *{failed}*',
+        'en': '✅ Close requests sent.\nClosed: *{closed}* | Failed: *{failed}*',
+    },
     'btn_mode_auto':       {'ar': '🤖 وضع آلي ✅',       'en': '🤖 Automated ✅'},
     'btn_mode_hybrid':     {'ar': '🤝 وضع هجين ✅',      'en': '🤝 Hybrid ✅'},
     'btn_switch_auto':     {'ar': '🔄 تفعيل الوضع الآلي','en': '🔄 Switch to Automated'},

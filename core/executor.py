@@ -1133,6 +1133,7 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
     auto_upsized = qty_total > float(size)
 
     opened_legs = []
+    opened_trade_ids: list[int] = []
     parent_session = str(uuid.uuid4())
     for idx, (leg_size, leg_target) in enumerate(legs):
         leg_role = "TP1" if idx == 0 else "TP2"
@@ -1198,7 +1199,7 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             break
 
         opened_legs.append((leg_size, leg_target, deal_id))
-        record_open_trade(
+        tid = record_open_trade(
             chat_id,
             symbol,
             action,
@@ -1210,6 +1211,11 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             parent_session=parent_session,
             stop_distance=stop_dist,
         )
+        try:
+            if tid is not None:
+                opened_trade_ids.append(int(tid))
+        except Exception:
+            pass
         ok, info = _sync_protection_to_broker(
             base_url, headers, deal_id, stop_level, leg_target
         )
@@ -1239,17 +1245,9 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
     is_override  = (reason == STATE_MANUAL_OVERRIDE)
     _fmt_money   = lambda v: f"${v:,.2f}"
 
-    # Daily trade counter (for the "#N" label).
-    utc_today = datetime.utcnow().date().isoformat()
-    conn = sqlite3.connect('database/trading_saas.db')
-    c = conn.cursor()
-    c.execute(
-        "SELECT COUNT(*) FROM trades WHERE chat_id=? AND DATE(opened_at)=?",
-        (chat_id, utc_today),
-    )
-    row = c.fetchone()
-    trade_index = row[0] if row else 0
-    conn.close()
+    # Stable trade identifier:
+    # Use the smallest trade_id opened in this session (TP1/TP2) as the display number.
+    trade_index = min(opened_trade_ids) if opened_trade_ids else 0
 
     from utils.market_hours import _now_et
     now_et_str = _now_et().strftime('%Y-%m-%d %H:%M ET')
