@@ -435,11 +435,19 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
             and regime != "VOLATILE"
         )
 
+        # ── AI DEBUG (CRITICAL) ───────────────────────────────────────────────
+        print(
+            f"[AI DEBUG] {symbol} {action} | "
+            f"conf={float(confidence):.1f} | prob={float(ai_prob):.1f} | "
+            f"approved={bool(ai_approved)} | override={bool(ai_override)} | "
+            f"strategy={strategy_key} | regime={regime}"
+        )
+
         if not (ai_approved or ai_override):
             print(
-                f"   [AI BLOCK] {symbol} {action} — "
-                f"probability {ai_prob:.1f}% < min({strategy_key})={ai_min_prob:.1f}% "
-                f"| regime={regime} | conf={confidence:.1f}%"
+                f"[AI BLOCK] {symbol} {action} | "
+                f"prob={float(ai_prob):.1f} < min={float(ai_min_prob):.1f} | "
+                f"conf={float(confidence):.1f} | strategy={strategy_key} | regime={regime}"
             )
             return
 
@@ -486,13 +494,16 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
                 if isinstance(result, str) and result.startswith("✅ Opened"):
                     opened += 1
                     unsupported_for_all = False
+                    print(f"[TRADE OPENED] {symbol} {action}")
                 elif isinstance(result, str) and result.startswith("⏭️"):
                     skipped += 1
                     if "symbol not available on broker" not in result:
                         unsupported_for_all = False
+                    print(f"[TRADE SKIPPED] {result}")
                 else:
                     failed += 1
                     unsupported_for_all = False
+                    print(f"[TRADE FAILED] {result}")
 
             else:
                 # HYBRID: post to DB, non-blocking.
@@ -507,11 +518,13 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
                 # In HYBRID mode this means "queued", not opened yet.
                 skipped += 1
                 unsupported_for_all = False
+                print(f"[TRADE SKIPPED] HYBRID queued signal_id={sig_id} ({symbol} {action})")
 
         except Exception as exc:
             print(f"   [ERROR  {chat_id}] dispatch failed: {exc}")
             failed += 1
             unsupported_for_all = False
+            print(f"[TRADE FAILED] dispatch exception: {exc}")
 
     print(
         f"   Signal outcome: attempted={attempted}/{len(subscribers)} | "
@@ -659,6 +672,9 @@ def run_trading_bot():
 
             print(f"\n[SCAN] {len(_watchlist)} symbols | {len(get_trading_subscribers())} trading / {len(get_all_active_subscribers())} total subscribers")
 
+            scan_started = time.time()
+            print(f"[SCAN START] symbols={len(_watchlist)}")
+
             # Parallel scan: eliminate per-symbol sleeps and IO bottlenecks.
             # Returns best-per-symbol signals with timeframes attached (no execution).
             signals = scan_watchlist_parallel(
@@ -666,6 +682,9 @@ def run_trading_bot():
                 min_confidence=MIN_CONFIDENCE,
                 max_workers=8,
             )
+
+            duration = time.time() - scan_started
+            print(f"[SCAN END] duration={duration:.1f} sec | signals_found={len(signals)}")
 
             if not signals:
                 print("   [SCAN] No signals found this cycle.")

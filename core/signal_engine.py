@@ -270,10 +270,15 @@ def scan_watchlist_parallel(
             return None
 
         candidates: list[tuple[str, float, str, str, float | None]] = []
+        raw_confs: list[float] = []
 
         # 1) RF multi-timeframe
         try:
             action, conf, reason = analyze_multi_timeframe(timeframes, symbol=symbol)
+            try:
+                raw_confs.append(float(conf))
+            except Exception:
+                pass
             if action and conf >= float(min_confidence):
                 candidates.append((action, float(conf), "RF", str(reason), None))
         except Exception:
@@ -282,6 +287,10 @@ def scan_watchlist_parallel(
         # 2) Mean Reversion
         try:
             mr = analyze_meanrev(symbol, timeframes)
+            try:
+                raw_confs.append(float((mr or {}).get("confidence", 0)))
+            except Exception:
+                pass
             if mr and float(mr.get("confidence", 0)) >= float(min_confidence):
                 candidates.append((
                     str(mr["action"]),
@@ -296,6 +305,10 @@ def scan_watchlist_parallel(
         # 3) Momentum
         try:
             mo = analyze_momentum(symbol, timeframes)
+            try:
+                raw_confs.append(float((mo or {}).get("confidence", 0)))
+            except Exception:
+                pass
             if mo and float(mo.get("confidence", 0)) >= float(min_confidence):
                 candidates.append((
                     str(mo["action"]),
@@ -308,11 +321,14 @@ def scan_watchlist_parallel(
             pass
 
         if not candidates:
+            best_conf = max(raw_confs) if raw_confs else 0.0
+            print(f"[NO SIGNAL] {symbol} | best_conf={best_conf:.1f}")
             return None
 
         best_action, best_conf, best_label, best_reason, best_sl_pct = max(
             candidates, key=lambda x: x[1]
         )
+        print(f"[CANDIDATES] {symbol} | count={len(candidates)} | best_conf={best_conf:.1f}")
 
         return {
             "symbol": symbol,
