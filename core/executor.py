@@ -523,7 +523,21 @@ def _confirm_deal_and_visibility(
                     data.get("dealStatus") or data.get("status") or ""
                 ).upper()
                 if st in ("REJECTED", "FAILED"):
-                    return False, "", f"deal rejected ({st})"
+                    # Broker usually includes a human-readable rejection reason.
+                    # Expose it so Telegram shows the actual cause instead of a generic label.
+                    msg = (
+                        data.get("message")
+                        or data.get("errorMessage")
+                        or data.get("reason")
+                        or data.get("rejectionReason")
+                        or data.get("dealError")
+                        or ""
+                    )
+                    msg = str(msg).strip()
+                    err = f"deal rejected ({st})"
+                    if msg:
+                        err += f": {msg[:200]}"
+                    return False, "", err
         except Exception:
             pass
         _time.sleep(0.45)
