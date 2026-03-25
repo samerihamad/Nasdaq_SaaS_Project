@@ -327,7 +327,28 @@ def run_daily_scan():
     level1 = level1_filter(tickers, top_n=300)
     level2 = level2_filter(level1)
     level3 = level3_filter(level2)
-    watchlist = level3[:MAX_WATCHLIST]
+
+    # Prefer Level3 (cheap + controlled daily range),
+    # but always fill up to MAX_WATCHLIST from Level2 if Level3 returns fewer.
+    seen = set()
+    watchlist = []
+    for sym in level3:
+        if sym in seen:
+            continue
+        seen.add(sym)
+        watchlist.append(sym)
+        if len(watchlist) >= MAX_WATCHLIST:
+            break
+
+    if len(watchlist) < MAX_WATCHLIST:
+        for sym in level2:
+            if sym in seen:
+                continue
+            seen.add(sym)
+            watchlist.append(sym)
+            if len(watchlist) >= MAX_WATCHLIST:
+                break
+
     print(f"✅ القائمة النهائية: {len(watchlist)} سهم")
     return watchlist
 
@@ -565,9 +586,14 @@ def run_trading_bot():
                         pretrain_models(_watchlist)
 
                 # DST-safe pre-market alert window.
+                # Ensure the alert is dispatched once even if Level3 produced
+                # an empty watchlist (we fill in run_daily_scan()).
                 if (_premarket_sent != today
                         and 0 < mins <= PREMARKET_ALERT_WINDOW_MIN
-                        and _watchlist):
+                        and (_watchlist or _last_scan_date == today)):
+                    if not _watchlist:
+                        # Last-resort: build a watchlist right before sending.
+                        _watchlist = run_daily_scan()
                     send_premarket_alert(len(_watchlist))
 
             # ── Market CLOSED: notify once, run watcher for all users ─────────
