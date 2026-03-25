@@ -271,6 +271,69 @@ def _get_min_deal_size(base_url, headers, epic) -> float:
         return 1.0
 
 
+def _get_min_stop_profit_distance(base_url, headers, epic) -> float | None:
+    """
+    Fetch broker minimum stop/profit distance for an epic (in absolute price units).
+
+    Capital.com dealing rules vary by instrument/region. We try multiple known keys.
+    Returns None if unavailable.
+    """
+    try:
+        res = requests.get(f"{base_url}/markets/{epic}", headers=headers, timeout=20)
+        if res.status_code != 200:
+            return None
+        data = res.json() or {}
+        rules = data.get("dealingRules", {}) or {}
+
+        # Known keys seen in Capital payloads (may be dicts with "value")
+        candidates = (
+            "minStopOrProfitDistance",
+            "minStopOrLimitDistance",
+            "minStopDistance",
+            "minLimitDistance",
+        )
+        for k in candidates:
+            v = rules.get(k)
+            if isinstance(v, dict):
+                v = v.get("value")
+            if v is None:
+                continue
+            try:
+                f = float(v)
+                if f > 0:
+                    return f
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
+
+
+def _apply_min_distance_to_protection(
+    action: str,
+    entry_price: float,
+    stop_level: float,
+    profit_level: float | None,
+    min_dist: float | None,
+) -> tuple[float, float | None]:
+    """
+    Ensure stop/profit are at least `min_dist` away from entry.
+    Adjusts levels outward only (more conservative), preserving direction ordering.
+    """
+    if min_dist is None or min_dist <= 0 or entry_price <= 0:
+        return stop_level, profit_level
+    md = float(min_dist)
+    if action == "BUY":
+        stop_level = min(float(stop_level), float(entry_price) - md)
+        if profit_level is not None:
+            profit_level = max(float(profit_level), float(entry_price) + md)
+    else:
+        stop_level = max(float(stop_level), float(entry_price) + md)
+        if profit_level is not None:
+            profit_level = min(float(profit_level), float(entry_price) - md)
+    return stop_level, profit_level
+
+
 def resolve_epic_for_user(chat_id, symbol, base_url=None, headers=None, is_demo=None):
     """
     Resolve and cache broker epic for (chat_id, symbol) per day.
@@ -336,6 +399,8 @@ def _open_position_with_protection(base_url, headers, epic, action, size, stop_l
         "epic": epic,
         "direction": action,
         "size": size,
+        "orderType": "MARKET",
+        "forceOpen": True,
         "stopLevel": stop_level,
     }
     if target_level is not None:
@@ -1031,6 +1096,17 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
         action, entry_price, stop_level, target1, target2
     )
 
+    # Broker dealing rules: enforce minimum stop/profit distance if provided.
+    # This prevents failures like: error.invalid.takeprofit.minvalue
+    min_dist = _get_min_stop_profit_distance(base_url, headers, order_epic)
+    stop_level, target1 = _apply_min_distance_to_protection(
+        action, entry_price, stop_level, target1, min_dist
+    )
+    # Re-sanitize after widening levels.
+    stop_level, target1, target2 = _sanitize_protection_levels(
+        action, entry_price, stop_level, target1, target2
+    )
+
     # Split into two positions to support TP1 + TP2 on broker.
     # Capital applies one TP per position, so we split size intentionally.
     min_deal_size = _get_min_deal_size(base_url, headers, order_epic)
@@ -1063,6 +1139,27 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
         ok, out = _open_position_with_protection(
             base_url, headers, order_epic, action, leg_size, stop_level, leg_target
         )
+        # If broker rejects TP as too close, retry once with widened TP from error code.
+        if (not ok) and isinstance(out, str) and "takeprofit.minvalue" in out.lower() and leg_target is not None:
+            try:
+                import re as _re
+                m = _re.search(r"minvalue:\s*([0-9]+(?:\.[0-9]+)?)", out, flags=_re.IGNORECASE)
+                req = float(m.group(1)) if m else None
+            except Exception:
+                req = None
+            if req and req > 0:
+                widened_stop, widened_tp = _apply_min_distance_to_protection(
+                    action, entry_price, stop_level, leg_target, req
+                )
+                widened_stop, widened_tp, _ = _sanitize_protection_levels(
+                    action, entry_price, widened_stop, widened_tp, widened_tp
+                )
+                ok, out = _open_position_with_protection(
+                    base_url, headers, order_epic, action, leg_size, widened_stop, widened_tp
+                )
+                if ok:
+                    stop_level = widened_stop
+                    leg_target = widened_tp
         if not ok:
             # If first leg fails, abort immediately. If second fails, keep first
             # and warn user to avoid hidden exposure.
