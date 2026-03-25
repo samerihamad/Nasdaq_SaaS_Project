@@ -31,8 +31,8 @@ WATCHLIST = [
 # ── Mean Reversion Parameters ─────────────────────────────────────────────────
 
 # RSI thresholds for oversold / overbought detection
-MR_RSI_OVERSOLD      = 30      # below → look for BUY reversal on 15m
-MR_RSI_OVERBOUGHT    = 70      # above → look for SELL reversal on 15m
+MR_RSI_OVERSOLD      = 35      # below → look for BUY reversal on 15m
+MR_RSI_OVERBOUGHT    = 65      # above → look for SELL reversal on 15m
 
 # Required % deviation from VWAP to confirm price is stretched
 MR_VWAP_DEV_PCT      = 1.5
@@ -49,12 +49,12 @@ MR_MIN_SCORE         = 40
 # ── Momentum Parameters ───────────────────────────────────────────────────────
 
 # ADX minimum for a trending market; signals below this are noise
-MOM_ADX_THRESHOLD    = 25
+MOM_ADX_THRESHOLD    = 20
 # ADX above this is considered a very strong trend (boosts score)
 MOM_ADX_STRONG       = 40
 
 # Current bar volume must be ≥ this multiple of the 20-bar average
-MOM_VOL_RATIO        = 1.8
+MOM_VOL_RATIO        = 1.3
 
 # Minimum gap-up or gap-down % to count as a momentum gap signal
 MOM_GAP_PCT          = 1.0
@@ -87,7 +87,7 @@ BE_LOCK_BUFFER_PCT = 0.0005  # 0.05% beyond entry (per direction)
 # ── Signal Quality Gate ───────────────────────────────────────────────────────
 
 # Signals with confidence below this are discarded before risk checks
-MIN_CONFIDENCE       = 63.0
+MIN_CONFIDENCE       = 55.0
 
 # Hard cap on new positions per user per day (independent of circuit breaker)
 MAX_DAILY_TRADES     = 5
@@ -129,9 +129,9 @@ PREMARKET_ALERT_WINDOW_MIN = 30
 #
 # Per-strategy minimum AI probability thresholds (%).
 # These apply in dispatch_signal() as an execution gate after strategy confidence.
-AI_MIN_PROB_RF = 60.0
-AI_MIN_PROB_MOMENTUM = 52.0
-AI_MIN_PROB_MEANREV = 48.0
+AI_MIN_PROB_RF = 55.0
+AI_MIN_PROB_MOMENTUM = 45.0
+AI_MIN_PROB_MEANREV = 45.0
 
 # Soft override:
 # Allow high-confidence strategy signals to pass even if AI probability is below
@@ -139,7 +139,7 @@ AI_MIN_PROB_MEANREV = 48.0
 # Soft override gate:
 # lower confidence threshold to allow more executions when AI probability is low
 # but technical confidence is still strong (unless regime is VOLATILE).
-AI_SOFT_OVERRIDE_CONFIDENCE = 65.0
+AI_SOFT_OVERRIDE_CONFIDENCE = 60.0
 AI_SOFT_OVERRIDE_MIN_PROB = 20.0
 
 # Refresh watchlist while market is open (seconds)
