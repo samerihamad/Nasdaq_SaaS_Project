@@ -14,7 +14,7 @@ Key public API:
   validate_signal(symbol, direction, timeframes) -> (approved, probability, regime)
   detect_regime(df)                              -> dict
   analyze_multi_timeframe(timeframes, symbol)    -> (action, confidence, reason)
-  load_or_train_model(symbol)                    -> (model, scaler)
+  load_or_train_model(symbol, timeframe)         -> (model, scaler)
 
 MODEL_VERSION is embedded in saved .pkl files. A version mismatch triggers
 automatic retraining so stale models with different feature sets never silently
@@ -36,7 +36,7 @@ import yfinance as yf
 log = logging.getLogger(__name__)
 
 MODEL_DIR             = "models"
-MODEL_VERSION         = 2          # bump whenever build_features() columns change
+MODEL_VERSION         = 3          # bump to force retrain after gate/training changes
 AI_PROBABILITY_THRESHOLD = 60.0    # minimum probability to approve a trade
 MIN_TRAIN_BARS        = 220        # supports EMA200 + labeling while allowing newer listings
 TRAIN_RETRY_HOURS     = 6          # avoid retry spam for symbols with short history
@@ -46,8 +46,8 @@ _train_retry_after: dict[str, datetime] = {}
 _model_cache: dict[str, tuple[Any, Any, int]] = {}  # symbol -> (model, scaler, version)
 
 # Label parameters
-FUTURE_BARS      = 5       # look-ahead bars for labeling
-RETURN_THRESHOLD = 0.015   # 1.5% move to qualify as BUY/SELL
+FUTURE_BARS      = 3       # tighter horizon for less label noise
+RETURN_THRESHOLD = 0.02    # 2.0% move to qualify as BUY/SELL
 
 LABEL_BUY  =  1
 LABEL_SELL = -1
@@ -120,7 +120,7 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Build a feature matrix from an OHLCV DataFrame.
 
-    Columns (v2 — MODEL_VERSION = 2):
+    Columns (v3 — MODEL_VERSION = 3):
       Price / EMA distances, RSI, MACD, VWAP, volume ratio,
       ATR% (volatility), BB width (regime), high-low range%
     """
@@ -186,10 +186,19 @@ def _model_path(symbol: str) -> str:
     safe = symbol.replace("/", "-").replace("=", "").replace("^", "")
     return os.path.join(MODEL_DIR, f"{safe}_v{MODEL_VERSION}.pkl")
 
+def _model_path_tf(symbol: str, tf: str) -> str:
+    safe = symbol.replace("/", "-").replace("=", "").replace("^", "")
+    tf_safe = str(tf or "").strip().lower().replace("/", "-")
+    return os.path.join(MODEL_DIR, f"{safe}_{tf_safe}_v{MODEL_VERSION}.pkl")
 
-def train_model(symbol: str):
+
+def train_model(symbol: str, timeframe: str = "1d"):
     """
-    Train a Random Forest classifier on 5 years of daily data.
+    Train a Random Forest classifier on market data for a specific timeframe.
+
+    - 1d: 5 years daily bars
+    - 15m: 60 days 15-minute bars (more detailed, closer to execution timeframe)
+
     Saves model + scaler to disk. Returns (model, scaler) or (None, None).
     """
     now = datetime.now(timezone.utc)
@@ -197,16 +206,29 @@ def train_model(symbol: str):
     if retry_at and now < retry_at:
         return None, None
 
-    log.info("Training RF model for %s (5y daily)...", symbol)
-    df = yf.download(symbol, period="5y", interval="1d",
-                     progress=False, auto_adjust=True)
+    tf = str(timeframe or "1d").strip().lower()
+    if tf in ("15m", "15min", "15"):
+        period, interval, label = "60d", "15m", "60d 15m"
+        tf = "15m"
+    else:
+        period, interval, label = "5y", "1d", "5y daily"
+        tf = "1d"
+
+    log.info("Training RF model for %s (%s)...", symbol, label)
+    df = yf.download(
+        symbol,
+        period=period,
+        interval=interval,
+        progress=False,
+        auto_adjust=True,
+    )
     bars = len(df) if df is not None else 0
     if df is None or bars < MIN_TRAIN_BARS:
         # Retry later instead of re-attempting every scan cycle.
         _train_retry_after[symbol] = now + timedelta(hours=TRAIN_RETRY_HOURS)
         log.warning(
-            "Insufficient data for %s (%s bars, need >= %s). Retry after %sh.",
-            symbol, bars, MIN_TRAIN_BARS, TRAIN_RETRY_HOURS
+            "Insufficient data for %s (%s, %s bars, need >= %s). Retry after %sh.",
+            symbol, tf, bars, MIN_TRAIN_BARS, TRAIN_RETRY_HOURS
         )
         return None, None
 
@@ -235,24 +257,30 @@ def train_model(symbol: str):
     )
     model.fit(X_scaled, y)
 
-    with open(_model_path(symbol), 'wb') as f:
+    with open(_model_path_tf(symbol, tf), 'wb') as f:
         pickle.dump({'model': model, 'scaler': scaler, 'version': MODEL_VERSION}, f)
 
-    log.info("Model saved for %s — %d training samples", symbol, len(combined))
+    log.info("Model saved for %s (%s) — %d training samples", symbol, tf, len(combined))
     return model, scaler
 
 
-def load_or_train_model(symbol: str):
+def load_or_train_model(symbol: str, timeframe: str = "1d"):
     """Load a cached model or train a new one if not found or version mismatch.
 
     Uses an in-memory cache to avoid repeated disk IO during scan loops.
     """
     sym = str(symbol or "").strip().upper()
-    if sym and sym in _model_cache:
-        m, s, v = _model_cache[sym]
+    tf = str(timeframe or "1d").strip().lower()
+    if tf not in ("1d", "15m"):
+        tf = "1d"
+
+    cache_key = f"{sym}|{tf}" if sym else tf
+    if cache_key in _model_cache:
+        m, s, v = _model_cache[cache_key]
         if v == MODEL_VERSION:
             return m, s
-    path = _model_path(symbol)
+
+    path = _model_path_tf(symbol, tf)
     if os.path.exists(path):
         try:
             with open(path, 'rb') as f:
@@ -260,14 +288,14 @@ def load_or_train_model(symbol: str):
             if saved.get('version') == MODEL_VERSION:
                 model, scaler = saved['model'], saved['scaler']
                 if sym:
-                    _model_cache[sym] = (model, scaler, MODEL_VERSION)
+                    _model_cache[cache_key] = (model, scaler, MODEL_VERSION)
                 return model, scaler
-            log.info("Model version mismatch for %s — retraining", symbol)
+            log.info("Model version mismatch for %s (%s) — retraining", symbol, tf)
         except Exception as exc:
-            log.warning("Failed to load model for %s: %s — retraining", symbol, exc)
-    model, scaler = train_model(symbol)
+            log.warning("Failed to load model for %s (%s): %s — retraining", symbol, tf, exc)
+    model, scaler = train_model(symbol, timeframe=tf)
     if sym and model and scaler:
-        _model_cache[sym] = (model, scaler, MODEL_VERSION)
+        _model_cache[cache_key] = (model, scaler, MODEL_VERSION)
     return model, scaler
 
 
@@ -366,7 +394,9 @@ def validate_signal(
     regime = detect_regime(df_primary)
 
     # Load model and compute direction probability
-    model, scaler = load_or_train_model(symbol)
+    # Prefer the 15m-trained model when validating on intraday data.
+    model_tf = "15m" if (df_primary is df_15m) else "1d"
+    model, scaler = load_or_train_model(symbol, timeframe=model_tf)
 
     if model and scaler:
         probability = _direction_probability(df_primary, model, scaler, direction)
@@ -376,11 +406,20 @@ def validate_signal(
 
     # Regime penalty: high volatility = uncertain environment
     if regime['type'] == 'VOLATILE':
-        probability = round(probability * 0.95, 1)   # -5% penalty
+        probability = round(probability * 0.80, 1)   # stronger penalty
         log.info(
             "[AI Gate %s] VOLATILE regime penalty applied → probability=%.1f%%",
             symbol, probability,
         )
+
+        # Hard block in VOLATILE when probability is too low (safety brake).
+        if probability < 45.0:
+            min_prob = AI_PROBABILITY_THRESHOLD if min_probability is None else float(min_probability)
+            log.info(
+                "[AI Gate %s] VOLATILE hard block (prob=%.1f%% < 45.0%%) | min=%.1f%%",
+                symbol, probability, min_prob
+            )
+            return False, probability, regime['type']
 
     min_prob = AI_PROBABILITY_THRESHOLD if min_probability is None else float(min_probability)
     approved = probability >= min_prob
@@ -442,7 +481,7 @@ def _rule_based_probability(df: pd.DataFrame, direction: str) -> float:
             checks = [c < e20, c < e50, c < e200, r < 55, h < 0]
 
         hit_rate = sum(checks) / len(checks)
-        prob     = round(40.0 + hit_rate * 50.0, 1)    # range 40–90
+        prob     = round(30.0 + hit_rate * 60.0, 1)    # range 30–90
         return prob
 
     except Exception:
@@ -489,13 +528,19 @@ def analyze_multi_timeframe(timeframes: dict, symbol: str = None) -> tuple:
     validate_signal() before executing any trade.
     """
     try:
-        model, scaler = (None, None)
+        # Use timeframe-specific models:
+        # - 1d model for daily context
+        # - 15m model for intraday context (15m + 4h)
+        models: dict[str, tuple[Any, Any]] = {}
         if symbol:
-            model, scaler = load_or_train_model(symbol)
+            models["1d"] = load_or_train_model(symbol, timeframe="1d")
+            models["15m"] = load_or_train_model(symbol, timeframe="15m")
 
         results = {}
         for tf, df in timeframes.items():
             df = _flatten(df)
+            use_tf = "15m" if str(tf).lower() in ("15m", "4h") else "1d"
+            model, scaler = models.get(use_tf, (None, None))
             if model and scaler:
                 action, conf = _predict(df, model, scaler)
                 bullish = action == 'BUY'
