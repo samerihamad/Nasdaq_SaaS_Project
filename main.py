@@ -21,7 +21,7 @@ import traceback
 from datetime import datetime, date, timezone
 
 from database.db_manager import create_db, is_maintenance_mode
-from utils.filters import get_nasdaq_tickers, level1_filter, level2_filter
+from utils.filters import get_nasdaq_tickers, level1_filter, level2_filter, level3_filter
 from utils.market_scanner import scan_multi_timeframe
 from utils.ai_model import (
     analyze_multi_timeframe,
@@ -326,7 +326,8 @@ def run_daily_scan():
     print(f"📋 إجمالي أسهم ناسداك: {len(tickers)}")
     level1 = level1_filter(tickers, top_n=300)
     level2 = level2_filter(level1)
-    watchlist = level2[:MAX_WATCHLIST]
+    level3 = level3_filter(level2)
+    watchlist = level3[:MAX_WATCHLIST]
     print(f"✅ القائمة النهائية: {len(watchlist)} سهم")
     return watchlist
 

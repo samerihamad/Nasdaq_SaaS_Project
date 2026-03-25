@@ -15,6 +15,15 @@ MIN_MARKET_CAP       = 300_000_000    # $300M
 MAX_GAP_PCT          = 0.02           # 2% max gap
 EARNINGS_BUFFER_DAYS = 2              # exclude if earnings within 2 days
 
+# ── Level 3 — Price / Daily Range filter ─────────────────────────────────
+# Goal: prefer "cheap" tickers with controlled intraday movement.
+# We estimate daily movement using (High - Low) / Close.
+MIN_PRICE            = 0.50          # $0.50 minimum
+MAX_PRICE            = 30.0          # $30 maximum (tune as needed)
+MIN_DAILY_RANGE_PCT = 0.50          # 0.5%
+MAX_DAILY_RANGE_PCT = 2.00          # 2.0%
+DAILY_RANGE_LOOKBACK_DAYS = 3         # average over last N sessions
+
 # Module-level cache: populated by get_nasdaq_tickers() when screener API works.
 # { symbol: {'avg_volume': float, 'market_cap': float} }
 _screener_cache: dict = {}
@@ -299,3 +308,94 @@ def level2_filter(tickers: list[str]) -> list[str]:
 
     print(f"✅ المستوى 2: اجتاز {len(stable)} سهم")
     return stable
+
+
+def level3_filter(tickers: list[str]) -> list[str]:
+    """
+    Level 3 — Price & Daily Range filter.
+
+    Keeps tickers where:
+      - Last close price within [MIN_PRICE, MAX_PRICE]
+      - Average daily range (High-Low)/Close over last N days in
+        [MIN_DAILY_RANGE_PCT, MAX_DAILY_RANGE_PCT]
+      - Last day's daily range is also within the same band
+
+    This aims to select stocks that are liquid yet not extremely volatile,
+    so targets/SL distances behave more predictably.
+    """
+    print(f"📊 المستوى 3: تصفية {len(tickers)} سهم (سعر رخيص + حركة يومية 0.5%-2%)...")
+    if not tickers:
+        return []
+
+    qualified: list[str] = []
+
+    # Chunk to limit memory and request payload size.
+    for i in range(0, len(tickers), 50):
+        batch = tickers[i:i + 50]
+        try:
+            raw = yf.download(
+                batch,
+                period="5d",
+                interval="1d",
+                progress=False,
+                auto_adjust=True,
+                group_by="ticker",
+                threads=True,
+            )
+        except Exception:
+            continue
+
+        for sym in batch:
+            try:
+                hist = raw[sym] if len(batch) > 1 else raw
+                if hist is None or hist.empty or len(hist) < DAILY_RANGE_LOOKBACK_DAYS:
+                    continue
+
+                # Ensure columns exist
+                if not all(col in hist.columns for col in ("High", "Low", "Close")):
+                    continue
+
+                hist = hist.dropna(subset=["High", "Low", "Close"])
+                if hist.empty or len(hist) < DAILY_RANGE_LOOKBACK_DAYS:
+                    continue
+
+                last = hist.iloc[-1]
+                close_last = float(last["Close"]) if last["Close"] is not None else 0.0
+                if close_last <= 0:
+                    continue
+
+                price_ok = (close_last >= MIN_PRICE) and (close_last <= MAX_PRICE)
+                if not price_ok:
+                    continue
+
+                # Daily range for each of the last N sessions.
+                tail = hist.tail(DAILY_RANGE_LOOKBACK_DAYS)
+                ranges = []
+                for _, row in tail.iterrows():
+                    c = float(row["Close"])
+                    if c <= 0:
+                        continue
+                    r = (float(row["High"]) - float(row["Low"])) / c * 100.0
+                    if r >= 0:
+                        ranges.append(r)
+
+                if not ranges:
+                    continue
+
+                avg_range = sum(ranges) / len(ranges)
+
+                # Also enforce last-day range band.
+                last_range = ranges[-1]
+                if (
+                    MIN_DAILY_RANGE_PCT <= avg_range <= MAX_DAILY_RANGE_PCT
+                    and MIN_DAILY_RANGE_PCT <= last_range <= MAX_DAILY_RANGE_PCT
+                ):
+                    qualified.append(sym)
+
+            except Exception:
+                continue
+
+    # Deduplicate in case symbols appear in multiple batches
+    qualified = list(dict.fromkeys(qualified))
+    print(f"✅ المستوى 3: اجتاز {len(qualified)} سهم")
+    return qualified
