@@ -73,6 +73,17 @@ ATR_STOP_MULTIPLIER  = 2.0
 # ATR period used for stop distance calculation (matches trailing_stop.py)
 ATR_PERIOD           = 14
 
+# ── Fixed Target Distances (entry-relative) ────────────────────────────────
+# These targets are used to set TP1/TP2 levels regardless of ATR/stop_distance.
+# TP1/T2 are percentages from entry price in the direction of the trade.
+TP1_PCT = 0.01   # 1%
+TP2_PCT = 0.015  # 1.5%
+
+# After TP1 is reached we "lock" the stop on TP2 leg so that the position
+# doesn't fall back to entry. We use a tiny buffer beyond breakeven to
+# reduce the chance of an exact-entry stop due to rounding/ticks.
+BE_LOCK_BUFFER_PCT = 0.0005  # 0.05% beyond entry (per direction)
+
 # ── Signal Quality Gate ───────────────────────────────────────────────────────
 
 # Signals with confidence below this are discarded before risk checks

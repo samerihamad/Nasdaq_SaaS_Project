@@ -99,7 +99,7 @@ def send_reconcile_tp1_hit(
         )
         if tp2_still_open:
             body += (
-                "⏳ *TP2 (1.33R)* is still open — waiting for the second target "
+                "⏳ *TP2 (1.5%)* is still open — waiting for the trailing phase "
                 "or stop management.\n"
             )
         else:
@@ -119,7 +119,7 @@ def send_reconcile_tp1_hit(
         )
         if tp2_still_open:
             body += (
-                "⏳ *الهدف الثاني (1.33R)* لا يزال مفتوحاً — ننتظر تحقيقه أو إدارة الوقف.\n"
+                "⏳ *الهدف الثاني (1.5%)* لا يزال مفتوحاً — ننتظر تفعيل التريلينج أو إدارة الوقف.\n"
             )
         else:
             body += "ℹ️ لا يوجد حد ثاني مسجّل كمفتوح.\n"
@@ -155,7 +155,7 @@ def send_reconcile_tp2_final(
             + f"🔢 *Total quantity*: *{int(total_qty)}* shares\n"
             + f"━━━━━━━━━━━━━━━━━━━━\n"
             + f"💰 *TP1 (1R) P&L*  : *{_fmt_money_signed(tp1_pnl)}*\n"
-            + f"💰 *TP2 (1.33R) P&L*: *{_fmt_money_signed(tp2_pnl)}*\n"
+            + f"💰 *TP2 (1.5%) P&L*: *{_fmt_money_signed(tp2_pnl)}*\n"
             + f"━━━━━━━━━━━━━━━━━━━━\n"
             + f"*Total P&L*       : *{_fmt_money_signed(total_pnl)}*\n"
             + f"🎯 *R*             : *{_fmt_r(total_r)}*\n"

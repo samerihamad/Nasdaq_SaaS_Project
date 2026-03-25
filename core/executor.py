@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from bot.notifier import send_telegram_message
 from bot.licensing import safe_decrypt
+from config import TP1_PCT, TP2_PCT, BE_LOCK_BUFFER_PCT
 from database.db_manager import is_maintenance_mode, get_subscriber_lang
 from core.risk_manager import (
     can_open_trade,
@@ -320,24 +321,27 @@ def _open_position_with_protection(base_url, headers, epic, action, size, stop_l
     Open one position with attached stop-loss and take-profit levels.
     Returns (ok: bool, payload_or_error: dict|str).
     """
-    payloads = [
-        {
-            "epic": epic,
-            "direction": action,
-            "size": size,
-            "orderType": "MARKET",
-            "forceOpen": True,
-            "stopLevel": stop_level,
-            "profitLevel": target_level,
-        },
-        {
-            "epic": epic,
-            "direction": action,
-            "size": size,
-            "stopLevel": stop_level,
-            "profitLevel": target_level,
-        },
-    ]
+    # If target_level is None, we omit profitLevel so the broker won't close
+    # the TP2 leg at a fixed price; trailing/SL management will decide later.
+    payloads = []
+    base = {
+        "epic": epic,
+        "direction": action,
+        "size": size,
+        "orderType": "MARKET",
+        "forceOpen": True,
+        "stopLevel": stop_level,
+    }
+    base2 = {
+        "epic": epic,
+        "direction": action,
+        "size": size,
+        "stopLevel": stop_level,
+    }
+    if target_level is not None:
+        base["profitLevel"] = target_level
+        base2["profitLevel"] = target_level
+    payloads = [base, base2]
     last_err = ""
     for payload in payloads:
         try:
@@ -711,23 +715,37 @@ def monitor_and_close(chat_id):
         entry_price = float(trade.get('entry_price') or current_price)
         base_stop = trade.get('trailing_stop')
 
-        # TP1 gate:
-        # Do NOT start trailing from the initial SL.
-        # Only after TP1 is reached, move SL to at least breakeven, then trail.
-        tp1_hit = False
-        tp1_price = None
-        if base_stop is not None:
-            stop_dist = abs(entry_price - float(base_stop))
-            if stop_dist > 0:
-                if direction == 'BUY':
-                    tp1_price = entry_price + stop_dist
-                    tp1_hit = current_price >= tp1_price
-                else:
-                    tp1_price = entry_price - stop_dist
-                    tp1_hit = current_price <= tp1_price
+        # Fixed TP milestones (entry-relative):
+        # - TP1  = entry +/- 1%
+        # - TP2  = entry +/- 1.5%
+        # Trailing starts only after TP2 is hit.
+        tp1_price = (
+            entry_price * (1 + TP1_PCT)
+            if direction == "BUY"
+            else entry_price * (1 - TP1_PCT)
+        )
+        tp2_price = (
+            entry_price * (1 + TP2_PCT)
+            if direction == "BUY"
+            else entry_price * (1 - TP2_PCT)
+        )
+        tp1_hit = (
+            current_price >= tp1_price
+            if direction == "BUY"
+            else current_price <= tp1_price
+        )
+        tp2_hit = (
+            current_price >= tp2_price
+            if direction == "BUY"
+            else current_price <= tp2_price
+        )
 
         if atr and atr > 0:
-            if tp1_hit:
+            # We only apply "lock after TP1" and "trailing after TP2"
+            # to the TP2 leg, because TP1 leg is closed by broker at TP1.
+            manage_leg = (leg_role or "").strip().upper() == "TP2"
+
+            if tp2_hit and manage_leg:
                 candidate = compute_stop_candidate(direction, current_price, atr)
                 prev_stop = float(base_stop if base_stop is not None else candidate)
                 breakeven = entry_price
@@ -743,7 +761,32 @@ def monitor_and_close(chat_id):
                     if not ok:
                         print(f"⚠️  Broker stop sync failed [{symbol} {deal_id}]: {info}")
                 stop_triggered = is_stop_hit(current_price, new_stop, direction)
-                stop_label = f"ATR trailing stop @ {new_stop:.4f} (TP1 passed)"
+                stop_label = f"ATR trailing stop @ {new_stop:.4f} (TP2 passed)"
+            elif tp1_hit and manage_leg:
+                # After TP1: lock TP2 leg beyond breakeven.
+                # This prevents the trade from reverting back to entry.
+                breakeven_lock = (
+                    entry_price * (1 + BE_LOCK_BUFFER_PCT)
+                    if direction == "BUY"
+                    else entry_price * (1 - BE_LOCK_BUFFER_PCT)
+                )
+                if base_stop is not None:
+                    # Ratchet in the profitable direction only.
+                    new_stop = (
+                        max(float(base_stop), breakeven_lock)
+                        if direction == "BUY"
+                        else min(float(base_stop), breakeven_lock)
+                    )
+                else:
+                    new_stop = breakeven_lock
+
+                if base_stop != new_stop:
+                    update_trade_stop(trade['trade_id'], new_stop)
+                    ok, info = _sync_stop_to_broker(base_url, headers, deal_id, new_stop)
+                    if not ok:
+                        print(f"⚠️  Broker stop sync failed [{symbol} {deal_id}]: {info}")
+                stop_triggered = is_stop_hit(current_price, new_stop, direction)
+                stop_label = f"SL locked @ {new_stop:.4f} (TP1 passed)"
             else:
                 # Before TP1: keep initial SL unchanged.
                 new_stop = float(base_stop) if base_stop is not None else None
@@ -751,7 +794,7 @@ def monitor_and_close(chat_id):
                     stop_triggered = is_stop_hit(current_price, new_stop, direction)
                     stop_label = (
                         f"Initial SL @ {new_stop:.4f} "
-                        f"(waiting TP1{f' {tp1_price:.4f}' if tp1_price else ''})"
+                        f"(waiting TP1 {tp1_price:.4f} / TP2 {tp2_price:.4f})"
                     )
                 else:
                     # Fallback only when SL is missing
@@ -759,10 +802,32 @@ def monitor_and_close(chat_id):
                     stop_label = f"وقف خسارة احتياطي (3%) @ UPL={upl:.2f}"
         else:
             # ATR unavailable: respect existing SL if present, else hard fallback.
-            new_stop = float(base_stop) if base_stop is not None else None
-            if new_stop is not None:
+            if base_stop is not None:
+                manage_leg = (leg_role or "").strip().upper() == "TP2"
+                new_stop = float(base_stop)
+                if manage_leg and tp1_hit:
+                    breakeven_lock = (
+                        entry_price * (1 + BE_LOCK_BUFFER_PCT)
+                        if direction == "BUY"
+                        else entry_price * (1 - BE_LOCK_BUFFER_PCT)
+                    )
+                    # Ratchet only in profitable direction.
+                    new_stop = (
+                        max(new_stop, breakeven_lock)
+                        if direction == "BUY"
+                        else min(new_stop, breakeven_lock)
+                    )
+                    if float(base_stop) != new_stop:
+                        update_trade_stop(trade['trade_id'], new_stop)
+                        ok, info = _sync_stop_to_broker(base_url, headers, deal_id, new_stop)
+                        if not ok:
+                            print(f"⚠️  Broker stop sync failed [{symbol} {deal_id}]: {info}")
+
                 stop_triggered = is_stop_hit(current_price, new_stop, direction)
-                stop_label = f"Initial SL @ {new_stop:.4f} (ATR unavailable)"
+                stop_label = (
+                    f"Initial SL @ {new_stop:.4f} "
+                    f"(ATR unavailable, tp1_hit={tp1_hit})"
+                )
             else:
                 stop_triggered = upl <= hard_stop_limit
                 stop_label = f"وقف خسارة احتياطي (3%) @ UPL={upl:.2f}"
@@ -885,7 +950,11 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
     # ── R:R ratio gate ────────────────────────────────────────────────────────
     if atr and entry_price > 0:
         # Compute stop price from stop_loss_pct (strategy-supplied) or ATR fallback
-        effective_sl_pct = stop_loss_pct if stop_loss_pct else (atr * 2.0 / entry_price)
+        effective_sl_pct = (
+            stop_loss_pct
+            if stop_loss_pct is not None
+            else (atr * 2.0 / entry_price)
+        )
         stop_price = (
             entry_price * (1 - effective_sl_pct) if action == 'BUY'
             else entry_price * (1 + effective_sl_pct)
@@ -905,7 +974,7 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             send_telegram_message(chat_id, msg)
             return msg
     else:
-        effective_sl_pct = stop_loss_pct or 0.01
+        effective_sl_pct = stop_loss_pct if stop_loss_pct is not None else 0.01
         rr_ratio = 0.0
         stop_price = (
             entry_price * (1 - effective_sl_pct) if action == 'BUY'
@@ -915,8 +984,11 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
     # ── Position size (1–2% risk, confidence-scaled) ──────────────────────────
     size = calculate_position_size(balance, confidence, entry_price, effective_sl_pct, chat_id)
     # Protection levels used BOTH for broker order and Telegram report.
-    # Use strategy stop when available, otherwise ATR fallback.
-    if atr and entry_price > 0:
+    # If the strategy provided stop_loss_pct, use it directly.
+    # Otherwise fall back to ATR candidate (legacy behavior).
+    if stop_loss_pct is not None:
+        initial_stop = stop_price
+    elif atr and entry_price > 0:
         initial_stop = compute_stop_candidate(action, entry_price, atr)
     else:
         initial_stop = stop_price
@@ -928,14 +1000,15 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
         send_telegram_message(chat_id, msg)
         return msg
 
+    # Fixed targets as % distance from entry (independent of ATR/stop_dist).
     if action == 'BUY':
-        target1 = entry_price + stop_dist * 1.00
-        target2 = entry_price + stop_dist * 1.33
+        target1 = entry_price * (1 + TP1_PCT)
+        target2 = entry_price * (1 + TP2_PCT)
         dir_ar   = 'شراء'
         sq_color = '🟩'
     else:
-        target1 = entry_price - stop_dist * 1.00
-        target2 = entry_price - stop_dist * 1.33
+        target1 = entry_price * (1 - TP1_PCT)
+        target2 = entry_price * (1 - TP2_PCT)
         dir_ar   = 'بيع'
         sq_color = '🟥'
 
@@ -964,7 +1037,9 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
         qty1 = max(min_deal_size, qty_total - qty2)
 
     qty_total = qty1 + qty2
-    legs = [(qty1, target1), (qty2, target2)]
+    # TP1 leg closes at TP1; TP2 leg has no fixed profitLevel and will be
+    # managed by trailing-stop after it reaches TP2 threshold.
+    legs = [(qty1, target1), (qty2, None)]
     auto_upsized = qty_total > float(size)
 
     opened_legs = []
@@ -1093,8 +1168,8 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             f"💵  Total Value  :  *{_fmt_money(total_amount)}*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🔴  Stop Loss    :  *{_fmt_money(stop_level)}*\n"
-            f"🎯  Target 1     :  *{_fmt_money(target1)}*  ({int(qty1)} shares — 1R)\n"
-            f"🏆  Target 2     :  *{_fmt_money(target2)}*  ({int(qty2)} shares — 1.33R)\n"
+            f"🎯  Target 1     :  *{_fmt_money(target1)}*  ({int(qty1)} shares — +{TP1_PCT * 100:.2f}%)\n"
+            f"🏆  Target 2     :  *{_fmt_money(target2)}*  ({int(qty2)} shares — +{TP2_PCT * 100:.2f}% triggers trailing)\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⚠️  Risk Amount  :  *{_fmt_money(risk_amount)}*\n"
             f"🕐  Time (ET)    :  {now_et_str}"
@@ -1113,8 +1188,8 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             f"💵  إجمالي المبلغ  :  *{_fmt_money(total_amount)}*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🔴  وقف الخسارة   :  *{_fmt_money(stop_level)}*\n"
-            f"🎯  الهدف 1        :  *{_fmt_money(target1)}*  ({int(qty1)} سهم — 1R)\n"
-            f"🏆  الهدف 2        :  *{_fmt_money(target2)}*  ({int(qty2)} سهم — 1.33R)\n"
+            f"🎯  الهدف 1        :  *{_fmt_money(target1)}*  ({int(qty1)} سهم — +{TP1_PCT * 100:.2f}%)\n"
+            f"🏆  الهدف 2        :  *{_fmt_money(target2)}*  ({int(qty2)} سهم — +{TP2_PCT * 100:.2f}% لتفعيل التريلينج)\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⚠️  المخاطرة       :  *{_fmt_money(risk_amount)}*\n"
             f"🕐  التوقيت (ET)   :  {now_et_str}"

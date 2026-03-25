@@ -170,7 +170,16 @@ def _dispatch_signal(signal: dict, subscribers: list[str]) -> int:
 
         # ── Place order ───────────────────────────────────────────────────────
         try:
-            result = place_trade_for_user(chat_id, symbol, action, confidence)
+            # Use the strategy-provided stop_loss_pct so TP/SL are derived
+            # from a controlled distance (not an unconstrained ATR fallback).
+            result = place_trade_for_user(
+                chat_id,
+                symbol,
+                action,
+                confidence,
+                stop_loss_pct=signal.get("stop_loss_pct"),
+                strategy_label=strategy,
+            )
             success = isinstance(result, str) and result.startswith("✅")
             log.info(
                 "[Dispatch %s] user=%s strategy=%s result: %s",
