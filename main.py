@@ -33,6 +33,7 @@ from utils.market_hours import get_market_status, minutes_to_open, STATUS_OPEN, 
 from utils.daily_report import send_daily_reports
 from core.executor import place_trade_for_user, monitor_and_close
 from core.watcher import run_watcher, get_all_active_subscribers, get_trading_subscribers
+from core.signal_engine import scan_watchlist_parallel
 from core.strategy_meanrev  import analyze as analyze_meanrev
 from core.strategy_momentum import analyze as analyze_momentum
 from core.risk_manager import get_risk_state, STATE_USER_DAY_HALT
@@ -411,8 +412,10 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
     No shared mutable state between users.
     """
     # ── AI Gatekeeper (evaluated once, applies to all users) ──────────────────
+    # Consistent decision model:
+    # - We rely on validate_signal(..., min_probability=...) to produce the boolean gate.
+    # - We allow a soft override only for Momentum/MeanRev when confidence is high.
     if timeframes:
-        ai_approved, ai_prob, regime = validate_signal(symbol, action, timeframes)
         strategy_key = (strategy_label or "RF").strip()
         ai_min_by_strategy = {
             "RF": AI_MIN_PROB_RF,
@@ -420,20 +423,19 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
             "MeanRev": AI_MIN_PROB_MEANREV,
         }
         ai_min_prob = ai_min_by_strategy.get(strategy_key, AI_MIN_PROB_RF)
-
-        # Soft-gate logic:
-        # 1) Normal pass: AI probability meets per-strategy threshold.
-        # 2) Soft override: very strong technical confidence can pass despite a
-        #    lower AI probability, but never in VOLATILE regime.
-        ai_pass_by_threshold = ai_prob >= ai_min_prob
-        ai_pass_by_override = (
-            confidence >= AI_SOFT_OVERRIDE_CONFIDENCE
-            and ai_prob >= AI_SOFT_OVERRIDE_MIN_PROB
-            and regime != "VOLATILE"
-            and strategy_key in ("Momentum", "MeanRev")
+        ai_approved, ai_prob, regime = validate_signal(
+            symbol, action, timeframes, min_probability=ai_min_prob
         )
 
-        if not (ai_pass_by_threshold or ai_pass_by_override):
+        ai_override = (
+            (not ai_approved)
+            and confidence >= AI_SOFT_OVERRIDE_CONFIDENCE
+            and ai_prob >= AI_SOFT_OVERRIDE_MIN_PROB
+            and strategy_key in ("Momentum", "MeanRev")
+            and regime != "VOLATILE"
+        )
+
+        if not (ai_approved or ai_override):
             print(
                 f"   [AI BLOCK] {symbol} {action} — "
                 f"probability {ai_prob:.1f}% < min({strategy_key})={ai_min_prob:.1f}% "
@@ -441,7 +443,7 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
             )
             return
 
-        if ai_pass_by_override and not ai_pass_by_threshold:
+        if ai_override:
             print(
                 f"   [AI OVERRIDE] {symbol} {action} — "
                 f"probability={ai_prob:.1f}% < min({strategy_key})={ai_min_prob:.1f}% "
@@ -657,65 +659,25 @@ def run_trading_bot():
 
             print(f"\n[SCAN] {len(_watchlist)} symbols | {len(get_trading_subscribers())} trading / {len(get_all_active_subscribers())} total subscribers")
 
-            for symbol in _watchlist:
-                try:
-                    timeframes = scan_multi_timeframe(symbol)
-                    if timeframes is None:
-                        continue
+            # Parallel scan: eliminate per-symbol sleeps and IO bottlenecks.
+            # Returns best-per-symbol signals with timeframes attached (no execution).
+            signals = scan_watchlist_parallel(
+                _watchlist,
+                min_confidence=MIN_CONFIDENCE,
+                max_workers=8,
+            )
 
-                    # Collect all signals that pass their own thresholds.
-                    # Each entry: (action, confidence, strategy_label, reason)
-                    candidates = []
-
-                    # 1. RF multi-timeframe model (existing)
-                    action, confidence, reason = analyze_multi_timeframe(
-                        timeframes, symbol=symbol
-                    )
-                    if action and confidence >= MIN_CONFIDENCE:
-                        candidates.append((action, confidence, "RF", reason))
-
-                    # 2. Mean Reversion strategy
-                    mr_sig = analyze_meanrev(symbol, timeframes)
-                    if mr_sig and mr_sig["confidence"] >= MIN_CONFIDENCE:
-                        candidates.append((
-                            mr_sig["action"],
-                            mr_sig["confidence"],
-                            "MeanRev",
-                            mr_sig["reason"],
-                        ))
-
-                    # 3. Momentum strategy
-                    mo_sig = analyze_momentum(symbol, timeframes)
-                    if mo_sig and mo_sig["confidence"] >= MIN_CONFIDENCE:
-                        candidates.append((
-                            mo_sig["action"],
-                            mo_sig["confidence"],
-                            "Momentum",
-                            mo_sig["reason"],
-                        ))
-
-                    if not candidates:
-                        best_conf = max(
-                            [confidence or 0,
-                             (mr_sig or {}).get("confidence", 0),
-                             (mo_sig or {}).get("confidence", 0)],
-                        )
-                        print(f"   [{symbol}] No signal ({best_conf:.0f}%)")
-                        time.sleep(1)
-                        continue
-
-                    # Pick the single highest-confidence signal to avoid
-                    # double-entering the same symbol on the same cycle.
-                    # Candidates: (action, confidence, label, reason, stop_loss_pct)
-                    best = max(candidates, key=lambda x: x[1])
-                    best_action, best_conf, best_label, best_reason = best
-
-                    # Retrieve stop_loss_pct from strategy signals
-                    best_sl_pct = None
-                    if best_label == "MeanRev" and mr_sig:
-                        best_sl_pct = mr_sig.get("stop_loss_pct")
-                    elif best_label == "Momentum" and mo_sig:
-                        best_sl_pct = mo_sig.get("stop_loss_pct")
+            if not signals:
+                print("   [SCAN] No signals found this cycle.")
+            else:
+                for sig in sorted(signals, key=lambda r: float(r.get("confidence", 0)), reverse=True):
+                    symbol = sig["symbol"]
+                    best_action = sig["action"]
+                    best_conf = float(sig["confidence"])
+                    best_label = sig["strategy_label"]
+                    best_reason = sig.get("reason", "")
+                    best_sl_pct = sig.get("stop_loss_pct")
+                    timeframes = sig.get("timeframes")
 
                     print(
                         f"   [{symbol}] {best_action} | "
@@ -727,12 +689,6 @@ def run_trading_bot():
                         timeframes=timeframes, stop_loss_pct=best_sl_pct,
                         strategy_label=best_label,
                     )
-
-                    time.sleep(1)
-
-                except Exception as e:
-                    print(f"❌ خطأ في {symbol}: {e}")
-                    traceback.print_exc()
 
         except Exception as e:
             print(f"❌ خطأ في المحرك الرئيسي: {e}")

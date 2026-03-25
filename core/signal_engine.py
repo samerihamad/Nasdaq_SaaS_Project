@@ -18,6 +18,7 @@ import logging
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
+from typing import Any
 
 from config import (
     WATCHLIST,
@@ -30,6 +31,7 @@ from core.strategy_momentum import analyze as analyze_momentum
 from core.risk_manager      import can_open_trade
 from core.executor          import place_trade_for_user
 from utils.market_scanner   import scan_multi_timeframe
+from utils.ai_model         import analyze_multi_timeframe
 
 DB_PATH = "database/trading_saas.db"
 
@@ -241,3 +243,101 @@ def run_scan() -> list[dict]:
         len(triggered), len(WATCHLIST),
     )
     return triggered
+
+
+# ── Parallel scanner (no execution) ───────────────────────────────────────────
+
+def scan_watchlist_parallel(
+    watchlist: list[str],
+    *,
+    min_confidence: float = MIN_CONFIDENCE,
+    max_workers: int = 8,
+) -> list[dict[str, Any]]:
+    """
+    High-throughput scanner for main.py.
+
+    - Fetches multi-timeframe data once per symbol.
+    - Runs RF + MeanRev + Momentum to build candidates.
+    - Returns best-per-symbol signals (does NOT execute, does NOT apply tiers/risk).
+
+    Output rows contain:
+      symbol, action, confidence, strategy_label, reason, stop_loss_pct, timeframes
+    """
+
+    def _analyze_one(symbol: str) -> dict[str, Any] | None:
+        timeframes = scan_multi_timeframe(symbol)
+        if not timeframes:
+            return None
+
+        candidates: list[tuple[str, float, str, str, float | None]] = []
+
+        # 1) RF multi-timeframe
+        try:
+            action, conf, reason = analyze_multi_timeframe(timeframes, symbol=symbol)
+            if action and conf >= float(min_confidence):
+                candidates.append((action, float(conf), "RF", str(reason), None))
+        except Exception:
+            pass
+
+        # 2) Mean Reversion
+        try:
+            mr = analyze_meanrev(symbol, timeframes)
+            if mr and float(mr.get("confidence", 0)) >= float(min_confidence):
+                candidates.append((
+                    str(mr["action"]),
+                    float(mr["confidence"]),
+                    "MeanRev",
+                    str(mr.get("reason", "")),
+                    mr.get("stop_loss_pct"),
+                ))
+        except Exception:
+            pass
+
+        # 3) Momentum
+        try:
+            mo = analyze_momentum(symbol, timeframes)
+            if mo and float(mo.get("confidence", 0)) >= float(min_confidence):
+                candidates.append((
+                    str(mo["action"]),
+                    float(mo["confidence"]),
+                    "Momentum",
+                    str(mo.get("reason", "")),
+                    mo.get("stop_loss_pct"),
+                ))
+        except Exception:
+            pass
+
+        if not candidates:
+            return None
+
+        best_action, best_conf, best_label, best_reason, best_sl_pct = max(
+            candidates, key=lambda x: x[1]
+        )
+
+        return {
+            "symbol": symbol,
+            "action": best_action,
+            "confidence": best_conf,
+            "strategy_label": best_label,
+            "reason": best_reason,
+            "stop_loss_pct": best_sl_pct,
+            "timeframes": timeframes,
+        }
+
+    wl = [str(s).strip().upper() for s in (watchlist or []) if str(s).strip()]
+    if not wl:
+        return []
+
+    # IO-bound: yfinance; keep a conservative default worker count.
+    workers = max(1, min(int(max_workers), len(wl)))
+    results: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_analyze_one, sym): sym for sym in wl}
+        for fut in as_completed(futures):
+            try:
+                row = fut.result()
+                if row:
+                    results.append(row)
+            except Exception:
+                continue
+    return results

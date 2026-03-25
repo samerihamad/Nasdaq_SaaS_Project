@@ -42,6 +42,7 @@ TRAIN_RETRY_HOURS     = 6          # avoid retry spam for symbols with short his
 
 os.makedirs(MODEL_DIR, exist_ok=True)
 _train_retry_after: dict[str, datetime] = {}
+_model_cache: dict[str, tuple[Any, Any, int]] = {}  # symbol -> (model, scaler, version)
 
 # Label parameters
 FUTURE_BARS      = 5       # look-ahead bars for labeling
@@ -241,18 +242,32 @@ def train_model(symbol: str):
 
 
 def load_or_train_model(symbol: str):
-    """Load a cached model or train a new one if not found or version mismatch."""
+    """Load a cached model or train a new one if not found or version mismatch.
+
+    Uses an in-memory cache to avoid repeated disk IO during scan loops.
+    """
+    sym = str(symbol or "").strip().upper()
+    if sym and sym in _model_cache:
+        m, s, v = _model_cache[sym]
+        if v == MODEL_VERSION:
+            return m, s
     path = _model_path(symbol)
     if os.path.exists(path):
         try:
             with open(path, 'rb') as f:
                 saved = pickle.load(f)
             if saved.get('version') == MODEL_VERSION:
-                return saved['model'], saved['scaler']
+                model, scaler = saved['model'], saved['scaler']
+                if sym:
+                    _model_cache[sym] = (model, scaler, MODEL_VERSION)
+                return model, scaler
             log.info("Model version mismatch for %s — retraining", symbol)
         except Exception as exc:
             log.warning("Failed to load model for %s: %s — retraining", symbol, exc)
-    return train_model(symbol)
+    model, scaler = train_model(symbol)
+    if sym and model and scaler:
+        _model_cache[sym] = (model, scaler, MODEL_VERSION)
+    return model, scaler
 
 
 # ── Regime detection ──────────────────────────────────────────────────────────
@@ -305,7 +320,13 @@ def detect_regime(df: pd.DataFrame) -> dict:
 
 # ── Core gatekeeper ───────────────────────────────────────────────────────────
 
-def validate_signal(symbol: str, direction: str, timeframes: dict) -> tuple:
+def validate_signal(
+    symbol: str,
+    direction: str,
+    timeframes: dict,
+    *,
+    min_probability: float | None = None,
+) -> tuple:
     """
     AI Gatekeeper — the single mandatory checkpoint before every trade.
 
@@ -360,7 +381,8 @@ def validate_signal(symbol: str, direction: str, timeframes: dict) -> tuple:
             symbol, probability,
         )
 
-    approved = probability >= AI_PROBABILITY_THRESHOLD
+    min_prob = AI_PROBABILITY_THRESHOLD if min_probability is None else float(min_probability)
+    approved = probability >= min_prob
 
     log.info(
         "[AI Gate %s] direction=%s | probability=%.1f%% | regime=%s | %s",
