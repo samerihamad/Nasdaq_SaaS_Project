@@ -423,6 +423,111 @@ def _format_manage_trade_card(card: dict, lang: str) -> str:
     )
 
 
+def _fetch_live_positions(base_url: str, headers: dict) -> list[dict]:
+    """Fetch live broker positions. Returns [] on failure."""
+    try:
+        res = requests.get(f"{base_url}/positions", headers=headers, timeout=15)
+        if res.status_code != 200:
+            return []
+        payload = res.json() if res.content else {}
+        return (payload or {}).get("positions", []) or []
+    except Exception:
+        return []
+
+
+def _cards_from_live_positions(chat_id: str, positions: list[dict]) -> list[dict]:
+    """
+    Build manage-trade cards from broker positions, enriched by DB (symbol + parent_session).
+    Cards are grouped by parent_session when available; otherwise single by deal_id.
+    """
+    # Map deal_id -> (trade_id, symbol, parent_session, trailing_stop)
+    deal_ids = []
+    for p in positions:
+        try:
+            did = str(p.get("position", {}).get("dealId") or "")
+        except Exception:
+            did = ""
+        if did:
+            deal_ids.append(did)
+
+    db_map: dict[str, dict] = {}
+    if deal_ids:
+        conn = _db()
+        c = conn.cursor()
+        q = (
+            "SELECT trade_id, symbol, deal_id, COALESCE(parent_session,''), trailing_stop "
+            "FROM trades WHERE chat_id=? AND status='OPEN' AND deal_id IN ({})"
+        ).format(",".join(["?"] * len(deal_ids)))
+        c.execute(q, (str(chat_id), *deal_ids))
+        for trade_id, symbol, deal_id, parent_session, trailing_stop in c.fetchall():
+            db_map[str(deal_id)] = {
+                "trade_id": int(trade_id),
+                "symbol": symbol,
+                "parent_session": (parent_session or "").strip(),
+                "trailing_stop": float(trailing_stop) if trailing_stop is not None else None,
+            }
+        conn.close()
+
+    # Group positions by parent_session when possible
+    groups: dict[str, list[dict]] = {}
+    for p in positions:
+        pos = p.get("position") or {}
+        mkt = p.get("market") or {}
+        deal_id = str(pos.get("dealId") or "")
+        if not deal_id:
+            continue
+
+        direction = str(pos.get("direction") or "")
+        entry = float(pos.get("level") or 0.0)
+        size = float(pos.get("size") or 0.0)
+        stop_level = pos.get("stopLevel")
+        stop = float(stop_level) if stop_level is not None else None
+
+        meta = db_map.get(deal_id) or {}
+        symbol = meta.get("symbol") or mkt.get("instrumentName") or mkt.get("epic") or "UNKNOWN"
+        trade_id = int(meta.get("trade_id") or 0)
+        parent_session = str(meta.get("parent_session") or "").strip()
+        if stop is None:
+            stop = meta.get("trailing_stop")
+
+        key = parent_session if parent_session else f"deal:{deal_id}"
+        groups.setdefault(key, []).append({
+            "deal_id": deal_id,
+            "trade_id": trade_id,
+            "symbol": symbol,
+            "direction": direction,
+            "entry_price": entry,
+            "qty": size,
+            "stop": stop,
+        })
+
+    cards: list[dict] = []
+    for key, legs in groups.items():
+        legs = sorted(legs, key=lambda x: int(x.get("trade_id") or 0))
+        first = legs[0]
+        direction = first["direction"]
+        entry = float(first["entry_price"] or 0)
+        qty_total = float(sum(l.get("qty", 0) for l in legs))
+        stops = [l.get("stop") for l in legs if isinstance(l.get("stop"), (int, float))]
+        stop = None
+        if stops:
+            stop = min(stops) if direction == "BUY" else max(stops)
+        trade_id = min([int(l.get("trade_id") or 0) for l in legs if int(l.get("trade_id") or 0) > 0] or [0])
+        cards.append({
+            "key": key,
+            "trade_id": trade_id,
+            "symbol": first["symbol"],
+            "direction": direction,
+            "entry_price": entry,
+            "qty": qty_total,
+            "stop": stop,
+            "deal_ids": [l["deal_id"] for l in legs],
+        })
+
+    # Sort stable by trade_id (fallback to symbol)
+    return sorted(cards, key=lambda c: (int(c.get("trade_id") or 0), str(c.get("symbol") or "")))
+
+
 def _back_keyboard(lang: str):
     return InlineKeyboardMarkup([[
         InlineKeyboardButton(t('btn_back', lang), callback_data='main_menu')
@@ -1260,8 +1365,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == 'manage_show_open':
-        rows = _fetch_open_trades(chat_id)
-        cards = _group_open_trades(rows)
+        # Source of truth: broker live positions.
+        # Step 1: reconcile so stale DB "OPEN" rows are closed if broker has none.
+        creds = get_user_credentials(chat_id)
+        if not creds:
+            await query.edit_message_text(
+                t('balance_error', lang),
+                reply_markup=_back_keyboard(lang),
+                parse_mode='Markdown',
+            )
+            return
+        base_url, headers = get_session(creds)
+        if not headers:
+            await query.edit_message_text(
+                t('balance_error', lang),
+                reply_markup=_back_keyboard(lang),
+                parse_mode='Markdown',
+            )
+            return
+        try:
+            reconcile(chat_id, base_url, headers)
+        except Exception:
+            pass
+
+        positions = _fetch_live_positions(base_url, headers)
+        cards = _cards_from_live_positions(chat_id, positions)
         if not cards:
             await query.edit_message_text(
                 t('manage_no_open_trades', lang),
@@ -1336,15 +1464,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == 'manage_close_all_yes':
-        rows = _fetch_open_trades(chat_id)
-        if not rows:
-            await query.edit_message_text(
-                t('manage_no_open_trades', lang),
-                reply_markup=_back_keyboard(lang),
-                parse_mode='Markdown',
-            )
-            return
-
+        # Close ALL broker live positions (source of truth), then persist to DB.
         creds = get_user_credentials(chat_id)
         if not creds:
             await query.edit_message_text(
@@ -1362,27 +1482,30 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        positions = _fetch_live_positions(base_url, headers)
+        if not positions:
+            await query.edit_message_text(
+                t('manage_no_open_trades', lang),
+                reply_markup=_back_keyboard(lang),
+                parse_mode='Markdown',
+            )
+            return
+
         upl_by_id: dict[str, float] = {}
-        try:
-            res = requests.get(f"{base_url}/positions", headers=headers, timeout=15)
-            if res.status_code == 200:
-                for p in (res.json() or {}).get('positions', []) or []:
-                    did = str(p.get('position', {}).get('dealId') or '')
-                    if not did:
-                        continue
-                    try:
-                        upl_by_id[did] = float(p.get('position', {}).get('upl') or 0.0)
-                    except Exception:
-                        upl_by_id[did] = 0.0
-        except Exception:
-            pass
+        for p in positions:
+            did = str((p.get("position") or {}).get("dealId") or "")
+            if not did:
+                continue
+            try:
+                upl_by_id[did] = float((p.get("position") or {}).get("upl") or 0.0)
+            except Exception:
+                upl_by_id[did] = 0.0
 
         closed = 0
         failed = 0
-        for r in rows:
-            deal_id = str(r.get("deal_id") or "")
+        for p in positions:
+            deal_id = str((p.get("position") or {}).get("dealId") or "")
             if not deal_id:
-                failed += 1
                 continue
             try:
                 del_res = requests.delete(f"{base_url}/positions/{deal_id}", headers=headers, timeout=20)
@@ -1390,8 +1513,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     failed += 1
                     continue
                 upl = float(upl_by_id.get(deal_id, 0.0))
-                close_trade_in_db(int(r["trade_id"]), upl)
-                after_trade_leg_closed(chat_id, r.get("parent_session"), upl)
+                # Close local DB rows that match this deal_id (if present).
+                conn = _db()
+                c = conn.cursor()
+                c.execute(
+                    "SELECT trade_id, COALESCE(parent_session,'') FROM trades "
+                    "WHERE chat_id=? AND deal_id=? AND status='OPEN'",
+                    (chat_id, deal_id),
+                )
+                rows = c.fetchall()
+                conn.close()
+                for trade_id, ps in rows:
+                    close_trade_in_db(int(trade_id), upl)
+                    after_trade_leg_closed(chat_id, (ps or "").strip(), upl)
                 closed += 1
             except Exception:
                 failed += 1
@@ -1403,6 +1537,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == 'manage_view_trade':
+        # Ensure this doesn't collide with the report date input flow.
+        context.user_data.pop('report_state', None)
         context.user_data['manage_trade_state'] = 'AWAIT_TRADE_ID'
         await query.edit_message_text(
             t('manage_trade_prompt_id', lang),
@@ -1810,6 +1946,72 @@ async def report_input_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         except ValueError:
             return False
 
+    # ── Manage trades: view specific trade by id ────────────────────────────
+    # Handle this FIRST to avoid collisions with report date flows.
+    if mstate == 'AWAIT_TRADE_ID':
+        context.user_data.pop('manage_trade_state', None)
+        # Also clear report state if it was left dangling.
+        context.user_data.pop('report_state', None)
+        m = re.search(r"\d+", text)
+        if not m:
+            await update.message.reply_text(t('manage_trade_not_found', lang), parse_mode='Markdown')
+            return
+        tid = int(m.group(0))
+
+        conn = _db()
+        c = conn.cursor()
+        c.execute(
+            "SELECT trade_id, symbol, direction, entry_price, size, trailing_stop, "
+            "COALESCE(parent_session,'') "
+            "FROM trades WHERE chat_id=? AND trade_id=?",
+            (chat_id, tid),
+        )
+        row = c.fetchone()
+        if not row:
+            conn.close()
+            await update.message.reply_text(t('manage_trade_not_found', lang), parse_mode='Markdown')
+            return
+        parent_session = (row[6] or "").strip()
+        if parent_session:
+            c.execute(
+                "SELECT trade_id, symbol, direction, entry_price, size, trailing_stop, parent_session "
+                "FROM trades WHERE chat_id=? AND parent_session=? AND status='OPEN' ORDER BY trade_id ASC",
+                (chat_id, parent_session),
+            )
+            legs = c.fetchall() or []
+        else:
+            legs = []
+        conn.close()
+
+        if legs:
+            rows = []
+            for lr in legs:
+                rows.append({
+                    "trade_id": int(lr[0]),
+                    "symbol": lr[1],
+                    "direction": lr[2],
+                    "entry_price": float(lr[3] or 0),
+                    "qty": float(lr[4] or 0),
+                    "stop": float(lr[5]) if lr[5] is not None else None,
+                    "parent_session": (lr[6] or "").strip(),
+                })
+            card = _group_open_trades(rows)[0]
+        else:
+            card = {
+                "trade_id": int(row[0]),
+                "symbol": row[1],
+                "direction": row[2],
+                "entry_price": float(row[3] or 0),
+                "qty": float(row[4] or 0),
+                "stop": float(row[5]) if row[5] is not None else None,
+            }
+        await update.message.reply_text(
+            _format_manage_trade_card(card, lang),
+            reply_markup=_back_keyboard(lang),
+            parse_mode='Markdown',
+        )
+        return
+
     # ── Waiting for date of daily report ────────────────────────────────────
     if state == 'AWAIT_DAILY_DATE':
         if not _valid_date(text):
@@ -1929,69 +2131,6 @@ async def report_input_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             parse_mode='Markdown',
         )
 
-    # ── Manage trades: view specific trade by id ────────────────────────────
-    elif mstate == 'AWAIT_TRADE_ID':
-        context.user_data.pop('manage_trade_state', None)
-        m = re.search(r"\d+", text)
-        if not m:
-            await update.message.reply_text(t('manage_trade_not_found', lang), parse_mode='Markdown')
-            return
-        tid = int(m.group(0))
-
-        conn = _db()
-        c = conn.cursor()
-        c.execute(
-            "SELECT trade_id, symbol, direction, entry_price, size, trailing_stop, "
-            "COALESCE(parent_session,'') "
-            "FROM trades WHERE chat_id=? AND trade_id=?",
-            (chat_id, tid),
-        )
-        row = c.fetchone()
-        if not row:
-            conn.close()
-            await update.message.reply_text(t('manage_trade_not_found', lang), parse_mode='Markdown')
-            return
-        parent_session = (row[6] or "").strip()
-        if parent_session:
-            # If this is a leg in a session, show aggregated OPEN legs if present,
-            # else show the single row.
-            c.execute(
-                "SELECT trade_id, symbol, direction, entry_price, size, trailing_stop, parent_session "
-                "FROM trades WHERE chat_id=? AND parent_session=? AND status='OPEN' ORDER BY trade_id ASC",
-                (chat_id, parent_session),
-            )
-            legs = c.fetchall() or []
-        else:
-            legs = []
-        conn.close()
-
-        if legs:
-            rows = []
-            for lr in legs:
-                rows.append({
-                    "trade_id": int(lr[0]),
-                    "symbol": lr[1],
-                    "direction": lr[2],
-                    "entry_price": float(lr[3] or 0),
-                    "size": float(lr[4] or 0),
-                    "trailing_stop": float(lr[5]) if lr[5] is not None else None,
-                    "parent_session": (lr[6] or "").strip(),
-                })
-            card = _group_open_trades(rows)[0]
-        else:
-            card = {
-                "trade_id": int(row[0]),
-                "symbol": row[1],
-                "direction": row[2],
-                "entry_price": float(row[3] or 0),
-                "qty": float(row[4] or 0),
-                "stop": float(row[5]) if row[5] is not None else None,
-            }
-        await update.message.reply_text(
-            _format_manage_trade_card(card, lang),
-            reply_markup=_back_keyboard(lang),
-            parse_mode='Markdown',
-        )
 
 
 # ── Circuit Breaker commands ───────────────────────────────────────────────────
