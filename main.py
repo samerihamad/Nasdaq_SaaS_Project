@@ -427,12 +427,12 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
             symbol, action, timeframes, min_probability=ai_min_prob
         )
 
+        # Soft override (Momentum/MeanRev): no VOLATILE block — see config AI_SOFT_OVERRIDE_*
         ai_override = (
             (not ai_approved)
             and confidence >= AI_SOFT_OVERRIDE_CONFIDENCE
             and ai_prob >= AI_SOFT_OVERRIDE_MIN_PROB
             and strategy_key in ("Momentum", "MeanRev")
-            and regime != "VOLATILE"
         )
 
         # ── AI DEBUG (CRITICAL) ───────────────────────────────────────────────

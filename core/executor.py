@@ -480,7 +480,13 @@ def _epic_last_token(ep: str) -> str:
 
 
 def _find_open_deal_by_epic_size(
-    base_url, headers, epic: str, direction: str, leg_size: float
+    base_url,
+    headers,
+    epic: str,
+    direction: str,
+    leg_size: float,
+    *,
+    exclude_deal_ids: set[str] | None = None,
 ) -> str | None:
     """
     Last-resort: match one open row by epic + direction + size (Capital list lag).
@@ -493,6 +499,7 @@ def _find_open_deal_by_epic_size(
         if res.status_code != 200:
             return None
         want_tok = _epic_last_token(epic)
+        ex = {str(d).strip() for d in (exclude_deal_ids or set()) if str(d).strip()}
         matches: list[str] = []
         for p in res.json().get("positions", []):
             m = p.get("market") or {}
@@ -514,6 +521,8 @@ def _find_open_deal_by_epic_size(
                 continue
             did = _deal_id_from_position_row(p)
             if did:
+                if did in ex:
+                    continue
                 matches.append(did)
         if len(matches) == 1:
             return matches[0]
@@ -531,6 +540,7 @@ def _confirm_deal_and_visibility(
     order_epic: str | None = None,
     direction: str | None = None,
     leg_size: float | None = None,
+    exclude_deal_ids: set[str] | None = None,
 ):
     """
     Resolve a real dealId (via /confirms when needed) and ensure the position
@@ -613,7 +623,12 @@ def _confirm_deal_and_visibility(
     # Epic + direction + size (single match) when list/API lags after a 200 POST.
     if order_epic and direction and leg_size is not None:
         alt = _find_open_deal_by_epic_size(
-            base_url, headers, order_epic, direction, float(leg_size)
+            base_url,
+            headers,
+            order_epic,
+            direction,
+            float(leg_size),
+            exclude_deal_ids=exclude_deal_ids,
         )
         if alt:
             if deal_id and str(deal_id) != str(alt):
@@ -1184,6 +1199,7 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             order_epic=order_epic,
             direction=action,
             leg_size=float(leg_size),
+            exclude_deal_ids={str(d).strip() for (_, _, d) in opened_legs if str(d).strip()},
         )
         if not ok_deal or not deal_id:
             if not opened_legs:

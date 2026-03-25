@@ -129,18 +129,15 @@ PREMARKET_ALERT_WINDOW_MIN = 30
 #
 # Per-strategy minimum AI probability thresholds (%).
 # These apply in dispatch_signal() as an execution gate after strategy confidence.
-AI_MIN_PROB_RF = 55.0
-AI_MIN_PROB_MOMENTUM = 45.0
-AI_MIN_PROB_MEANREV = 45.0
+AI_MIN_PROB_RF = 50.0
+AI_MIN_PROB_MOMENTUM = 40.0
+AI_MIN_PROB_MEANREV = 40.0
 
 # Soft override:
-# Allow high-confidence strategy signals to pass even if AI probability is below
-# the per-strategy threshold, as long as market regime is not VOLATILE.
-# Soft override gate:
-# lower confidence threshold to allow more executions when AI probability is low
-# but technical confidence is still strong (unless regime is VOLATILE).
-AI_SOFT_OVERRIDE_CONFIDENCE = 60.0
-AI_SOFT_OVERRIDE_MIN_PROB = 20.0
+# Allow high-confidence Momentum/MeanRev signals to pass even if AI probability
+# is below the per-strategy threshold (applies in all regimes including VOLATILE).
+AI_SOFT_OVERRIDE_CONFIDENCE = 55.0
+AI_SOFT_OVERRIDE_MIN_PROB = 10.0
 
 # Refresh watchlist while market is open (seconds)
 WATCHLIST_REFRESH_SECONDS = 3600
