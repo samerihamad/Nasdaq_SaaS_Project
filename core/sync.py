@@ -30,7 +30,7 @@ from database.db_manager import is_maintenance_mode
 DB_PATH = 'database/trading_saas.db'
 
 
-def reconcile(chat_id, base_url, headers):
+def reconcile(chat_id, base_url, headers, *, notify: bool = True):
     """
     Sync local DB with live Capital.com /positions.
     Should be called once per monitoring cycle before any stop checks.
@@ -117,7 +117,10 @@ def reconcile(chat_id, base_url, headers):
             # One risk outcome per session (not per leg) for TP1+TP2 splits.
             after_trade_leg_closed(chat_id, ps, pnl_f)
 
-            if is_maintenance_mode():
+            # During maintenance, we never send Telegram messages from reconcile.
+            # Also allow callers (e.g., dashboard UI) to run reconcile silently
+            # to clean up stale DB rows without spamming the user.
+            if is_maintenance_mode() or not notify:
                 continue
 
             ep = float(entry_price or 0)

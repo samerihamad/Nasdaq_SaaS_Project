@@ -1384,7 +1384,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         try:
-            reconcile(chat_id, base_url, headers)
+            reconcile(chat_id, base_url, headers, notify=False)
         except Exception:
             pass
 
