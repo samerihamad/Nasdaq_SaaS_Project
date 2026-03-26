@@ -47,7 +47,7 @@ from core.executor import get_user_credentials, get_session
 from core.sync import reconcile, backfill_closed_pnls
 from core.trailing_stop import close_trade_in_db
 from core.trade_session_finalize import after_trade_leg_closed
-from bot.admin import admin_handler
+from bot.admin import admin_handler, limits_handler
 from database.db_manager import (
     create_db, get_bank_details, get_user_tier,
     get_trading_enabled, set_trading_enabled,
@@ -2246,6 +2246,8 @@ async def _post_init(app):
         BotCommand('start',      'Main dashboard / onboarding'),
         BotCommand('override',   'Manual override after Circuit Breaker'),
         BotCommand('stop_today', 'Block trading for the rest of today (stops engine)'),
+        BotCommand('limits',     'Admin: active pending limit orders'),
+        BotCommand('orders',     'Admin alias for /limits'),
     ])
 
 
@@ -2295,6 +2297,8 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler('override',   override_handler))
     app.add_handler(CommandHandler('stop_today', stop_today_handler))
     app.add_handler(CommandHandler('admin',      admin_handler))
+    app.add_handler(CommandHandler('limits',     limits_handler))
+    app.add_handler(CommandHandler('orders',     limits_handler))
 
     print("NATB Dashboard Bot running...")
     app.run_polling()

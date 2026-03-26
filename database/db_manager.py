@@ -152,6 +152,26 @@ def create_db():
             details    TEXT)'''
     )
 
+    # ── Pending limit orders (Sprint 2) ─────────────────────────────────────
+    c.execute(
+        '''CREATE TABLE IF NOT EXISTS pending_limit_orders
+           (id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at     TEXT,
+            expires_at     TEXT,
+            chat_id        TEXT,
+            symbol         TEXT,
+            action         TEXT,
+            strategy_label TEXT,
+            confidence     REAL,
+            stop_loss_pct  REAL,
+            limit_price    REAL,
+            status         TEXT DEFAULT 'PENDING',
+            reason         TEXT,
+            last_error     TEXT,
+            triggered_at   TEXT,
+            cancelled_at   TEXT)'''
+    )
+
     # ── Global system settings (key-value store) ──────────────────────────────
     c.execute('''CREATE TABLE IF NOT EXISTS system_settings
                  (key   TEXT PRIMARY KEY,

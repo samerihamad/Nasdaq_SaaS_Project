@@ -31,7 +31,7 @@ from utils.ai_model import (
 )
 from utils.market_hours import get_market_status, minutes_to_open, STATUS_OPEN, STATUS_CLOSED
 from utils.daily_report import send_daily_reports
-from core.executor import place_trade_for_user, monitor_and_close
+from core.executor import place_trade_for_user, monitor_and_close, process_pending_limit_orders
 from core.watcher import run_watcher, get_all_active_subscribers, get_trading_subscribers
 from core.signal_engine import scan_watchlist_parallel
 from core.strategy_meanrev  import analyze as analyze_meanrev
@@ -195,6 +195,11 @@ def _hybrid_approval_loop():
                                 "UPDATE pending_signals SET status='EXECUTED' WHERE signal_id=?",
                                 (signal_id,),
                             )
+                        elif isinstance(result, str) and result.startswith("🧾 Limit placed"):
+                            cx.execute(
+                                "UPDATE pending_signals SET status='EXECUTED' WHERE signal_id=?",
+                                (signal_id,),
+                            )
                         elif isinstance(result, str) and result.startswith("⏭️"):
                             cx.execute(
                                 "UPDATE pending_signals SET status='SKIPPED' WHERE signal_id=?",
@@ -238,11 +243,24 @@ def _hybrid_approval_loop():
         time.sleep(5)
 
 
+def _limit_order_worker_loop():
+    """Daemon worker: tracks pending limits and handles TTL cancels."""
+    while True:
+        try:
+            n = process_pending_limit_orders()
+            if n:
+                print(f"[LIMIT WORKER] processed={n}")
+        except Exception as exc:
+            print(f"[LIMIT WORKER] Error: {exc}")
+        time.sleep(5)
+
+
 def _start_background_threads():
     for target, name in [
         (_heartbeat_loop,       "heartbeat"),
         (_backup_loop,          "backup"),
         (_hybrid_approval_loop, "hybrid-approvals"),
+        (_limit_order_worker_loop, "limit-orders"),
     ]:
         t = threading.Thread(target=target, name=name, daemon=True)
         t.start()

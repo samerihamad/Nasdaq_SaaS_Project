@@ -21,6 +21,7 @@ Commands:
 
 import os
 import sqlite3
+from datetime import datetime, timezone
 from telegram import Update
 from telegram.ext import ContextTypes
 
@@ -42,6 +43,22 @@ DB_PATH       = 'database/trading_saas.db'
 
 def _is_admin(chat_id: str) -> bool:
     return bool(ADMIN_CHAT_ID) and str(chat_id) == str(ADMIN_CHAT_ID)
+
+
+def _fmt_remaining(expires_at: str) -> str:
+    try:
+        exp = datetime.fromisoformat(str(expires_at))
+        now = datetime.now(timezone.utc)
+        sec = int((exp - now).total_seconds())
+    except Exception:
+        return "unknown"
+    if sec <= 0:
+        return "expired"
+    minutes, seconds = divmod(sec, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m {seconds}s"
 
 
 def _get_lang(chat_id: str) -> str:
@@ -399,3 +416,51 @@ async def admin_handler(update: Update, context):
         await update.message.reply_text(
             f"Unknown command: `{cmd}`", parse_mode='Markdown'
         )
+
+
+async def limits_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Admin-only command:
+      /limits
+      /orders (alias)
+    Show all active pending limit orders with remaining time until expiry.
+    """
+    chat_id = str(update.message.chat_id)
+    if not _is_admin(chat_id):
+        await update.message.reply_text("Access denied.")
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute(
+            "SELECT id, chat_id, symbol, action, limit_price, expires_at "
+            "FROM pending_limit_orders "
+            "WHERE status='PENDING' "
+            "ORDER BY expires_at ASC, id ASC"
+        )
+        rows = c.fetchall()
+    except sqlite3.OperationalError:
+        conn.close()
+        await update.message.reply_text(
+            "pending_limit_orders table not found.\n"
+            "Restart the engine/bot to apply DB schema.",
+        )
+        return
+    conn.close()
+
+    if not rows:
+        await update.message.reply_text("No active pending limit orders.")
+        return
+
+    lines = [f"*Active Pending Limit Orders ({len(rows)}):*"]
+    for oid, uid, symbol, action, limit_price, expires_at in rows[:50]:
+        rem = _fmt_remaining(expires_at)
+        lines.append(
+            f"• `#{oid}` `{uid}` | {symbol} {action} | "
+            f"`{float(limit_price):.4f}` | ⏳ {rem}"
+        )
+    if len(rows) > 50:
+        lines.append(f"\n... and {len(rows) - 50} more")
+
+    await update.message.reply_text("\n".join(lines), parse_mode='Markdown')

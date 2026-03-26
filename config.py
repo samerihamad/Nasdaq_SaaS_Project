@@ -127,6 +127,14 @@ FINAL_SYNC_FALLBACK_ENABLED = os.getenv("FINAL_SYNC_FALLBACK_ENABLED", "true").l
 # These are logged to DB for audit instead.
 SUPPRESS_EXPECTED_REJECTION_TELEGRAM = os.getenv("SUPPRESS_EXPECTED_REJECTION_TELEGRAM", "true").lower() == "true"
 
+# ── Sprint 2: Limit order policy ─────────────────────────────────────────────
+ENABLE_LIMIT_ORDER_MODE = os.getenv("ENABLE_LIMIT_ORDER_MODE", "true").lower() == "true"
+LIMIT_ORDER_TTL_BARS = int(os.getenv("LIMIT_ORDER_TTL_BARS", "4"))
+LIMIT_ORDER_BAR_MINUTES = int(os.getenv("LIMIT_ORDER_BAR_MINUTES", "15"))
+LIMIT_ORDER_MOMENTUM_RETRACE = float(os.getenv("LIMIT_ORDER_MOMENTUM_RETRACE", "0.618"))
+LIMIT_ORDER_MEANREV_ATR_OFFSET = float(os.getenv("LIMIT_ORDER_MEANREV_ATR_OFFSET", "0.20"))
+LIMIT_ORDER_ALLOW_MARKET_FALLBACK = os.getenv("LIMIT_ORDER_ALLOW_MARKET_FALLBACK", "false").lower() == "true"
+
 # Hard cap on new positions per user per day (independent of circuit breaker)
 MAX_DAILY_TRADES     = 5
 

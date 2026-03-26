@@ -14,7 +14,14 @@ from config import (
     TP2_MIN_DISTANCE_BUFFER_MULT,
     BE_LOCK_BUFFER_PCT,
     SUPPRESS_EXPECTED_REJECTION_TELEGRAM,
+    ENABLE_LIMIT_ORDER_MODE,
+    LIMIT_ORDER_TTL_BARS,
+    LIMIT_ORDER_BAR_MINUTES,
+    LIMIT_ORDER_MOMENTUM_RETRACE,
+    LIMIT_ORDER_MEANREV_ATR_OFFSET,
+    LIMIT_ORDER_ALLOW_MARKET_FALLBACK,
 )
+from utils.market_scanner import scan_multi_timeframe
 from database.db_manager import is_maintenance_mode, get_subscriber_lang
 from core.risk_manager import (
     can_open_trade,
@@ -40,6 +47,7 @@ from core.trade_close_messages import (
 _EPIC_CACHE = {}
 _SESSION_CACHE = {}
 SESSION_TTL_SECONDS = 45
+DB_PATH = 'database/trading_saas.db'
 
 
 def _log_trade_rejection(chat_id, symbol, action, stage: str, reason: str, details: str = ""):
@@ -81,6 +89,190 @@ def _is_expected_rejection(reason: str) -> bool:
         "max distance",
     ]
     return any(m in r for m in markers)
+
+
+def _calculate_limit_price(symbol: str, action: str, strategy_label: str, entry_price: float, atr: float | None) -> float:
+    """
+    Sprint 2 policy map:
+    - Momentum: 0.618 retrace of last 15m candle range.
+    - MeanRev: ATR offset from current extreme/reclaimed area proxy.
+    """
+    s = (strategy_label or "").strip().lower()
+    tf = scan_multi_timeframe(symbol) or {}
+    df_15m = tf.get("15m")
+    if df_15m is None or len(df_15m) < 2:
+        return float(entry_price)
+
+    try:
+        last = df_15m.iloc[-1]
+        rng = abs(float(last["High"]) - float(last["Low"]))
+    except Exception:
+        rng = 0.0
+    if rng <= 0:
+        rng = max(0.01, float(entry_price) * 0.002)
+
+    if s == "momentum":
+        retr = max(0.1, min(0.9, float(LIMIT_ORDER_MOMENTUM_RETRACE)))
+        if action == "BUY":
+            px = float(entry_price) - (retr * rng)
+        else:
+            px = float(entry_price) + (retr * rng)
+    else:
+        # Mean reversion: use conservative ATR offset from current price proxy.
+        atr_off = float(atr or 0.0) * max(0.05, float(LIMIT_ORDER_MEANREV_ATR_OFFSET))
+        if atr_off <= 0:
+            atr_off = max(0.01, float(entry_price) * 0.0015)
+        if action == "BUY":
+            px = float(entry_price) - atr_off
+        else:
+            px = float(entry_price) + atr_off
+
+    return max(0.01, round(px, 4))
+
+
+def _place_pending_limit_order(
+    chat_id: str,
+    symbol: str,
+    action: str,
+    strategy_label: str,
+    confidence: float,
+    stop_loss_pct: float | None,
+    limit_price: float,
+):
+    ttl_sec = max(60, int(LIMIT_ORDER_TTL_BARS) * int(LIMIT_ORDER_BAR_MINUTES) * 60)
+    now = datetime.now(timezone.utc)
+    exp = now + timedelta(seconds=ttl_sec)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    # one active pending limit per symbol+direction per user
+    c.execute(
+        "SELECT id FROM pending_limit_orders WHERE chat_id=? AND symbol=? AND action=? "
+        "AND status='PENDING' LIMIT 1",
+        (str(chat_id), str(symbol), str(action)),
+    )
+    row = c.fetchone()
+    if row:
+        conn.close()
+        return False, int(row[0]), "already_pending"
+    c.execute(
+        "INSERT INTO pending_limit_orders "
+        "(created_at, expires_at, chat_id, symbol, action, strategy_label, confidence, stop_loss_pct, limit_price, status, reason) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)",
+        (
+            now.isoformat(),
+            exp.isoformat(),
+            str(chat_id),
+            str(symbol),
+            str(action),
+            str(strategy_label or ""),
+            float(confidence),
+            float(stop_loss_pct) if stop_loss_pct is not None else None,
+            float(limit_price),
+            "limit_policy",
+        ),
+    )
+    oid = int(c.lastrowid)
+    conn.commit()
+    conn.close()
+    return True, oid, ""
+
+
+def process_pending_limit_orders():
+    """
+    Worker: track pending limits, trigger execution on touch, auto-cancel on TTL.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT id, chat_id, symbol, action, strategy_label, confidence, stop_loss_pct, limit_price, "
+        "created_at, expires_at FROM pending_limit_orders WHERE status='PENDING' ORDER BY id ASC"
+    )
+    rows = c.fetchall()
+    conn.close()
+    if not rows:
+        return 0
+
+    processed = 0
+    now = datetime.now(timezone.utc)
+    for row in rows:
+        (
+            oid,
+            chat_id,
+            symbol,
+            action,
+            strategy_label,
+            confidence,
+            stop_loss_pct,
+            limit_price,
+            _created_at,
+            expires_at,
+        ) = row
+        exp_dt = None
+        try:
+            exp_dt = datetime.fromisoformat(str(expires_at))
+        except Exception:
+            exp_dt = None
+        if exp_dt and now >= exp_dt:
+            with sqlite3.connect(DB_PATH) as cx:
+                cx.execute(
+                    "UPDATE pending_limit_orders SET status='CANCELLED', cancelled_at=?, reason=? WHERE id=? AND status='PENDING'",
+                    (now.isoformat(), "ttl_expired", int(oid)),
+                )
+            lang = get_subscriber_lang(str(chat_id))
+            msg = (
+                f"⏱️ *Limit order expired*\n\n📌 {symbol} {action}\n💰 Limit: {float(limit_price):.4f}\nReason: TTL reached ({int(LIMIT_ORDER_TTL_BARS)} bars)."
+                if lang == "en"
+                else
+                f"⏱️ *انتهت صلاحية أمر ليمت*\n\n📌 {symbol} {('شراء' if action=='BUY' else 'بيع')}\n💰 سعر الليمِت: {float(limit_price):.4f}\nالسبب: انتهاء المهلة ({int(LIMIT_ORDER_TTL_BARS)} شموع)."
+            )
+            send_telegram_message(str(chat_id), msg)
+            processed += 1
+            continue
+
+        creds = get_user_credentials(str(chat_id))
+        if not creds:
+            continue
+        base_url, headers = get_session(creds)
+        if not headers:
+            continue
+        order_epic = resolve_epic_for_user(str(chat_id), str(symbol), base_url=base_url, headers=headers, is_demo=bool(creds[2]))
+        if not order_epic:
+            continue
+        px = _get_current_price(base_url, headers, order_epic)
+        touched = (float(px) <= float(limit_price)) if str(action) == "BUY" else (float(px) >= float(limit_price))
+        if not touched:
+            continue
+
+        with sqlite3.connect(DB_PATH) as cx:
+            cx.execute(
+                "UPDATE pending_limit_orders SET status='TRIGGERED', triggered_at=? WHERE id=? AND status='PENDING'",
+                (now.isoformat(), int(oid)),
+            )
+        lang = get_subscriber_lang(str(chat_id))
+        trig_msg = (
+            f"🎯 *Limit touched* — executing\n{symbol} {action}\nLimit: {float(limit_price):.4f}\nNow: {float(px):.4f}"
+            if lang == "en"
+            else
+            f"🎯 *تم لمس سعر الليمِت* — جارٍ التنفيذ\n{symbol} {('شراء' if action=='BUY' else 'بيع')}\nسعر الليمِت: {float(limit_price):.4f}\nالسعر الحالي: {float(px):.4f}"
+        )
+        send_telegram_message(str(chat_id), trig_msg)
+        result = place_trade_for_user(
+            str(chat_id),
+            str(symbol),
+            str(action),
+            confidence=float(confidence or 75.0),
+            stop_loss_pct=float(stop_loss_pct) if stop_loss_pct is not None else None,
+            strategy_label=str(strategy_label or ""),
+            force_market=True,
+        )
+        final_status = "FILLED" if isinstance(result, str) and result.startswith("✅ Opened") else "FAILED"
+        with sqlite3.connect(DB_PATH) as cx:
+            cx.execute(
+                "UPDATE pending_limit_orders SET status=?, last_error=? WHERE id=?",
+                (final_status, "" if final_status == "FILLED" else str(result or "")[:400], int(oid)),
+            )
+        processed += 1
+    return processed
 
 
 # ── Credentials & session ─────────────────────────────────────────────────────
@@ -1217,7 +1409,7 @@ def monitor_and_close(chat_id):
 
 # ── Trade execution ───────────────────────────────────────────────────────────
 
-def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct=None, strategy_label=None):
+def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct=None, strategy_label=None, force_market: bool = False):
     """
     Open a new position.
 
@@ -1351,6 +1543,46 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             entry_price * (1 - effective_sl_pct) if action == 'BUY'
             else entry_price * (1 + effective_sl_pct)
         )
+
+    # ── Sprint 2: limit-first entry policy ───────────────────────────────────
+    if ENABLE_LIMIT_ORDER_MODE and not force_market:
+        limit_px = _calculate_limit_price(
+            symbol=str(symbol),
+            action=str(action),
+            strategy_label=str(strategy_label or ""),
+            entry_price=float(entry_price),
+            atr=float(atr) if atr is not None else None,
+        )
+        ok_lim, oid, lim_reason = _place_pending_limit_order(
+            chat_id=str(chat_id),
+            symbol=str(symbol),
+            action=str(action),
+            strategy_label=str(strategy_label or ""),
+            confidence=float(confidence),
+            stop_loss_pct=float(stop_loss_pct) if stop_loss_pct is not None else None,
+            limit_price=float(limit_px),
+        )
+        if not ok_lim and lim_reason == "already_pending":
+            msg = f"⏭️ Limit already pending ({symbol} {action})"
+            return msg
+        lang = get_subscriber_lang(chat_id)
+        ttl_bars = int(LIMIT_ORDER_TTL_BARS)
+        if lang == "en":
+            msg = (
+                f"🧾 *Limit order placed* #{oid}\n"
+                f"📌 {symbol} {action}\n"
+                f"💰 Limit price: *{float(limit_px):.4f}*\n"
+                f"⏱️ TTL: *{ttl_bars} bars* ({int(LIMIT_ORDER_BAR_MINUTES)}m)"
+            )
+        else:
+            msg = (
+                f"🧾 *تم وضع أمر ليمِت* #{oid}\n"
+                f"📌 {symbol} {('شراء' if action=='BUY' else 'بيع')}\n"
+                f"💰 سعر الليمِت: *{float(limit_px):.4f}*\n"
+                f"⏱️ الصلاحية: *{ttl_bars} شموع* ({int(LIMIT_ORDER_BAR_MINUTES)}م)"
+            )
+        send_telegram_message(chat_id, msg)
+        return f"🧾 Limit placed ({symbol} {action}) @ {float(limit_px):.4f}"
 
     # ── Position size (1–2% risk, confidence-scaled) ──────────────────────────
     size = calculate_position_size(balance, confidence, entry_price, effective_sl_pct, chat_id)
