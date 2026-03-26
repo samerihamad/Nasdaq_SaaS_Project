@@ -202,10 +202,14 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
     local_open = c.fetchall()
     # If TP1 and TP2 both closed on the broker in the same cycle, process TP1 first
     # so TP1 is CLOSED in DB before TP2 final aggregates P&L.
+    # local_open tuple layout:
+    # (trade_id, deal_id, deal_reference, symbol, direction, entry_price, size,
+    #  leg_role, parent_session, stop_distance, trailing_stop)
+    # NOTE: `size` (r[6]) is numeric and must NEVER be `.strip()`'d.
     local_open = sorted(
         local_open,
         key=lambda r: (
-            0 if (r[6] or "").strip() == "TP1" else 1 if (r[6] or "").strip() == "TP2" else 2,
+            0 if (r[7] or "").strip() == "TP1" else 1 if (r[7] or "").strip() == "TP2" else 2,
             r[0],
         ),
     )
