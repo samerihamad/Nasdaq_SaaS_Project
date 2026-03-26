@@ -9,18 +9,54 @@ load_dotenv()
 
 def send_telegram_message(chat_id, message):
     """Send a Telegram message to a subscriber."""
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    url   = f"https://api.telegram.org/bot{token}/sendMessage"
+    token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+    if not token:
+        print("[Telegram] Missing TELEGRAM_BOT_TOKEN; message not sent.", flush=True)
+        return None
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
         "chat_id":    chat_id,
         "text":       message,
         "parse_mode": "Markdown",
     }
     try:
-        response = requests.post(url, json=payload)
-        return response.json()
+        response = requests.post(url, json=payload, timeout=20)
+        data = response.json()
+        # Telegram can return HTTP 200 with ok=false (e.g., Markdown parse errors).
+        if not isinstance(data, dict) or not data.get("ok", False):
+            desc = ""
+            try:
+                desc = str((data or {}).get("description") or "").strip()
+            except Exception:
+                desc = ""
+            print(
+                f"[Telegram] Send failed chat_id={chat_id} "
+                f"status={response.status_code} desc={desc[:220]}",
+                flush=True,
+            )
+            # Fallback: resend without Markdown formatting to avoid parse errors blocking alerts.
+            try:
+                payload2 = {"chat_id": chat_id, "text": str(message)}
+                response2 = requests.post(url, json=payload2, timeout=20)
+                data2 = response2.json()
+                if isinstance(data2, dict) and data2.get("ok", False):
+                    print(
+                        f"[Telegram] Fallback plaintext sent chat_id={chat_id}",
+                        flush=True,
+                    )
+                    return data2
+                desc2 = str((data2 or {}).get("description") or "").strip()
+                print(
+                    f"[Telegram] Fallback failed chat_id={chat_id} "
+                    f"status={response2.status_code} desc={desc2[:220]}",
+                    flush=True,
+                )
+            except Exception as e2:
+                print(f"Telegram fallback send error: {e2}", flush=True)
+            return data
+        return data
     except Exception as e:
-        print(f"Telegram send error: {e}")
+        print(f"Telegram send error: {e}", flush=True)
         return None
 
 
