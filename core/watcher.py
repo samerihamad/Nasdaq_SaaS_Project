@@ -16,6 +16,7 @@ and delegates entirely to run_watcher().
 import os
 import sqlite3
 import requests
+import traceback
 from bot.notifier import send_telegram_message
 from bot.licensing import safe_decrypt
 from core.trailing_stop import record_open_trade
@@ -178,15 +179,22 @@ def run_watcher() -> int:
     total_orphans = 0
 
     for row in subscribers:
-        chat_id = row[0]
+        # SQLite can return numeric types if legacy rows were inserted without
+        # enforcing TEXT affinity for chat_id. Normalize to a safe string early.
+        chat_id = str(row[0]).strip()
         try:
             monitor_and_close(chat_id)
         except Exception as e:
             print(f"⚠️  Watcher error for {chat_id}: {e}")
+            try:
+                print(traceback.format_exc())
+            except Exception:
+                pass
 
     # Standalone orphan scan (in case monitor_and_close failed or was skipped)
     for row in subscribers:
-        chat_id, enc_key, enc_pass, is_demo, enc_email = row
+        raw_chat_id, enc_key, enc_pass, is_demo, enc_email = row
+        chat_id = str(raw_chat_id).strip()
         try:
             api_key    = safe_decrypt(enc_key)
             password   = safe_decrypt(enc_pass)
@@ -217,5 +225,9 @@ def run_watcher() -> int:
 
         except Exception as e:
             print(f"⚠️  Orphan scan error for {chat_id}: {e}")
+            try:
+                print(traceback.format_exc())
+            except Exception:
+                pass
 
     return total_orphans
