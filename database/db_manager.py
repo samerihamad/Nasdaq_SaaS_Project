@@ -76,6 +76,10 @@ def create_db():
         # UX: if a position is closed manually on the platform, broker history can lag.
         # We send one "pending sync" notification and then wait for realized P&L.
         ('close_sync_notified', "INTEGER DEFAULT 0"),
+        # Sync lifecycle diagnostics for externally closed trades.
+        ('close_sync_attempts', "INTEGER DEFAULT 0"),
+        ('close_sync_last_try_at', "TEXT"),
+        ('close_sync_last_error', "TEXT"),
         # Final broker-truth fields (synced from Capital.com history after close).
         # `pnl` remains for backward compatibility (reports/analytics) and is set to `actual_pnl`.
         ('actual_pnl', 'REAL'),

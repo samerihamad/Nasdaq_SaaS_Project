@@ -30,6 +30,8 @@ from database.db_manager import is_maintenance_mode, get_subscriber_lang
 
 DB_PATH = 'database/trading_saas.db'
 ENABLE_CLOSE_PENDING_NOTIFY = (os.getenv("ENABLE_CLOSE_PENDING_NOTIFY", "false").strip().lower() == "true")
+SYNC_RETRY_COOLDOWN_SEC = int(os.getenv("CLOSE_SYNC_RETRY_COOLDOWN_SEC", "30"))
+SYNC_MAX_ATTEMPTS = int(os.getenv("CLOSE_SYNC_MAX_ATTEMPTS", "120"))
 
 
 def fetch_closed_deal_final_data(
@@ -144,9 +146,15 @@ def fetch_closed_deal_final_data(
             tx_deal = tx.get("dealId")
             tx_ref = tx.get("dealReference")
             tx_related = tx.get("relatedDealId") or tx.get("relatedDealReference")
+            tx_reference = tx.get("reference") or tx.get("transactionReference")
             match = False
             for x in ids:
-                if str(tx_deal) == x or str(tx_ref) == x or str(tx_related) == x:
+                if (
+                    str(tx_deal) == x
+                    or str(tx_ref) == x
+                    or str(tx_related) == x
+                    or str(tx_reference) == x
+                ):
                     match = True
                     break
             if not match:
@@ -198,7 +206,7 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
     c.execute(
         "SELECT trade_id, deal_id, COALESCE(deal_reference,''), symbol, direction, entry_price, size, "
         "COALESCE(leg_role,''), COALESCE(parent_session,''), stop_distance, trailing_stop, "
-        "COALESCE(close_sync_notified,0) "
+        "COALESCE(close_sync_notified,0), COALESCE(close_sync_attempts,0), close_sync_last_try_at "
         "FROM trades WHERE chat_id=? AND status='OPEN'",
         (chat_id,),
     )
@@ -207,7 +215,8 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
     # so TP1 is CLOSED in DB before TP2 final aggregates P&L.
     # local_open tuple layout:
     # (trade_id, deal_id, deal_reference, symbol, direction, entry_price, size,
-    #  leg_role, parent_session, stop_distance, trailing_stop, close_sync_notified)
+    #  leg_role, parent_session, stop_distance, trailing_stop, close_sync_notified,
+    #  close_sync_attempts, close_sync_last_try_at)
     # NOTE: `size` (r[6]) is numeric and must NEVER be `.strip()`'d.
     local_open = sorted(
         local_open,
@@ -232,8 +241,44 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
         stop_distance,
         trailing_stop,
         close_sync_notified,
+        close_sync_attempts,
+        close_sync_last_try_at,
     ) in local_open:
         if deal_id and str(deal_id) not in live_deal_ids:
+            # Prevent hot-loop hammering when Capital history lags.
+            # Retry with cooldown and bounded attempt tracking per trade.
+            try:
+                attempts_i = int(close_sync_attempts or 0)
+            except Exception:
+                attempts_i = 0
+            if attempts_i >= SYNC_MAX_ATTEMPTS:
+                if attempts_i == SYNC_MAX_ATTEMPTS:
+                    print(
+                        f"[Capital Sync] max attempts reached trade_id={trade_id} deal_id={deal_id}",
+                        flush=True,
+                    )
+                    c.execute(
+                        "UPDATE trades SET close_sync_attempts=?, close_sync_last_error=? WHERE trade_id=?",
+                        (attempts_i + 1, "max_attempts_reached", int(trade_id)),
+                    )
+                    conn.commit()
+                continue
+            if close_sync_last_try_at:
+                try:
+                    last_try = _dt.fromisoformat(str(close_sync_last_try_at))
+                    delta = (_dt.now() - last_try).total_seconds()
+                    if delta < max(1, SYNC_RETRY_COOLDOWN_SEC):
+                        continue
+                except Exception:
+                    pass
+
+            c.execute(
+                "UPDATE trades SET close_sync_attempts=COALESCE(close_sync_attempts,0)+1, "
+                "close_sync_last_try_at=? WHERE trade_id=? AND status='OPEN'",
+                (_dt.now().isoformat(), int(trade_id)),
+            )
+            conn.commit()
+
             # Broker realizedPnL can be delayed right after a manual close.
             # If we read too early, we may incorrectly get 0.0 and send
             # "Breakeven" to Telegram even though the final realized P&L is > 0.
@@ -272,14 +317,26 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
                         conn.commit()
                 except Exception:
                     pass
+                c.execute(
+                    "UPDATE trades SET close_sync_last_error=? WHERE trade_id=? AND status='OPEN'",
+                    ("transaction_not_found_or_not_realized", int(trade_id)),
+                )
+                conn.commit()
                 continue
 
             pnl = float(final["actual_pnl"])
             exit_price = final.get("exit_price")
             cur = c.execute(
-                "UPDATE trades SET status='CLOSED', pnl=?, actual_pnl=?, exit_price=?, closed_at=? "
+                "UPDATE trades SET status='CLOSED', pnl=?, actual_pnl=?, exit_price=?, closed_at=?, "
+                "close_sync_last_error=NULL "
                 "WHERE trade_id=? AND status='OPEN'",
-                (pnl, pnl, float(exit_price) if exit_price is not None else None, _dt.now().isoformat(), trade_id),
+                (
+                    pnl,
+                    pnl,
+                    float(exit_price) if exit_price is not None else None,
+                    _dt.now().isoformat(),
+                    trade_id,
+                ),
             )
             # If rowcount is 0, another process updated it before this cycle.
             if cur.rowcount != 1:
