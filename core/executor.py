@@ -1435,7 +1435,13 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
                 break
 
             opened_broker_legs.append(
-                {"role": leg_role, "size": float(leg_size), "tp": float(leg_target), "deal_id": str(deal_id)}
+                {
+                    "role": leg_role,
+                    "size": float(leg_size),
+                    "tp": float(leg_target),
+                    "deal_id": str(deal_id),
+                    "deal_reference": str(payload.get("dealReference") or payload.get("deal_ref") or "").strip() or None,
+                }
             )
             ok_sync, info = _sync_protection_to_broker(
                 base_url, headers, str(deal_id), stop_level, float(leg_target)
@@ -1471,6 +1477,7 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             float(ob["size"]),
             str(ob["deal_id"]),
             stop_level,
+            deal_reference=ob.get("deal_reference"),
             leg_role=str(ob["role"]),
             parent_session=parent_session,
             stop_distance=stop_dist,

@@ -191,7 +191,7 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
 
     # Fetch locally tracked open trades
     c.execute(
-        "SELECT trade_id, deal_id, symbol, direction, entry_price, size, "
+        "SELECT trade_id, deal_id, COALESCE(deal_reference,''), symbol, direction, entry_price, size, "
         "COALESCE(leg_role,''), COALESCE(parent_session,''), stop_distance, trailing_stop "
         "FROM trades WHERE chat_id=? AND status='OPEN'",
         (chat_id,),
@@ -212,6 +212,7 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
     for (
         trade_id,
         deal_id,
+        deal_reference,
         symbol,
         direction,
         entry_price,
@@ -225,11 +226,15 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
             # Broker realizedPnL can be delayed right after a manual close.
             # If we read too early, we may incorrectly get 0.0 and send
             # "Breakeven" to Telegram even though the final realized P&L is > 0.
+            dr = str(deal_reference or "").strip()
             final = fetch_closed_deal_final_data(
-                base_url, headers, str(deal_id), wait_for_realized=True
+                base_url,
+                headers,
+                str(deal_id),
+                wait_for_realized=True,
+                identifiers=[dr] if dr else None,
             )
             if not final:
-                print("Error: Could not sync final data from Capital.com")
                 continue
 
             pnl = float(final["actual_pnl"])

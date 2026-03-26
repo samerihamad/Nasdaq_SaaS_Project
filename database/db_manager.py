@@ -71,6 +71,8 @@ def create_db():
         ('leg_role', "TEXT"),
         ('parent_session', "TEXT"),
         ('stop_distance', "REAL"),
+        # Capital order reference (useful for matching history after close).
+        ('deal_reference', "TEXT"),
         # Final broker-truth fields (synced from Capital.com history after close).
         # `pnl` remains for backward compatibility (reports/analytics) and is set to `actual_pnl`.
         ('actual_pnl', 'REAL'),
