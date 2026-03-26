@@ -56,6 +56,7 @@ from config import (
     AI_MIN_PROB_MEANREV,
     AI_SOFT_OVERRIDE_CONFIDENCE,
     AI_SOFT_OVERRIDE_MIN_PROB,
+    ENABLE_AI_SOFT_OVERRIDE,
     ENABLE_STRUCTURAL_REJECTION_NOTIFY,
     STRUCTURAL_REJECTION_NOTIFY_COOLDOWN_SEC,
     STRUCTURAL_REJECTION_NOTIFY_MAX_PER_CYCLE,
@@ -433,6 +434,8 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
 
         # Soft override (Momentum/MeanRev): no VOLATILE block — see config AI_SOFT_OVERRIDE_*
         ai_override = (
+            ENABLE_AI_SOFT_OVERRIDE
+            and
             (not ai_approved)
             and confidence >= AI_SOFT_OVERRIDE_CONFIDENCE
             and ai_prob >= AI_SOFT_OVERRIDE_MIN_PROB

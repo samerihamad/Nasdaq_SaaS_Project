@@ -31,39 +31,39 @@ WATCHLIST = [
 # ── Mean Reversion Parameters ─────────────────────────────────────────────────
 
 # RSI thresholds for oversold / overbought detection
-MR_RSI_OVERSOLD      = 35      # below → look for BUY reversal on 15m
-MR_RSI_OVERBOUGHT    = 65      # above → look for SELL reversal on 15m
+MR_RSI_OVERSOLD      = 30      # institutional strict: deeper oversold
+MR_RSI_OVERBOUGHT    = 70      # institutional strict: deeper overbought
 
 # Required % deviation from VWAP to confirm price is stretched
-MR_VWAP_DEV_PCT      = 1.5
+MR_VWAP_DEV_PCT      = 2.2
 
 # A gap larger than this % on the entry bar flags a "News Trap" → signal skipped
-MR_NEWS_TRAP_GAP_PCT = 3.0
+MR_NEWS_TRAP_GAP_PCT = 2.0
 
 # Bars to look back when detecting a Liquidity Sweep
-MR_SWEEP_LOOKBACK    = 10
+MR_SWEEP_LOOKBACK    = 16
 
 # Minimum composite score (0–100) to emit a mean-reversion signal
-MR_MIN_SCORE         = 40
+MR_MIN_SCORE         = 65
 
 # ── Momentum Parameters ───────────────────────────────────────────────────────
 
 # ADX minimum for a trending market; signals below this are noise
-MOM_ADX_THRESHOLD    = 20
+MOM_ADX_THRESHOLD    = 28
 # ADX above this is considered a very strong trend (boosts score)
-MOM_ADX_STRONG       = 40
+MOM_ADX_STRONG       = 45
 
 # Current bar volume must be ≥ this multiple of the 20-bar average
-MOM_VOL_RATIO        = 1.3
+MOM_VOL_RATIO        = 2.0
 
 # Minimum gap-up or gap-down % to count as a momentum gap signal
-MOM_GAP_PCT          = 1.0
+MOM_GAP_PCT          = 1.5
 
 # Require MACD line to cross above/below signal line on entry bar
 MOM_MACD_CONFIRM     = True
 
 # Minimum composite score (0–100) to emit a momentum signal
-MOM_MIN_SCORE        = 45
+MOM_MIN_SCORE        = 68
 
 # ── ATR / Stop-Loss ───────────────────────────────────────────────────────────
 
@@ -97,22 +97,22 @@ BE_LOCK_BUFFER_PCT = 0.0005  # 0.05% beyond entry (per direction)
 # ── Signal Quality Gate ───────────────────────────────────────────────────────
 
 # Signals with confidence below this are discarded before risk checks
-MIN_CONFIDENCE       = 55.0
+MIN_CONFIDENCE       = 67.0
 
 # ── Sprint 1: Market Structure Foundation flags ───────────────────────────────
 # Toggle these filters without changing strategy code.
-ENABLE_MARKET_STRUCTURE_FILTERS = os.getenv("ENABLE_MARKET_STRUCTURE_FILTERS", "false").lower() == "true"
-ENABLE_PREMIUM_DISCOUNT_FILTER = os.getenv("ENABLE_PREMIUM_DISCOUNT_FILTER", "false").lower() == "true"
-ENABLE_LIQUIDITY_MAP_FILTER = os.getenv("ENABLE_LIQUIDITY_MAP_FILTER", "false").lower() == "true"
+ENABLE_MARKET_STRUCTURE_FILTERS = os.getenv("ENABLE_MARKET_STRUCTURE_FILTERS", "true").lower() == "true"
+ENABLE_PREMIUM_DISCOUNT_FILTER = os.getenv("ENABLE_PREMIUM_DISCOUNT_FILTER", "true").lower() == "true"
+ENABLE_LIQUIDITY_MAP_FILTER = os.getenv("ENABLE_LIQUIDITY_MAP_FILTER", "true").lower() == "true"
 
 # Reject setups around HTF equilibrium ("no man's land").
-MARKET_STRUCTURE_NO_TRADE_ZONE_PCT = float(os.getenv("MARKET_STRUCTURE_NO_TRADE_ZONE_PCT", "0.10"))
+MARKET_STRUCTURE_NO_TRADE_ZONE_PCT = float(os.getenv("MARKET_STRUCTURE_NO_TRADE_ZONE_PCT", "0.14"))
 
 # 4H candles used to build HTF range and premium/discount context.
-MARKET_STRUCTURE_HTF_LOOKBACK = int(os.getenv("MARKET_STRUCTURE_HTF_LOOKBACK", "60"))
+MARKET_STRUCTURE_HTF_LOOKBACK = int(os.getenv("MARKET_STRUCTURE_HTF_LOOKBACK", "80"))
 
 # First N 15m candles used for opening-range liquidity levels.
-LIQUIDITY_OPENING_RANGE_BARS = int(os.getenv("LIQUIDITY_OPENING_RANGE_BARS", "4"))
+LIQUIDITY_OPENING_RANGE_BARS = int(os.getenv("LIQUIDITY_OPENING_RANGE_BARS", "6"))
 
 # Send Telegram notice when a setup is rejected by market-structure filters.
 ENABLE_STRUCTURAL_REJECTION_NOTIFY = os.getenv("ENABLE_STRUCTURAL_REJECTION_NOTIFY", "true").lower() == "true"
@@ -167,15 +167,16 @@ PREMARKET_ALERT_WINDOW_MIN = 30
 #
 # Per-strategy minimum AI probability thresholds (%).
 # These apply in dispatch_signal() as an execution gate after strategy confidence.
-AI_MIN_PROB_RF = 55.0
-AI_MIN_PROB_MOMENTUM = 52.0
-AI_MIN_PROB_MEANREV = 52.0
+AI_MIN_PROB_RF = 62.0
+AI_MIN_PROB_MOMENTUM = 65.0
+AI_MIN_PROB_MEANREV = 64.0
 
 # Soft override:
 # Allow high-confidence Momentum/MeanRev signals to pass even if AI probability
 # is below the per-strategy threshold (override is intentionally harder to reach).
 AI_SOFT_OVERRIDE_CONFIDENCE = 63.0
 AI_SOFT_OVERRIDE_MIN_PROB = 40.0
+ENABLE_AI_SOFT_OVERRIDE = os.getenv("ENABLE_AI_SOFT_OVERRIDE", "false").lower() == "true"
 
 # Refresh watchlist while market is open (seconds)
 WATCHLIST_REFRESH_SECONDS = 3600

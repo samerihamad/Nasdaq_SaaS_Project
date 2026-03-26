@@ -286,8 +286,9 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
     minus_di_val = float(minus_di.iloc[-1])
 
     if adx_val < MOM_ADX_THRESHOLD:
-        log.debug("[Momentum %s] ADX=%.1f below threshold %.1f — no trend", symbol, adx_val, MOM_ADX_THRESHOLD)
-        return None
+        rej = f"Rejected: Weak Trend (ADX {adx_val:.1f} < {float(MOM_ADX_THRESHOLD):.1f})"
+        log.info("[Momentum %s] %s", symbol, rej)
+        return {"rejected": True, "strategy": "Momentum", "reason": rej}
 
     # Determine direction from DI lines
     if plus_di_val > minus_di_val:
@@ -319,14 +320,16 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
     # ── MACD crossover ────────────────────────────────────────────────────────
     macd_line, signal_line = _macd(close_15m)
     if MOM_MACD_CONFIRM and not _macd_crossover(macd_line, signal_line, direction):
-        log.debug("[Momentum %s] No MACD crossover — signal rejected", symbol)
-        return None
+        rej = "Rejected: No MACD Confirmation"
+        log.info("[Momentum %s] %s", symbol, rej)
+        return {"rejected": True, "strategy": "Momentum", "reason": rej}
 
     # ── Volume spike ──────────────────────────────────────────────────────────
     vol_ratio = _volume_ratio(df_15m)
     if vol_ratio < MOM_VOL_RATIO:
-        log.debug("[Momentum %s] VolRatio=%.2f below threshold %.2f", symbol, vol_ratio, MOM_VOL_RATIO)
-        return None
+        rej = f"Rejected: Low Volume ({vol_ratio:.1f}x < {float(MOM_VOL_RATIO):.1f}x)"
+        log.info("[Momentum %s] %s", symbol, rej)
+        return {"rejected": True, "strategy": "Momentum", "reason": rej}
 
     # ── Composite scoring ─────────────────────────────────────────────────────
     score   = 0
@@ -394,8 +397,9 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
     )
 
     if score < MOM_MIN_SCORE:
-        log.debug("[Momentum %s] Score %d below threshold %d", symbol, score, MOM_MIN_SCORE)
-        return None
+        rej = f"Rejected: Low Confidence (Score {int(score)} < {int(MOM_MIN_SCORE)})"
+        log.info("[Momentum %s] %s", symbol, rej)
+        return {"rejected": True, "strategy": "Momentum", "reason": rej}
 
     # Map score (60–100) to confidence (65–95 %)
     confidence = round(65.0 + (score - MOM_MIN_SCORE) / (100 - MOM_MIN_SCORE) * 30.0, 1)

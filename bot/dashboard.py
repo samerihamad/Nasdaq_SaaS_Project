@@ -1503,15 +1503,35 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         closed = 0
         failed = 0
+        # Work on unique deal IDs only; duplicated rows can otherwise inflate "failed".
+        unique_deal_ids = []
+        seen_deals = set()
         for p in positions:
-            deal_id = str((p.get("position") or {}).get("dealId") or "")
-            if not deal_id:
+            did = str((p.get("position") or {}).get("dealId") or "")
+            if not did or did in seen_deals:
                 continue
+            seen_deals.add(did)
+            unique_deal_ids.append(did)
+
+        for deal_id in unique_deal_ids:
             try:
                 del_res = requests.delete(f"{base_url}/positions/{deal_id}", headers=headers, timeout=20)
                 if del_res.status_code != 200:
-                    failed += 1
-                    continue
+                    # Some broker responses are non-200 even when the position is already gone.
+                    # Verify from live positions before counting as failed.
+                    verify_res = requests.get(f"{base_url}/positions", headers=headers, timeout=15)
+                    still_open = True
+                    if verify_res.status_code == 200:
+                        verify_positions = (verify_res.json() or {}).get("positions", []) or []
+                        live_ids = {
+                            str((vp.get("position") or {}).get("dealId") or "")
+                            for vp in verify_positions
+                        }
+                        still_open = deal_id in live_ids
+                    if still_open:
+                        failed += 1
+                        continue
+
                 upl = float(upl_by_id.get(deal_id, 0.0))
                 # Close local DB rows that match this deal_id (if present).
                 conn = _db()

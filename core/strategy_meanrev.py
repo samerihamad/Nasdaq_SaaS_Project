@@ -281,8 +281,12 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
     elif rsi_val >= MR_RSI_OVERBOUGHT:
         direction = "SELL"
     else:
-        log.debug("[MeanRev %s] RSI %.1f — no extreme; skip", symbol, rsi_val)
-        return None
+        rej = (
+            f"Rejected: RSI not extreme ({rsi_val:.1f} not <= {float(MR_RSI_OVERSOLD):.1f} "
+            f"or >= {float(MR_RSI_OVERBOUGHT):.1f})"
+        )
+        log.info("[MeanRev %s] %s", symbol, rej)
+        return {"rejected": True, "strategy": "MeanRev", "reason": rej}
 
     # ── Sprint 1: Market structure gates (feature-flagged) ──────────────────
     htf = None
@@ -305,8 +309,9 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
 
     # ── News Trap filter ──────────────────────────────────────────────────────
     if _news_trap(df_15m):
-        log.info("[MeanRev %s] News Trap detected — signal skipped", symbol)
-        return None
+        rej = f"Rejected: News Trap (Gap >= {float(MR_NEWS_TRAP_GAP_PCT):.1f}%)"
+        log.info("[MeanRev %s] %s", symbol, rej)
+        return {"rejected": True, "strategy": "MeanRev", "reason": rej}
 
     # ── Reversal candle check (preferred but not mandatory) ──────────────────
     # A reversal candle OR a liquidity sweep is sufficient to proceed.
@@ -328,11 +333,9 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
     has_sweep = _liquidity_sweep(df_15m, direction)
 
     if not has_reversal_candle and not has_sweep:
-        log.debug(
-            "[MeanRev %s] No reversal candle (%s) and no liquidity sweep — signal rejected",
-            symbol, candle_label,
-        )
-        return None
+        rej = "Rejected: No Reversal Candle/Sweep Confirmation"
+        log.info("[MeanRev %s] %s", symbol, rej)
+        return {"rejected": True, "strategy": "MeanRev", "reason": rej}
 
     # ── Composite scoring ─────────────────────────────────────────────────────
     score = 0
@@ -399,8 +402,9 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
     )
 
     if score < MR_MIN_SCORE:
-        log.debug("[MeanRev %s] Score %d below threshold %d", symbol, score, MR_MIN_SCORE)
-        return None
+        rej = f"Rejected: Low Confidence (Score {int(score)} < {int(MR_MIN_SCORE)})"
+        log.info("[MeanRev %s] %s", symbol, rej)
+        return {"rejected": True, "strategy": "MeanRev", "reason": rej}
 
     # Map score (55–100) to confidence (65–95 %)
     confidence = round(65.0 + (score - MR_MIN_SCORE) / (100 - MR_MIN_SCORE) * 30.0, 1)
