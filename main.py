@@ -544,6 +544,17 @@ def run_trading_bot():
     print(f"   الثقة الدنيا: {MIN_CONFIDENCE}% | فحص كل {CHECK_INTERVAL}s")
     print("-" * 55)
 
+    # Telegram health ping (helps detect missing token / blocked bot early)
+    try:
+        if ADMIN_CHAT_ID and not is_maintenance_mode():
+            now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            send_telegram_message(
+                ADMIN_CHAT_ID,
+                f"✅ Engine started\n🕒 {now_utc}",
+            )
+    except Exception as exc:
+        print(f"[Telegram] Startup ping failed: {exc}", flush=True)
+
     _start_background_threads()
 
     while True:
