@@ -546,7 +546,9 @@ def run_trading_bot():
 
     # Telegram health ping (helps detect missing token / blocked bot early)
     try:
-        if ADMIN_CHAT_ID and not is_maintenance_mode():
+        if not ADMIN_CHAT_ID:
+            print("[Telegram] ADMIN_CHAT_ID is not set; startup ping skipped.", flush=True)
+        elif not is_maintenance_mode():
             now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
             send_telegram_message(
                 ADMIN_CHAT_ID,

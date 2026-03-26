@@ -1544,7 +1544,14 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             f"{sl_adjust_note}"
         )
 
-    send_telegram_message(chat_id, msg)
+    tg_res = send_telegram_message(chat_id, msg)
+    # Always surface Telegram delivery failures in engine logs.
+    try:
+        if isinstance(tg_res, dict) and tg_res.get("ok") is False:
+            desc = str(tg_res.get("description") or "").strip()
+            print(f"[Telegram] Send failed chat_id={chat_id} desc={desc[:220]}", flush=True)
+    except Exception:
+        pass
 
     stop_info = f"{stop_level:.4f}" if stop_level is not None else "N/A"
     return (
