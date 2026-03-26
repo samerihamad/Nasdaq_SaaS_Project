@@ -1162,6 +1162,8 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
     if is_maintenance_mode():
         return "🔧 System in maintenance — new entries suspended."
 
+    lang = get_subscriber_lang(chat_id)
+
     # ── Session Gatekeeper (UTC) — do not call broker outside window ─────────
     try:
         from utils.market_hours import is_within_us_cash_session_utc
@@ -1169,7 +1171,10 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
     except Exception:
         ok_sess, sess_reason = True, "OK"
     if not ok_sess:
-        msg = f"⏭️ Skipped: Outside Market Hours ({sess_reason}) — {symbol}"
+        if lang == "en":
+            msg = f"⏭️ Skipped: Outside Market Hours ({sess_reason}) — {symbol}"
+        else:
+            msg = f"⏭️ تم التخطي: خارج ساعات السوق ({sess_reason}) — {symbol}"
         print(msg)
         if not is_maintenance_mode():
             send_telegram_message(chat_id, msg)
@@ -1229,7 +1234,9 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
     is_tradeable, m_status = _market_tradeability(base_url, headers, order_epic)
     if not is_tradeable:
         print(f"Trade skipped: Market Closed for {symbol} ({order_epic}) status={m_status}")
-        return f"⏭️ Trade skipped: Market Closed for {symbol}"
+        if lang == "en":
+            return f"⏭️ Trade skipped: Market Closed for {symbol} ({m_status})"
+        return f"⏭️ تم التخطي: السوق مغلق لـ {symbol} ({m_status})"
 
     # ── R:R ratio gate ────────────────────────────────────────────────────────
     if atr and entry_price > 0:
@@ -1285,7 +1292,14 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
     stop_level_capped, sl_adjusted = _cap_stop_to_max_distance(action, entry_price, stop_level, max_dist)
     if sl_adjusted:
         stop_level = stop_level_capped
-        sl_adjust_note = f"\nℹ️ Adjusted: SL too far → capped to broker max distance ({float(max_dist):.4f})."
+        if lang == "en":
+            sl_adjust_note = (
+                f"\nℹ️ Adjusted: SL too far → capped to broker max distance ({float(max_dist):.4f})."
+            )
+        else:
+            sl_adjust_note = (
+                f"\nℹ️ تم التعديل: وقف الخسارة بعيد جداً → تم تحديده عند الحد الأقصى المسموح من الوسيط ({float(max_dist):.4f})."
+            )
     stop_dist  = abs(entry_price - stop_level)
     if stop_dist <= 0:
         msg = f"❌ Order failed ({symbol} {action}): invalid stop distance"
@@ -1318,10 +1332,16 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
         md = float(min_dist)
         tp1_dist = abs(float(target1) - float(entry_price))
         if tp1_dist < md:
-            msg = (
-                f"⏭️ Trade skipped ({symbol} {action}): "
-                f"Target 1 distance too tight for broker rules (min={md:.4f}, got={tp1_dist:.4f})"
-            )
+            if lang == "en":
+                msg = (
+                    f"⏭️ Trade skipped ({symbol} {action}): "
+                    f"Target 1 distance too tight for broker rules (min={md:.4f}, got={tp1_dist:.4f})"
+                )
+            else:
+                msg = (
+                    f"⏭️ تم التخطي ({symbol} {action}): "
+                    f"مسافة الهدف الأول صغيرة جداً حسب شروط الوسيط (الحد الأدنى={md:.4f}، الحالي={tp1_dist:.4f})"
+                )
             print(msg)
             return msg
         tp2_dist = abs(float(target2) - float(entry_price))
@@ -1342,7 +1362,10 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
     qty_total = float(int(round(float(size))))
     ok_split, qty1, qty2, split_err = _split_qty_70_30(qty_total=qty_total, min_deal_size=min_deal_size)
     if not ok_split:
-        msg = f"❌ Order blocked ({symbol} {action}): {split_err}"
+        if lang == "en":
+            msg = f"❌ Order blocked ({symbol} {action}): {split_err}"
+        else:
+            msg = f"❌ تم منع الأمر ({symbol} {action}): {split_err}"
         print(msg)
         return msg
 
