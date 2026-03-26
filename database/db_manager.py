@@ -73,6 +73,9 @@ def create_db():
         ('stop_distance', "REAL"),
         # Capital order reference (useful for matching history after close).
         ('deal_reference', "TEXT"),
+        # UX: if a position is closed manually on the platform, broker history can lag.
+        # We send one "pending sync" notification and then wait for realized P&L.
+        ('close_sync_notified', "INTEGER DEFAULT 0"),
         # Final broker-truth fields (synced from Capital.com history after close).
         # `pnl` remains for backward compatibility (reports/analytics) and is set to `actual_pnl`.
         ('actual_pnl', 'REAL'),

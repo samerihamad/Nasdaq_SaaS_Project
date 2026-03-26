@@ -19,13 +19,14 @@ import re
 import time
 from datetime import datetime as _dt
 
+from bot.notifier import send_telegram_message
 from core.trade_session_finalize import after_trade_leg_closed
 from core.trade_close_messages import (
     send_reconcile_generic_external,
     send_reconcile_tp1_hit,
     send_reconcile_tp2_final,
 )
-from database.db_manager import is_maintenance_mode
+from database.db_manager import is_maintenance_mode, get_subscriber_lang
 
 DB_PATH = 'database/trading_saas.db'
 
@@ -195,7 +196,8 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
     # Fetch locally tracked open trades
     c.execute(
         "SELECT trade_id, deal_id, COALESCE(deal_reference,''), symbol, direction, entry_price, size, "
-        "COALESCE(leg_role,''), COALESCE(parent_session,''), stop_distance, trailing_stop "
+        "COALESCE(leg_role,''), COALESCE(parent_session,''), stop_distance, trailing_stop, "
+        "COALESCE(close_sync_notified,0) "
         "FROM trades WHERE chat_id=? AND status='OPEN'",
         (chat_id,),
     )
@@ -204,7 +206,7 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
     # so TP1 is CLOSED in DB before TP2 final aggregates P&L.
     # local_open tuple layout:
     # (trade_id, deal_id, deal_reference, symbol, direction, entry_price, size,
-    #  leg_role, parent_session, stop_distance, trailing_stop)
+    #  leg_role, parent_session, stop_distance, trailing_stop, close_sync_notified)
     # NOTE: `size` (r[6]) is numeric and must NEVER be `.strip()`'d.
     local_open = sorted(
         local_open,
@@ -228,6 +230,7 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
         parent_session,
         stop_distance,
         trailing_stop,
+        close_sync_notified,
     ) in local_open:
         if deal_id and str(deal_id) not in live_deal_ids:
             # Broker realizedPnL can be delayed right after a manual close.
@@ -242,6 +245,37 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
                 identifiers=[dr] if dr else None,
             )
             if not final:
+                # UX: confirm the bot detected the close even if broker history lags.
+                # Send once per trade_id to avoid spamming.
+                try:
+                    if (
+                        not is_maintenance_mode()
+                        and notify
+                        and int(close_sync_notified or 0) == 0
+                    ):
+                        lang = get_subscriber_lang(chat_id)
+                        if lang == "en":
+                            msg = (
+                                "⏳ *Trade closed on platform*\n\n"
+                                f"📌 Asset: *{symbol}* ({direction})\n"
+                                f"🆔 Trade ID: *{int(trade_id)}*\n"
+                                "Syncing final P&L from Capital.com history…"
+                            )
+                        else:
+                            msg = (
+                                "⏳ *تم إغلاق الصفقة على المنصة*\n\n"
+                                f"📌 الأداة: *{symbol}* ({'شراء' if direction=='BUY' else 'بيع'})\n"
+                                f"🆔 رقم الصفقة: *{int(trade_id)}*\n"
+                                "جارٍ مزامنة الربح/الخسارة النهائية من سجل Capital.com…"
+                            )
+                        send_telegram_message(chat_id, msg)
+                        c.execute(
+                            "UPDATE trades SET close_sync_notified=1 WHERE trade_id=? AND status='OPEN'",
+                            (int(trade_id),),
+                        )
+                        conn.commit()
+                except Exception:
+                    pass
                 continue
 
             pnl = float(final["actual_pnl"])
