@@ -317,6 +317,62 @@ def _get_min_stop_profit_distance(base_url, headers, epic) -> float | None:
     return None
 
 
+def _get_max_stop_profit_distance(base_url, headers, epic) -> float | None:
+    """
+    Fetch broker maximum stop/profit distance for an epic (absolute price units).
+    Used to avoid: error.invalid.stoploss.maxvalue
+    Returns None if unavailable.
+    """
+    try:
+        res = requests.get(f"{base_url}/markets/{epic}", headers=headers, timeout=20)
+        if res.status_code != 200:
+            return None
+        data = res.json() or {}
+        rules = data.get("dealingRules", {}) or {}
+        candidates = (
+            "maxStopOrProfitDistance",
+            "maxStopOrLimitDistance",
+            "maxStopDistance",
+            "maxLimitDistance",
+        )
+        for k in candidates:
+            v = rules.get(k)
+            if isinstance(v, dict):
+                v = v.get("value")
+            if v is None:
+                continue
+            try:
+                f = float(v)
+                if f > 0:
+                    return f
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
+
+
+def _cap_stop_to_max_distance(
+    action: str,
+    entry_price: float,
+    stop_level: float,
+    max_dist: float | None,
+) -> tuple[float, bool]:
+    """
+    If broker enforces a maximum stop distance, cap stop to that distance.
+    Returns (new_stop_level, adjusted_flag).
+    """
+    if max_dist is None or max_dist <= 0 or entry_price <= 0:
+        return stop_level, False
+    d = abs(float(entry_price) - float(stop_level))
+    if d <= float(max_dist):
+        return stop_level, False
+    md = float(max_dist)
+    if action == "BUY":
+        return float(entry_price) - md, True
+    return float(entry_price) + md, True
+
+
 def _market_tradeability(base_url: str, headers: dict, epic: str) -> tuple[bool, str]:
     """
     Check if an instrument is currently tradable on Capital.com.
@@ -1106,6 +1162,19 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
     if is_maintenance_mode():
         return "🔧 System in maintenance — new entries suspended."
 
+    # ── Session Gatekeeper (UTC) — do not call broker outside window ─────────
+    try:
+        from utils.market_hours import is_within_us_cash_session_utc
+        ok_sess, sess_reason = is_within_us_cash_session_utc()
+    except Exception:
+        ok_sess, sess_reason = True, "OK"
+    if not ok_sess:
+        msg = f"⏭️ Skipped: Outside Market Hours ({sess_reason}) — {symbol}"
+        print(msg)
+        if not is_maintenance_mode():
+            send_telegram_message(chat_id, msg)
+        return msg
+
     # ── Circuit Breaker / Hard Block gate ─────────────────────────────────────
     allowed, reason = can_open_trade(chat_id)
     if not allowed:
@@ -1209,6 +1278,14 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
         initial_stop = stop_price
 
     stop_level = initial_stop if initial_stop is not None else stop_price
+
+    # ── Stop-loss max-distance cap (avoid invalid.stoploss.maxvalue) ─────────
+    sl_adjust_note = ""
+    max_dist = _get_max_stop_profit_distance(base_url, headers, order_epic)
+    stop_level_capped, sl_adjusted = _cap_stop_to_max_distance(action, entry_price, stop_level, max_dist)
+    if sl_adjusted:
+        stop_level = stop_level_capped
+        sl_adjust_note = f"\nℹ️ Adjusted: SL too far → capped to broker max distance ({float(max_dist):.4f})."
     stop_dist  = abs(entry_price - stop_level)
     if stop_dist <= 0:
         msg = f"❌ Order failed ({symbol} {action}): invalid stop distance"
@@ -1421,6 +1498,7 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             f"⚠️  Risk Amount  :  *{_fmt_money(risk_amount)}*\n"
             f"🕐  Time (ET)    :  {now_et_str}"
             f"{partial_note_en}"
+            f"{sl_adjust_note}"
         )
     else:
         override_line = "⚠️ تجاوز يدوي — جاري فتح صفقة جديدة\n\n" if is_override else ""
@@ -1440,6 +1518,7 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             f"⚠️  المخاطرة       :  *{_fmt_money(risk_amount)}*\n"
             f"🕐  التوقيت (ET)   :  {now_et_str}"
             f"{partial_note_ar}"
+            f"{sl_adjust_note}"
         )
 
     send_telegram_message(chat_id, msg)

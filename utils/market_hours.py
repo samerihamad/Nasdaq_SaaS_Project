@@ -205,3 +205,36 @@ def minutes_to_open() -> int:
         return 0
     delta = next_market_open() - _now_et()
     return max(0, int(delta.total_seconds() / 60))
+
+
+# ── Strict UTC session gatekeeper (requested) ─────────────────────────────────
+#
+# This is a hard safety guard for US equities execution:
+# - Do not even attempt broker API calls outside the UTC window below.
+# - Also enforce a "closing transition" cutoff to avoid POST_MARKET edge cases.
+
+US_CASH_UTC_OPEN = time(13, 30)     # 13:30 UTC
+US_CASH_UTC_CLOSE = time(20, 0)     # 20:00 UTC
+US_CASH_UTC_CUTOFF = time(19, 55)   # Do not send new orders at/after 19:55 UTC
+
+
+def utc_time_now() -> time:
+    """Current UTC wall-clock time (naive time object)."""
+    return datetime.now(timezone.utc).time()
+
+
+def is_within_us_cash_session_utc(now: datetime | None = None) -> tuple[bool, str]:
+    """
+    Strict guard: only allow trading between 13:30 and 20:00 UTC.
+    Stop-condition: block at/after 19:55 UTC.
+
+    Returns (allowed, reason_code).
+    """
+    n = now or datetime.now(timezone.utc)
+    t = n.time()
+
+    if t >= US_CASH_UTC_CUTOFF:
+        return False, "CUTOFF_19_55_UTC"
+    if US_CASH_UTC_OPEN <= t < US_CASH_UTC_CLOSE:
+        return True, "OK"
+    return False, "OUTSIDE_13_30_20_00_UTC"
