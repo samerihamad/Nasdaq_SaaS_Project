@@ -26,7 +26,7 @@ from core.trade_close_messages import (
     send_reconcile_tp1_hit,
     send_reconcile_tp2_final,
 )
-from database.db_manager import is_maintenance_mode, get_subscriber_lang
+from database.db_manager import get_subscriber_lang
 
 DB_PATH = 'database/trading_saas.db'
 ENABLE_CLOSE_PENDING_NOTIFY = (os.getenv("ENABLE_CLOSE_PENDING_NOTIFY", "false").strip().lower() == "true")

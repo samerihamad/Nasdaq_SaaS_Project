@@ -36,7 +36,6 @@ def _purge_db_files(project_root: Path, include_backups: bool) -> list[Path]:
         for p in project_root.glob(pat):
             if not p.is_file():
                 continue
-            # Keep virtualenv and dependency folders safe.
             skip_parts = {"venv", ".venv", "__pycache__", ".git"}
             if any(part in skip_parts for part in p.parts):
                 continue
@@ -81,10 +80,8 @@ def main() -> None:
     if len(removed) > 20:
         print(f" ... and {len(removed) - 20} more")
 
-    # Recreate all tables/columns from latest schema.
     create_db()
 
-    # Safety verification: schema must match expected trade sync fields.
     conn = sqlite3.connect(DB_PATH)
     cols = _table_columns(conn, "trades")
     conn.close()
