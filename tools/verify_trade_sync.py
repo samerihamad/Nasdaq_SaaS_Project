@@ -47,16 +47,20 @@ def main() -> None:
                 SUM(CASE WHEN actual_pnl IS NOT NULL THEN 1 ELSE 0 END) AS with_actual_pnl,
                 SUM(CASE WHEN exit_price IS NOT NULL THEN 1 ELSE 0 END) AS with_exit_price,
                 SUM(CASE WHEN close_reason IS NOT NULL AND TRIM(close_reason) != '' THEN 1 ELSE 0 END) AS with_close_reason,
-                SUM(CASE WHEN status='OPEN' AND COALESCE(close_sync_attempts,0) > 0 THEN 1 ELSE 0 END) AS open_pending_sync
+                SUM(CASE WHEN status='OPEN' AND COALESCE(close_sync_attempts,0) > 0 THEN 1 ELSE 0 END) AS open_pending_sync,
+                SUM(CASE WHEN status='CLOSED' AND COALESCE(sync_status,'')='PENDING_FINAL' THEN 1 ELSE 0 END) AS closed_pending_final,
+                SUM(CASE WHEN status='CLOSED' AND COALESCE(sync_status,'')='SYNCED' THEN 1 ELSE 0 END) AS closed_synced
             FROM trades
             """
         )
-        row = c.fetchone() or (0, 0, 0, 0, 0)
+        row = c.fetchone() or (0, 0, 0, 0, 0, 0, 0)
         print(f"closed_total          : {int(row[0] or 0)}")
         print(f"closed_with_actual_pnl: {int(row[1] or 0)}")
         print(f"closed_with_exit_price: {int(row[2] or 0)}")
         print(f"closed_with_reason    : {int(row[3] or 0)}")
         print(f"open_pending_sync     : {int(row[4] or 0)}")
+        print(f"closed_pending_final  : {int(row[5] or 0)}")
+        print(f"closed_synced         : {int(row[6] or 0)}")
 
     print("\n== Top pending sync trades (latest) ==")
     if {"deal_reference", "close_sync_attempts", "close_sync_last_try_at", "close_sync_last_error"} <= cols:
@@ -66,7 +70,8 @@ def main() -> None:
                 trade_id, chat_id, symbol, direction, deal_id, deal_reference,
                 close_sync_attempts, close_sync_last_try_at, close_sync_last_error
             FROM trades
-            WHERE status='OPEN' AND COALESCE(close_sync_attempts,0) > 0
+            WHERE (status='OPEN' AND COALESCE(close_sync_attempts,0) > 0)
+               OR (status='CLOSED' AND COALESCE(sync_status,'')='PENDING_FINAL')
             ORDER BY COALESCE(close_sync_attempts,0) DESC, trade_id DESC
             LIMIT 25
             """

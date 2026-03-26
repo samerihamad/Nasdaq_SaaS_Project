@@ -57,6 +57,8 @@ from config import (
     AI_SOFT_OVERRIDE_CONFIDENCE,
     AI_SOFT_OVERRIDE_MIN_PROB,
     ENABLE_STRUCTURAL_REJECTION_NOTIFY,
+    STRUCTURAL_REJECTION_NOTIFY_COOLDOWN_SEC,
+    STRUCTURAL_REJECTION_NOTIFY_MAX_PER_CYCLE,
 )
 
 # ── Single-instance lock ──────────────────────────────────────────────────────
@@ -103,6 +105,7 @@ _prev_market_status = None   # detect OPEN→CLOSED transition
 _closed_notified    = False  # sent "market closed" msg this session
 _last_watchlist_refresh_at = None  # UTC datetime of last in-session refresh
 _unsupported_all_day: set[str] = set()  # symbols unsupported for all users today
+_last_structural_rejection_sent_at: dict[str, float] = {}
 
 
 # ── Heartbeat & backup threads ────────────────────────────────────────────────
@@ -536,13 +539,28 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
         print(f"   [WATCHLIST PRUNE] {symbol} marked unsupported for all users today.")
 
 
-def _notify_structural_rejection(symbol: str, strategy: str, reason: str):
+def _notify_structural_rejection(symbol: str, strategy: str, reason: str) -> bool:
     if not ENABLE_STRUCTURAL_REJECTION_NOTIFY:
-        return
+        return False
     try:
         if ADMIN_CHAT_ID:
             lang = _get_user_lang(ADMIN_CHAT_ID)
             reason_l = (reason or "").lower()
+            if "no-trade zone" in reason_l:
+                bucket = "no_trade_zone"
+            elif "premium zone" in reason_l and "for buy" in reason_l:
+                bucket = "premium_buy_reject"
+            elif "discount zone" in reason_l and "for sell" in reason_l:
+                bucket = "discount_sell_reject"
+            else:
+                bucket = "generic_reject"
+
+            cooldown_key = f"{strategy}:{bucket}"
+            now_ts = time.time()
+            last_ts = _last_structural_rejection_sent_at.get(cooldown_key, 0.0)
+            if (now_ts - last_ts) < float(STRUCTURAL_REJECTION_NOTIFY_COOLDOWN_SEC):
+                return False
+
             ar_reason = reason
             if "no-trade zone" in reason_l:
                 ar_reason = "❌ تم الرفض: منطقة لا تداول (No-Trade Zone)."
@@ -568,8 +586,11 @@ def _notify_structural_rejection(symbol: str, strategy: str, reason: str):
                     f"Reason: {reason}"
                 )
             send_telegram_message(ADMIN_CHAT_ID, msg)
+            _last_structural_rejection_sent_at[cooldown_key] = now_ts
+            return True
     except Exception:
-        pass
+        return False
+    return False
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -739,13 +760,22 @@ def run_trading_bot():
             if not signals:
                 print("   [SCAN] No signals found this cycle.")
             else:
+                rej_sent = 0
+                rej_suppressed = 0
                 for sig in sorted(signals, key=lambda r: float(r.get("confidence", 0)), reverse=True):
                     symbol = sig["symbol"]
                     if sig.get("rejected"):
                         rej_reason = str(sig.get("reason", "Rejected by market structure filter"))
                         rej_strategy = str(sig.get("strategy_label", "Unknown"))
                         print(f"   [{symbol}] REJECTED | strategy={rej_strategy} | {rej_reason}")
-                        _notify_structural_rejection(symbol, rej_strategy, rej_reason)
+                        if rej_sent < int(STRUCTURAL_REJECTION_NOTIFY_MAX_PER_CYCLE):
+                            did_send = _notify_structural_rejection(symbol, rej_strategy, rej_reason)
+                            if did_send:
+                                rej_sent += 1
+                            else:
+                                rej_suppressed += 1
+                        else:
+                            rej_suppressed += 1
                         continue
 
                     best_action = sig["action"]
@@ -765,6 +795,21 @@ def run_trading_bot():
                         timeframes=timeframes, stop_loss_pct=best_sl_pct,
                         strategy_label=best_label,
                     )
+                if rej_suppressed > 0 and ADMIN_CHAT_ID and ENABLE_STRUCTURAL_REJECTION_NOTIFY:
+                    try:
+                        lang = _get_user_lang(ADMIN_CHAT_ID)
+                        if lang == "ar":
+                            send_telegram_message(
+                                ADMIN_CHAT_ID,
+                                f"ℹ️ تم كتم {rej_suppressed} إشعار رفض هيكلي متكرر في هذه الدورة لتقليل الإزعاج.",
+                            )
+                        else:
+                            send_telegram_message(
+                                ADMIN_CHAT_ID,
+                                f"ℹ️ Suppressed {rej_suppressed} repeated structural rejection alerts in this cycle.",
+                            )
+                    except Exception:
+                        pass
 
         except Exception as e:
             print(f"❌ خطأ في المحرك الرئيسي: {e}")

@@ -27,6 +27,7 @@ from core.trailing_stop import (
 )
 from core.sync import reconcile
 from core.sync import fetch_closed_deal_final_data
+from core.sync import mark_trade_closed_pending
 from core.trade_close_messages import (
     send_bot_automated_close,
     count_open_sibling_same_session,
@@ -1100,7 +1101,16 @@ def monitor_and_close(chat_id):
                 )
                 if not final:
                     # fetch_closed_deal_final_data already logged the root cause details.
-                    # Leave DB row OPEN; reconcile() will retry next cycle.
+                    # Mark CLOSED pending immediately to avoid ghost OPEN trades.
+                    mark_trade_closed_pending(
+                        chat_id,
+                        int(trade['trade_id']),
+                        symbol=symbol,
+                        direction=direction,
+                        deal_reference=str(deal_ref).strip() if deal_ref else None,
+                        reason="transaction_not_found_or_not_realized",
+                        notify=True,
+                    )
                     continue
 
                 actual_pnl = float(final["actual_pnl"])

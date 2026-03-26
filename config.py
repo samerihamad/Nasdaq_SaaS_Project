@@ -116,6 +116,12 @@ LIQUIDITY_OPENING_RANGE_BARS = int(os.getenv("LIQUIDITY_OPENING_RANGE_BARS", "4"
 
 # Send Telegram notice when a setup is rejected by market-structure filters.
 ENABLE_STRUCTURAL_REJECTION_NOTIFY = os.getenv("ENABLE_STRUCTURAL_REJECTION_NOTIFY", "true").lower() == "true"
+STRUCTURAL_REJECTION_NOTIFY_COOLDOWN_SEC = int(os.getenv("STRUCTURAL_REJECTION_NOTIFY_COOLDOWN_SEC", "1800"))
+STRUCTURAL_REJECTION_NOTIFY_MAX_PER_CYCLE = int(os.getenv("STRUCTURAL_REJECTION_NOTIFY_MAX_PER_CYCLE", "5"))
+
+# If broker history never returns final realized PnL, send a terminal close
+# notification and stop retrying forever.
+FINAL_SYNC_FALLBACK_ENABLED = os.getenv("FINAL_SYNC_FALLBACK_ENABLED", "true").lower() == "true"
 
 # Hard cap on new positions per user per day (independent of circuit breaker)
 MAX_DAILY_TRADES     = 5
