@@ -673,20 +673,21 @@ def _confirm_deal_and_visibility(
     Resolve a real dealId (via /confirms when needed) and ensure the position
     exists on the broker (list, GET-by-id, or epic/size match).
 
-    Returns (ok, deal_id, error_message).
+    Returns (ok, deal_id, deal_reference, error_message).
     """
     if not isinstance(order_response, dict):
-        return False, "", "Invalid order response"
+        return False, "", "", "Invalid order response"
 
     ec = order_response.get("errorCode")
     if ec:
-        return False, "", f"{ec}: {str(order_response.get('message', ''))[:200]}"
+        return False, "", "", f"{ec}: {str(order_response.get('message', ''))[:200]}"
 
     import time as _time
 
     deadline = _time.time() + timeout_sec
     deal_id = order_response.get("dealId")
     deal_ref = order_response.get("dealReference")
+    deal_ref_str = str(deal_ref).strip() if deal_ref is not None else ""
 
     def _visible(did: str) -> bool:
         if not did:
@@ -699,7 +700,7 @@ def _confirm_deal_and_visibility(
         deal_id = str(deal_id)
         while _time.time() < deadline:
             if _visible(deal_id):
-                return True, deal_id, ""
+                return True, deal_id, deal_ref_str, ""
             _time.sleep(0.45)
 
     # Poll /confirms for dealReference until we get dealId or rejection.
@@ -714,13 +715,14 @@ def _confirm_deal_and_visibility(
                     return (
                         False,
                         "",
+                        deal_ref_str,
                         f"{data.get('errorCode')}: {str(data.get('message', ''))[:160]}",
                     )
                 did = data.get("dealId")
                 if did:
                     deal_id = str(did)
                     if _visible(deal_id):
-                        return True, deal_id, ""
+                        return True, deal_id, deal_ref_str, ""
                 st = str(
                     data.get("dealStatus") or data.get("status") or ""
                 ).upper()
@@ -739,13 +741,13 @@ def _confirm_deal_and_visibility(
                     err = f"deal rejected ({st})"
                     if msg:
                         err += f": {msg[:200]}"
-                    return False, "", err
+                    return False, "", deal_ref_str, err
         except Exception:
             pass
         _time.sleep(0.45)
 
     if deal_id and _visible(str(deal_id)):
-        return True, str(deal_id), ""
+        return True, str(deal_id), deal_ref_str, ""
 
     # Epic + direction + size (single match) when list/API lags after a 200 POST.
     if order_epic and direction and leg_size is not None:
@@ -762,11 +764,12 @@ def _confirm_deal_and_visibility(
                 print(
                     f"[VERIFY] Using epic/size match dealId={alt} (POST had {deal_id})"
                 )
-            return True, str(alt), ""
+            return True, str(alt), deal_ref_str, ""
 
     return (
         False,
         "",
+        deal_ref_str,
         "Could not verify an open position on the broker (check demo vs live account, "
         "or that the instrument is enabled).",
     )
@@ -1421,7 +1424,7 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
                 break
 
             payload = out if isinstance(out, dict) else {}
-            ok_deal, deal_id, cerr = _confirm_deal_and_visibility(
+            ok_deal, deal_id, deal_ref, cerr = _confirm_deal_and_visibility(
                 base_url,
                 headers,
                 payload,
@@ -1440,7 +1443,7 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
                     "size": float(leg_size),
                     "tp": float(leg_target),
                     "deal_id": str(deal_id),
-                    "deal_reference": str(payload.get("dealReference") or payload.get("deal_ref") or "").strip() or None,
+                    "deal_reference": (str(deal_ref).strip() if deal_ref else None),
                 }
             )
             ok_sync, info = _sync_protection_to_broker(
