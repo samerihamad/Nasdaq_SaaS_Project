@@ -56,6 +56,7 @@ from config import (
     AI_MIN_PROB_MEANREV,
     AI_SOFT_OVERRIDE_CONFIDENCE,
     AI_SOFT_OVERRIDE_MIN_PROB,
+    ENABLE_STRUCTURAL_REJECTION_NOTIFY,
 )
 
 # ── Single-instance lock ──────────────────────────────────────────────────────
@@ -535,6 +536,42 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
         print(f"   [WATCHLIST PRUNE] {symbol} marked unsupported for all users today.")
 
 
+def _notify_structural_rejection(symbol: str, strategy: str, reason: str):
+    if not ENABLE_STRUCTURAL_REJECTION_NOTIFY:
+        return
+    try:
+        if ADMIN_CHAT_ID:
+            lang = _get_user_lang(ADMIN_CHAT_ID)
+            reason_l = (reason or "").lower()
+            ar_reason = reason
+            if "no-trade zone" in reason_l:
+                ar_reason = "❌ تم الرفض: منطقة لا تداول (No-Trade Zone)."
+            elif "premium zone" in reason_l and "for buy" in reason_l:
+                ar_reason = "❌ تم رفض الصفقة: السعر في منطقة غالية (Premium Zone) وإشارة الشراء غير مسموحة."
+            elif "discount zone" in reason_l and "for sell" in reason_l:
+                ar_reason = "❌ تم رفض الصفقة: السعر في منطقة مخفضة (Discount Zone) وإشارة البيع غير مسموحة."
+            elif "rejected:" in reason_l:
+                ar_reason = f"❌ تم رفض الصفقة: {reason.replace('Rejected: ', '').strip()}"
+
+            if lang == "ar":
+                msg = (
+                    "⛔ رفض فلتر الهيكل السوقي\n"
+                    f"الرمز: {symbol}\n"
+                    f"الاستراتيجية: {strategy}\n"
+                    f"السبب: {ar_reason}"
+                )
+            else:
+                msg = (
+                    "⛔ Structural Filter Rejection\n"
+                    f"Symbol: {symbol}\n"
+                    f"Strategy: {strategy}\n"
+                    f"Reason: {reason}"
+                )
+            send_telegram_message(ADMIN_CHAT_ID, msg)
+    except Exception:
+        pass
+
+
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def run_trading_bot():
@@ -704,6 +741,13 @@ def run_trading_bot():
             else:
                 for sig in sorted(signals, key=lambda r: float(r.get("confidence", 0)), reverse=True):
                     symbol = sig["symbol"]
+                    if sig.get("rejected"):
+                        rej_reason = str(sig.get("reason", "Rejected by market structure filter"))
+                        rej_strategy = str(sig.get("strategy_label", "Unknown"))
+                        print(f"   [{symbol}] REJECTED | strategy={rej_strategy} | {rej_reason}")
+                        _notify_structural_rejection(symbol, rej_strategy, rej_reason)
+                        continue
+
                     best_action = sig["action"]
                     best_conf = float(sig["confidence"])
                     best_label = sig["strategy_label"]

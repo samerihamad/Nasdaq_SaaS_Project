@@ -99,6 +99,24 @@ BE_LOCK_BUFFER_PCT = 0.0005  # 0.05% beyond entry (per direction)
 # Signals with confidence below this are discarded before risk checks
 MIN_CONFIDENCE       = 55.0
 
+# ── Sprint 1: Market Structure Foundation flags ───────────────────────────────
+# Toggle these filters without changing strategy code.
+ENABLE_MARKET_STRUCTURE_FILTERS = os.getenv("ENABLE_MARKET_STRUCTURE_FILTERS", "false").lower() == "true"
+ENABLE_PREMIUM_DISCOUNT_FILTER = os.getenv("ENABLE_PREMIUM_DISCOUNT_FILTER", "false").lower() == "true"
+ENABLE_LIQUIDITY_MAP_FILTER = os.getenv("ENABLE_LIQUIDITY_MAP_FILTER", "false").lower() == "true"
+
+# Reject setups around HTF equilibrium ("no man's land").
+MARKET_STRUCTURE_NO_TRADE_ZONE_PCT = float(os.getenv("MARKET_STRUCTURE_NO_TRADE_ZONE_PCT", "0.10"))
+
+# 4H candles used to build HTF range and premium/discount context.
+MARKET_STRUCTURE_HTF_LOOKBACK = int(os.getenv("MARKET_STRUCTURE_HTF_LOOKBACK", "60"))
+
+# First N 15m candles used for opening-range liquidity levels.
+LIQUIDITY_OPENING_RANGE_BARS = int(os.getenv("LIQUIDITY_OPENING_RANGE_BARS", "4"))
+
+# Send Telegram notice when a setup is rejected by market-structure filters.
+ENABLE_STRUCTURAL_REJECTION_NOTIFY = os.getenv("ENABLE_STRUCTURAL_REJECTION_NOTIFY", "true").lower() == "true"
+
 # Hard cap on new positions per user per day (independent of circuit breaker)
 MAX_DAILY_TRADES     = 5
 

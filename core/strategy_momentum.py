@@ -40,6 +40,19 @@ from config import (
     NEWS_API_KEY,
     NEWS_LOOKBACK_HOURS,
     NEWS_QUALITY_SCORE,
+    ENABLE_MARKET_STRUCTURE_FILTERS,
+    ENABLE_PREMIUM_DISCOUNT_FILTER,
+    ENABLE_LIQUIDITY_MAP_FILTER,
+    MARKET_STRUCTURE_NO_TRADE_ZONE_PCT,
+    MARKET_STRUCTURE_HTF_LOOKBACK,
+    LIQUIDITY_OPENING_RANGE_BARS,
+)
+from core.market_structure import (
+    compute_htf_range,
+    allow_direction_by_pd,
+    in_no_trade_zone,
+    build_liquidity_map,
+    liquidity_sweep_score,
 )
 
 log = logging.getLogger(__name__)
@@ -257,6 +270,7 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
     None  if no valid signal found
     """
     df_1d  = _flatten(timeframes.get("1d",  pd.DataFrame()))
+    df_4h  = _flatten(timeframes.get("4h",  pd.DataFrame()))
     df_15m = _flatten(timeframes.get("15m", pd.DataFrame()))
 
     if df_15m.empty or len(df_15m) < 30:
@@ -280,6 +294,27 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
         direction = "BUY"
     else:
         direction = "SELL"
+
+    close_val = float(close_15m.iloc[-1])
+
+    # ── Sprint 1: Market structure gates (feature-flagged) ──────────────────
+    htf = None
+    liq = None
+    if ENABLE_MARKET_STRUCTURE_FILTERS:
+        htf = compute_htf_range(df_4h, close_val, lookback=MARKET_STRUCTURE_HTF_LOOKBACK)
+        if htf and in_no_trade_zone(close_val, htf, width_pct=MARKET_STRUCTURE_NO_TRADE_ZONE_PCT):
+            rej = f"Rejected: No-Trade Zone | zone={htf.zone} eq={htf.eq:.2f} close={close_val:.2f}"
+            log.info("[Momentum %s] %s", symbol, rej)
+            return {"rejected": True, "strategy": "Momentum", "reason": rej}
+
+        if ENABLE_PREMIUM_DISCOUNT_FILTER and not allow_direction_by_pd(direction, htf):
+            zone = htf.zone if htf else "unknown"
+            rej = f"Rejected: Price in {zone.title()} Zone for {direction}"
+            log.info("[Momentum %s] %s", symbol, rej)
+            return {"rejected": True, "strategy": "Momentum", "reason": rej}
+
+        if ENABLE_LIQUIDITY_MAP_FILTER:
+            liq = build_liquidity_map(df_1d, df_15m, opening_bars=LIQUIDITY_OPENING_RANGE_BARS)
 
     # ── MACD crossover ────────────────────────────────────────────────────────
     macd_line, signal_line = _macd(close_15m)
@@ -333,6 +368,26 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
         score  += news_pts
         reasons.append(f"News (+{news_pts})")
 
+    # 7. Structural liquidity confluence (up to 10 pts)
+    if ENABLE_MARKET_STRUCTURE_FILTERS and ENABLE_LIQUIDITY_MAP_FILTER and liq is not None:
+        liq_pts = liquidity_sweep_score(direction, close_val, liq)
+        if liq_pts > 0:
+            score += liq_pts
+            reasons.append(f"LiqMap (+{liq_pts})")
+
+    if ENABLE_MARKET_STRUCTURE_FILTERS and htf is not None:
+        reasons.append(
+            f"MS zone={htf.zone} range=[{htf.low:.2f}-{htf.high:.2f}] eq={htf.eq:.2f}"
+        )
+        if ENABLE_LIQUIDITY_MAP_FILTER and liq is not None:
+            reasons.append(
+                "LiqLvls "
+                f"PDH={liq.pdh if liq.pdh is not None else 'NA'} "
+                f"PDL={liq.pdl if liq.pdl is not None else 'NA'} "
+                f"ORH={liq.orh if liq.orh is not None else 'NA'} "
+                f"ORL={liq.orl if liq.orl is not None else 'NA'}"
+            )
+
     log.info(
         "[Momentum %s] %s | score=%d | %s",
         symbol, direction, score, " | ".join(reasons),
@@ -348,7 +403,6 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
 
     # Estimate stop distance from recent ATR proxy (15m range)
     avg_range   = float((df_15m["High"] - df_15m["Low"]).tail(14).mean())
-    close_val   = float(close_15m.iloc[-1])
     stop_pct    = round(avg_range / close_val, 4) if close_val > 0 else 0.01
     stop_pct    = max(0.005, min(0.05, stop_pct))
 

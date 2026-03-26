@@ -33,6 +33,19 @@ from config import (
     MR_NEWS_TRAP_GAP_PCT,
     MR_SWEEP_LOOKBACK,
     MR_MIN_SCORE,
+    ENABLE_MARKET_STRUCTURE_FILTERS,
+    ENABLE_PREMIUM_DISCOUNT_FILTER,
+    ENABLE_LIQUIDITY_MAP_FILTER,
+    MARKET_STRUCTURE_NO_TRADE_ZONE_PCT,
+    MARKET_STRUCTURE_HTF_LOOKBACK,
+    LIQUIDITY_OPENING_RANGE_BARS,
+)
+from core.market_structure import (
+    compute_htf_range,
+    allow_direction_by_pd,
+    in_no_trade_zone,
+    build_liquidity_map,
+    liquidity_sweep_score,
 )
 
 log = logging.getLogger(__name__)
@@ -271,6 +284,25 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
         log.debug("[MeanRev %s] RSI %.1f — no extreme; skip", symbol, rsi_val)
         return None
 
+    # ── Sprint 1: Market structure gates (feature-flagged) ──────────────────
+    htf = None
+    liq = None
+    if ENABLE_MARKET_STRUCTURE_FILTERS:
+        htf = compute_htf_range(df_4h, close_val, lookback=MARKET_STRUCTURE_HTF_LOOKBACK)
+        if htf and in_no_trade_zone(close_val, htf, width_pct=MARKET_STRUCTURE_NO_TRADE_ZONE_PCT):
+            rej = f"Rejected: No-Trade Zone | zone={htf.zone} eq={htf.eq:.2f} close={close_val:.2f}"
+            log.info("[MeanRev %s] %s", symbol, rej)
+            return {"rejected": True, "strategy": "MeanRev", "reason": rej}
+
+        if ENABLE_PREMIUM_DISCOUNT_FILTER and not allow_direction_by_pd(direction, htf):
+            zone = htf.zone if htf else "unknown"
+            rej = f"Rejected: Price in {zone.title()} Zone for {direction}"
+            log.info("[MeanRev %s] %s", symbol, rej)
+            return {"rejected": True, "strategy": "MeanRev", "reason": rej}
+
+        if ENABLE_LIQUIDITY_MAP_FILTER:
+            liq = build_liquidity_map(df_1d, df_15m, opening_bars=LIQUIDITY_OPENING_RANGE_BARS)
+
     # ── News Trap filter ──────────────────────────────────────────────────────
     if _news_trap(df_15m):
         log.info("[MeanRev %s] News Trap detected — signal skipped", symbol)
@@ -340,6 +372,26 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
     if _check_1d_alignment(df_1d, direction):
         score += 10
         reasons.append("1D_align (+10)")
+
+    # 7. Structural liquidity confluence (up to 10 pts)
+    if ENABLE_MARKET_STRUCTURE_FILTERS and ENABLE_LIQUIDITY_MAP_FILTER and liq is not None:
+        liq_pts = liquidity_sweep_score(direction, close_val, liq)
+        if liq_pts > 0:
+            score += liq_pts
+            reasons.append(f"LiqMap (+{liq_pts})")
+
+    if ENABLE_MARKET_STRUCTURE_FILTERS and htf is not None:
+        reasons.append(
+            f"MS zone={htf.zone} range=[{htf.low:.2f}-{htf.high:.2f}] eq={htf.eq:.2f}"
+        )
+        if ENABLE_LIQUIDITY_MAP_FILTER and liq is not None:
+            reasons.append(
+                "LiqLvls "
+                f"PDH={liq.pdh if liq.pdh is not None else 'NA'} "
+                f"PDL={liq.pdl if liq.pdl is not None else 'NA'} "
+                f"ORH={liq.orh if liq.orh is not None else 'NA'} "
+                f"ORL={liq.orl if liq.orl is not None else 'NA'}"
+            )
 
     log.info(
         "[MeanRev %s] %s | score=%d | %s",

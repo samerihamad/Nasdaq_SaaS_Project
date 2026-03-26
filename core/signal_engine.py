@@ -90,11 +90,19 @@ def _analyze_ticker(symbol: str) -> dict | None:
         return None
 
     signals = []
+    structural_rejections = []
 
     # Mean Reversion
     try:
         sig = analyze_meanrev(symbol, timeframes)
-        if sig:
+        if sig and sig.get("rejected"):
+            structural_rejections.append({
+                "symbol": symbol,
+                "strategy": sig.get("strategy", "MeanRev"),
+                "reason": sig.get("reason", "Rejected by market structure filter"),
+                "rejected": True,
+            })
+        elif sig:
             signals.append(sig)
     except Exception as exc:
         log.error("[%s] MeanRev error: %s", symbol, exc)
@@ -102,12 +110,26 @@ def _analyze_ticker(symbol: str) -> dict | None:
     # Momentum
     try:
         sig = analyze_momentum(symbol, timeframes)
-        if sig:
+        if sig and sig.get("rejected"):
+            structural_rejections.append({
+                "symbol": symbol,
+                "strategy": sig.get("strategy", "Momentum"),
+                "reason": sig.get("reason", "Rejected by market structure filter"),
+                "rejected": True,
+            })
+        elif sig:
             signals.append(sig)
     except Exception as exc:
         log.error("[%s] Momentum error: %s", symbol, exc)
 
     if not signals:
+        if structural_rejections:
+            best_rej = structural_rejections[0]
+            log.info(
+                "[%s] %s rejected by structure: %s",
+                symbol, best_rej["strategy"], best_rej["reason"],
+            )
+            return best_rej
         return None
 
     # Pick the signal with the highest score; filter by confidence
@@ -291,7 +313,15 @@ def scan_watchlist_parallel(
                 raw_confs.append(float((mr or {}).get("confidence", 0)))
             except Exception:
                 pass
-            if mr and float(mr.get("confidence", 0)) >= float(min_confidence):
+            if mr and mr.get("rejected"):
+                candidates.append((
+                    "__REJECTED__",
+                    -1.0,
+                    str(mr.get("strategy", "MeanRev")),
+                    str(mr.get("reason", "Rejected by market structure filter")),
+                    None,
+                ))
+            elif mr and float(mr.get("confidence", 0)) >= float(min_confidence):
                 candidates.append((
                     str(mr["action"]),
                     float(mr["confidence"]),
@@ -309,7 +339,15 @@ def scan_watchlist_parallel(
                 raw_confs.append(float((mo or {}).get("confidence", 0)))
             except Exception:
                 pass
-            if mo and float(mo.get("confidence", 0)) >= float(min_confidence):
+            if mo and mo.get("rejected"):
+                candidates.append((
+                    "__REJECTED__",
+                    -1.0,
+                    str(mo.get("strategy", "Momentum")),
+                    str(mo.get("reason", "Rejected by market structure filter")),
+                    None,
+                ))
+            elif mo and float(mo.get("confidence", 0)) >= float(min_confidence):
                 candidates.append((
                     str(mo["action"]),
                     float(mo["confidence"]),
@@ -325,8 +363,22 @@ def scan_watchlist_parallel(
             print(f"[NO SIGNAL] {symbol} | best_conf={best_conf:.1f}")
             return None
 
+        accepted = [c for c in candidates if c[0] != "__REJECTED__"]
+        if not accepted:
+            _, _, rej_label, rej_reason, _ = candidates[0]
+            return {
+                "symbol": symbol,
+                "action": None,
+                "confidence": 0.0,
+                "strategy_label": rej_label,
+                "reason": rej_reason,
+                "stop_loss_pct": None,
+                "timeframes": timeframes,
+                "rejected": True,
+            }
+
         best_action, best_conf, best_label, best_reason, best_sl_pct = max(
-            candidates, key=lambda x: x[1]
+            accepted, key=lambda x: x[1]
         )
         print(f"[CANDIDATES] {symbol} | count={len(candidates)} | best_conf={best_conf:.1f}")
 
