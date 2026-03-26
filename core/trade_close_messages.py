@@ -127,8 +127,7 @@ def send_reconcile_tp1_hit(
         )
         if tp2_still_open:
             body += (
-                "⏳ *TP2 (1.5%)* is still open — waiting for the trailing phase "
-                "or stop management.\n"
+                "⏳ *TP2 (2.5%)* is still open — managed as a separate leg.\n"
             )
         else:
             body += "ℹ️ No second leg tracked as open.\n"
@@ -147,7 +146,7 @@ def send_reconcile_tp1_hit(
         )
         if tp2_still_open:
             body += (
-                "⏳ *الهدف الثاني (1.5%)* لا يزال مفتوحاً — ننتظر تفعيل التريلينج أو إدارة الوقف.\n"
+                "⏳ *الهدف الثاني (2.5%)* لا يزال مفتوحاً — يُدار كحد منفصل.\n"
             )
         else:
             body += "ℹ️ لا يوجد حد ثاني مسجّل كمفتوح.\n"
@@ -187,12 +186,12 @@ def send_reconcile_tp2_final(
             + f"🔢 *Total quantity*: *{int(total_qty)}* shares\n"
             + f"━━━━━━━━━━━━━━━━━━━━\n"
             + f"💰 *TP1 (1R) P&L*  : *{_fmt_money_signed(tp1_pnl)}*\n"
-            + f"💰 *TP2 (1.5%) P&L*: *{_fmt_money_signed(tp2_pnl)}*\n"
+            + f"💰 *TP2 (2.5%) P&L*: *{_fmt_money_signed(tp2_pnl)}*\n"
             + f"━━━━━━━━━━━━━━━━━━━━\n"
             + f"*Final Realized P&L*: *{_fmt_money_signed(total_pnl)}*\n"
             + f"🎯 *R*             : *{_fmt_r(total_r)}*\n"
             + f"━━━━━━━━━━━━━━━━━━━━\n"
-            + f"📍 *Target*        : *Target 2 / Trailing Stop*\n"
+            + f"📍 *Target*        : *Target 2 Hit*\n"
         )
     else:
         title = _outcome_title_ar(total_pnl, partial=False)
@@ -210,7 +209,7 @@ def send_reconcile_tp2_final(
             + f"*Total P&L*            : *{_fmt_money_signed(total_pnl)}*\n"
             + f"🎯 *R*                  : *{_fmt_r(total_r)}*\n"
             + f"━━━━━━━━━━━━━━━━━━━━\n"
-            + f"_القيم محسوبة من بيانات المنصة حيث توفرت._\n"
+            + f"📍 *النتيجة*            : *تحقق الهدف الثاني (2.5%)*\n"
         )
 
     send_telegram_message(chat_id, body)
@@ -326,11 +325,13 @@ def send_bot_automated_close(
             + f"━━━━━━━━━━━━━━━━━━━━\n"
             + f"▶️ *الاتجاه*    : *{_dir_ar(direction)}*\n"
             + f"💰 *سعر الدخول*: *${entry_price:,.2f}*\n"
+            + (f"🏁 *سعر الخروج*: *${exit_price:,.2f}*\n" if exit_price is not None else "")
             + f"🔢 *كمية الحد* : *{int(size)}* سهم\n"
             + f"📍 *السبب*     : _{stop_label}_\n"
             + f"━━━━━━━━━━━━━━━━━━━━\n"
-            + f"*Total P&L*    : *{_fmt_money_signed(pnl)}*\n"
+            + f"*الربح/الخسارة النهائي*: *{_fmt_money_signed(pnl)}*\n"
             + f"🎯 *R*         : *{_fmt_r(r_mult)}*\n"
+            + (f"📍 *الهدف*     : *{target_reached}*\n" if target_reached else "")
         )
         if sibling_tp2_open and leg_role == "TP1":
             body += (
