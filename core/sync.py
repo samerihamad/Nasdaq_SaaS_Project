@@ -214,6 +214,26 @@ def fetch_closed_deal_final_data(
     seen = set()
     ids = [x for x in ids if not (x in seen or seen.add(x))]
 
+    def _norm_id(v) -> str:
+        if v is None:
+            return ""
+        return re.sub(r"[^a-zA-Z0-9]", "", str(v)).lower()
+
+    def _id_match(a, b) -> bool:
+        na = _norm_id(a)
+        nb = _norm_id(b)
+        if not na or not nb:
+            return False
+        if na == nb:
+            return True
+        # Capital may return shorter/alternate formatted references in history.
+        # Accept suffix matches when enough entropy exists.
+        if len(na) >= 8 and nb.endswith(na):
+            return True
+        if len(nb) >= 8 and na.endswith(nb):
+            return True
+        return False
+
     for attempt in range(attempts):
         ok, txs, st, info = _fetch({"dealId": str(deal_id)})
         if not ok:
@@ -237,10 +257,10 @@ def fetch_closed_deal_final_data(
             match = False
             for x in ids:
                 if (
-                    str(tx_deal) == x
-                    or str(tx_ref) == x
-                    or str(tx_related) == x
-                    or str(tx_reference) == x
+                    _id_match(tx_deal, x)
+                    or _id_match(tx_ref, x)
+                    or _id_match(tx_related, x)
+                    or _id_match(tx_reference, x)
                 ):
                     match = True
                     break
@@ -385,7 +405,8 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
                     direction=direction,
                     deal_reference=dr,
                     reason="transaction_not_found_or_not_realized",
-                    notify=notify,
+                    # Close events are critical and must always notify.
+                    notify=True,
                 )
                 continue
 
@@ -422,8 +443,7 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
             #
             # NOTE: Even in maintenance mode we still send close notifications,
             # because maintenance should block NEW entries, not hide trade exits.
-            if not notify:
-                continue
+            # Close notifications are mandatory; do not silence with notify=False.
 
             ep = float(entry_price or 0)
             sz = float(size or 0)
@@ -627,8 +647,7 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
         pnl_f = float(pnl)
         after_trade_leg_closed(chat_id, ps, pnl_f)
 
-        if not notify:
-            continue
+        # Close notifications are mandatory; do not silence with notify=False.
         ep = float(entry_price or 0)
         sz = float(size or 0)
         ts = float(trailing_stop) if trailing_stop is not None else None

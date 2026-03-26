@@ -139,6 +139,19 @@ def create_db():
         except Exception:
             pass
 
+    # ── Expected rejection audit log (non-user-facing) ───────────────────────
+    c.execute(
+        '''CREATE TABLE IF NOT EXISTS trade_rejections
+           (id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT,
+            chat_id    TEXT,
+            symbol     TEXT,
+            action     TEXT,
+            stage      TEXT,
+            reason     TEXT,
+            details    TEXT)'''
+    )
+
     # ── Global system settings (key-value store) ──────────────────────────────
     c.execute('''CREATE TABLE IF NOT EXISTS system_settings
                  (key   TEXT PRIMARY KEY,

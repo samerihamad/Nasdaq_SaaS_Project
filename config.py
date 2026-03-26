@@ -123,6 +123,10 @@ STRUCTURAL_REJECTION_NOTIFY_MAX_PER_CYCLE = int(os.getenv("STRUCTURAL_REJECTION_
 # notification and stop retrying forever.
 FINAL_SYNC_FALLBACK_ENABLED = os.getenv("FINAL_SYNC_FALLBACK_ENABLED", "true").lower() == "true"
 
+# Do not push expected setup/broker-rule rejections to Telegram subscribers.
+# These are logged to DB for audit instead.
+SUPPRESS_EXPECTED_REJECTION_TELEGRAM = os.getenv("SUPPRESS_EXPECTED_REJECTION_TELEGRAM", "true").lower() == "true"
+
 # Hard cap on new positions per user per day (independent of circuit breaker)
 MAX_DAILY_TRADES     = 5
 

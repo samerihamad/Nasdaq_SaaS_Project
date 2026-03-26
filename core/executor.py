@@ -2,6 +2,7 @@ import requests
 import sqlite3
 import time
 import uuid
+import math
 from datetime import datetime, timedelta, timezone
 from bot.notifier import send_telegram_message
 from bot.licensing import safe_decrypt
@@ -12,6 +13,7 @@ from config import (
     TP2_SPLIT_PCT,
     TP2_MIN_DISTANCE_BUFFER_MULT,
     BE_LOCK_BUFFER_PCT,
+    SUPPRESS_EXPECTED_REJECTION_TELEGRAM,
 )
 from database.db_manager import is_maintenance_mode, get_subscriber_lang
 from core.risk_manager import (
@@ -38,6 +40,47 @@ from core.trade_close_messages import (
 _EPIC_CACHE = {}
 _SESSION_CACHE = {}
 SESSION_TTL_SECONDS = 45
+
+
+def _log_trade_rejection(chat_id, symbol, action, stage: str, reason: str, details: str = ""):
+    """
+    Persist expected rejections for audit without spamming Telegram.
+    """
+    try:
+        conn = sqlite3.connect('database/trading_saas.db')
+        conn.execute(
+            "INSERT INTO trade_rejections (created_at, chat_id, symbol, action, stage, reason, details) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                datetime.now(timezone.utc).isoformat(),
+                str(chat_id),
+                str(symbol),
+                str(action),
+                str(stage),
+                str(reason),
+                str(details or ""),
+            ),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def _is_expected_rejection(reason: str) -> bool:
+    r = str(reason or "").lower()
+    markers = [
+        "error.invalid.takeprofit.minvalue",
+        "error.invalid.stoploss.maxvalue",
+        "deal rejected (rejected)",
+        "target not achievable within atr",
+        "does not meet minimum 1:2",
+        "symbol not available on broker",
+        "distance too tight for broker rules",
+        "min distance",
+        "max distance",
+    ]
+    return any(m in r for m in markers)
 
 
 # ── Credentials & session ─────────────────────────────────────────────────────
@@ -1281,18 +1324,25 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             else entry_price * (1 + effective_sl_pct)
         )
         rr_ok, rr_ratio, rr_reason = check_rr_ratio(entry_price, stop_price, action, atr)
+        if isinstance(rr_ratio, float) and (math.isnan(rr_ratio) or math.isinf(rr_ratio)):
+            rr_ok = False
+            rr_reason = "invalid_rr_nan"
         if not rr_ok:
             if rr_reason == "target_beyond_atr_limit":
                 msg = (
                     f"❌ R:R {rr_ratio:.1f}:1 rejected — target not achievable "
                     f"within ATR limit ({symbol} {action})"
                 )
+            elif rr_reason == "invalid_rr_nan":
+                msg = f"❌ R:R nan:1 does not meet minimum 1:2 — setup discarded ({symbol} {action})"
             else:
                 msg = (
                     f"❌ R:R {rr_ratio:.1f}:1 does not meet minimum 1:2 — "
                     f"setup discarded ({symbol} {action})"
                 )
-            send_telegram_message(chat_id, msg)
+            _log_trade_rejection(chat_id, symbol, action, "rr_gate", msg, rr_reason or "")
+            if not SUPPRESS_EXPECTED_REJECTION_TELEGRAM:
+                send_telegram_message(chat_id, msg)
             return msg
     else:
         effective_sl_pct = stop_loss_pct if stop_loss_pct is not None else 0.01
@@ -1333,7 +1383,9 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
     stop_dist  = abs(entry_price - stop_level)
     if stop_dist <= 0:
         msg = f"❌ Order failed ({symbol} {action}): invalid stop distance"
-        send_telegram_message(chat_id, msg)
+        _log_trade_rejection(chat_id, symbol, action, "stop_validation", msg)
+        if not SUPPRESS_EXPECTED_REJECTION_TELEGRAM:
+            send_telegram_message(chat_id, msg)
         return msg
 
     # Fixed targets as % distance from entry (independent of ATR/stop_dist).
@@ -1373,6 +1425,7 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
                     f"مسافة الهدف الأول صغيرة جداً حسب شروط الوسيط (الحد الأدنى={md:.4f}، الحالي={tp1_dist:.4f})"
                 )
             print(msg)
+            _log_trade_rejection(chat_id, symbol, action, "tp1_distance", msg, f"min={md:.4f}, got={tp1_dist:.4f}")
             return msg
         tp2_dist = abs(float(target2) - float(entry_price))
         if tp2_dist < md:
@@ -1397,6 +1450,7 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
         else:
             msg = f"❌ تم منع الأمر ({symbol} {action}): {split_err}"
         print(msg)
+        _log_trade_rejection(chat_id, symbol, action, "split_qty", msg, split_err or "")
         return msg
 
     qty_total = qty1 + qty2
@@ -1478,7 +1532,9 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
                 f"❌ Order rejected ({symbol} {action}) — {leg_role} failed.\n"
                 f"Reason: {reason}"
             )
-            send_telegram_message(chat_id, msg)
+            _log_trade_rejection(chat_id, symbol, action, f"{leg_role}_execution", msg, reason)
+            if (not SUPPRESS_EXPECTED_REJECTION_TELEGRAM) or (not _is_expected_rejection(reason)):
+                send_telegram_message(chat_id, msg)
             return msg
 
     opened_trade_ids: list[int] = []
