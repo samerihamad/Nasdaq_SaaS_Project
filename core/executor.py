@@ -1077,10 +1077,26 @@ def monitor_and_close(chat_id):
                 f"{base_url}/positions/{deal_id}", headers=headers
             )
             if del_res.status_code == 200:
+                # Capture dealReference from close response when present (Capital often keys history by it).
+                try:
+                    close_payload = del_res.json() or {}
+                except Exception:
+                    close_payload = {}
+                deal_ref = (
+                    close_payload.get("dealReference")
+                    or close_payload.get("dealRef")
+                    or close_payload.get("reference")
+                )
                 # Broker-truth sync (realized PnL + exit price) MUST happen after close.
-                final = fetch_closed_deal_final_data(base_url, headers, str(deal_id), wait_for_realized=True)
+                final = fetch_closed_deal_final_data(
+                    base_url,
+                    headers,
+                    str(deal_id),
+                    wait_for_realized=True,
+                    identifiers=[str(deal_ref)] if deal_ref else None,
+                )
                 if not final:
-                    print("Error: Could not sync final data from Capital.com")
+                    # fetch_closed_deal_final_data already logged the root cause details.
                     # Leave DB row OPEN; reconcile() will retry next cycle.
                     continue
 

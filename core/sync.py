@@ -36,6 +36,8 @@ def fetch_closed_deal_final_data(
     deal_id: str,
     *,
     wait_for_realized: bool = True,
+    identifiers: list[str] | None = None,
+    lookback_max: int = 500,
 ) -> dict | None:
     """
     Fetch broker-truth final close data for a dealId from Capital.com history.
@@ -94,7 +96,7 @@ def fetch_closed_deal_final_data(
                     return px
         return None
 
-    def _fetch(params: dict | None) -> tuple[bool, list]:
+    def _fetch(params: dict | None) -> tuple[bool, list, int, str]:
         try:
             res = requests.get(
                 f"{base_url}/history/transactions",
@@ -102,30 +104,48 @@ def fetch_closed_deal_final_data(
                 headers=headers,
                 timeout=20,
             )
-        except Exception:
-            return False, []
+        except Exception as exc:
+            return False, [], 0, f"exception: {exc}"
         if res.status_code != 200:
-            return False, []
-        return True, (res.json() or {}).get("transactions", []) or []
+            txt = (res.text or "").strip()
+            return False, [], int(res.status_code), txt[:300]
+        return True, (res.json() or {}).get("transactions", []) or [], int(res.status_code), ""
 
     attempts = 5 if wait_for_realized else 2
     delay_s = 0.75 if wait_for_realized else 0.0
 
+    ids = [str(deal_id)]
+    if identifiers:
+        ids.extend([str(x).strip() for x in identifiers if str(x).strip()])
+    # De-dup while preserving order
+    seen = set()
+    ids = [x for x in ids if not (x in seen or seen.add(x))]
+
     for attempt in range(attempts):
-        ok, txs = _fetch({"dealId": str(deal_id)})
+        ok, txs, st, info = _fetch({"dealId": str(deal_id)})
         if not ok:
             # Stop-condition: endpoint failure (do not proceed with close reporting).
+            print("Error: Could not sync final data from Capital.com", flush=True)
+            print(f"[Capital Sync] history/transactions failed status={st} info={info}", flush=True)
             return None
         if not txs:
-            ok2, txs2 = _fetch({"max": 200})
+            ok2, txs2, st2, info2 = _fetch({"max": int(lookback_max)})
             if not ok2:
+                print("Error: Could not sync final data from Capital.com", flush=True)
+                print(f"[Capital Sync] history/transactions failed status={st2} info={info2}", flush=True)
                 return None
             txs = txs2
 
         for tx in txs:
             tx_deal = tx.get("dealId")
             tx_ref = tx.get("dealReference")
-            if str(tx_deal) != str(deal_id) and str(tx_ref) != str(deal_id):
+            tx_related = tx.get("relatedDealId") or tx.get("relatedDealReference")
+            match = False
+            for x in ids:
+                if str(tx_deal) == x or str(tx_ref) == x or str(tx_related) == x:
+                    match = True
+                    break
+            if not match:
                 continue
             pnl = _parse_pnl(tx)
             if pnl is None:
@@ -142,6 +162,8 @@ def fetch_closed_deal_final_data(
             time.sleep(delay_s)
 
     # Stop-condition: not found / not ready.
+    print("Error: Could not sync final data from Capital.com", flush=True)
+    print(f"[Capital Sync] transaction not found yet ids={ids}", flush=True)
     return None
 
 
