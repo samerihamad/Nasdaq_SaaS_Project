@@ -248,11 +248,7 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
                 # UX: confirm the bot detected the close even if broker history lags.
                 # Send once per trade_id to avoid spamming.
                 try:
-                    if (
-                        not is_maintenance_mode()
-                        and notify
-                        and int(close_sync_notified or 0) == 0
-                    ):
+                    if notify and int(close_sync_notified or 0) == 0:
                         lang = get_subscriber_lang(chat_id)
                         if lang == "en":
                             msg = (
@@ -298,10 +294,12 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
             # One risk outcome per session (not per leg) for TP1+TP2 splits.
             after_trade_leg_closed(chat_id, ps, pnl_f)
 
-            # During maintenance, we never send Telegram messages from reconcile.
-            # Also allow callers (e.g., dashboard UI) to run reconcile silently
+            # Allow callers (e.g., dashboard UI) to run reconcile silently
             # to clean up stale DB rows without spamming the user.
-            if is_maintenance_mode() or not notify:
+            #
+            # NOTE: Even in maintenance mode we still send close notifications,
+            # because maintenance should block NEW entries, not hide trade exits.
+            if not notify:
                 continue
 
             ep = float(entry_price or 0)

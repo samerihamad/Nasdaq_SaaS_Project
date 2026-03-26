@@ -1139,23 +1139,24 @@ def monitor_and_close(chat_id):
                         )
                         > 0
                     )
-                if not is_maintenance_mode():
-                    send_bot_automated_close(
-                        chat_id,
-                        trade_id=int(trade_id),
-                        symbol=symbol,
-                        direction=direction,
-                        entry_price=entry_price,
-                        exit_price=float(exit_price) if exit_price is not None else None,
-                        size=size_leg or float(live["position"].get("size") or 0),
-                        pnl=actual_pnl,
-                        stop_distance=sd_eff,
-                        trailing_stop=float(base_stop) if base_stop is not None else None,
-                        stop_label=stop_label,
-                        sibling_tp2_open=sibling_tp2_open,
-                        leg_role=leg_role or "SINGLE",
-                        target_reached=target_label,
-                    )
+                # Even in maintenance mode we still send close notifications,
+                # because maintenance should block NEW entries, not hide trade exits.
+                send_bot_automated_close(
+                    chat_id,
+                    trade_id=int(trade_id),
+                    symbol=symbol,
+                    direction=direction,
+                    entry_price=entry_price,
+                    exit_price=float(exit_price) if exit_price is not None else None,
+                    size=size_leg or float(live["position"].get("size") or 0),
+                    pnl=actual_pnl,
+                    stop_distance=sd_eff,
+                    trailing_stop=float(base_stop) if base_stop is not None else None,
+                    stop_label=stop_label,
+                    sibling_tp2_open=sibling_tp2_open,
+                    leg_role=leg_role or "SINGLE",
+                    target_reached=target_label,
+                )
                 closed_any = True
 
     return closed_any
