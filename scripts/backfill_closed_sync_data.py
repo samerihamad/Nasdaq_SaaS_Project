@@ -1,13 +1,54 @@
 import sqlite3
+import requests
 
-from core.executor import get_session
-from core.watcher import get_all_active_subscribers
 from core.sync import backfill_closed_pnls
 from bot.licensing import safe_decrypt
 
+DB_PATH = "database/trading_saas.db"
+
+
+def _get_all_active_subscribers():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT chat_id, api_key, api_password, is_demo, email "
+        "FROM subscribers WHERE is_active=1 AND email IS NOT NULL"
+    )
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def _auth_session(api_key: str, password: str, is_demo: int, email: str):
+    base_url = (
+        "https://demo-api-capital.backend-capital.com/api/v1"
+        if bool(is_demo)
+        else
+        "https://api-capital.backend-capital.com/api/v1"
+    )
+    headers = {
+        "X-CAP-API-KEY": str(api_key or "").strip(),
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    try:
+        res = requests.post(
+            f"{base_url}/session",
+            json={"identifier": str(email or "").strip(), "password": str(password or "").strip()},
+            headers=headers,
+            timeout=20,
+        )
+    except Exception:
+        return None, None
+    if res.status_code != 200:
+        return None, None
+    headers["CST"] = res.headers.get("CST")
+    headers["X-SECURITY-TOKEN"] = res.headers.get("X-SECURITY-TOKEN")
+    return base_url, headers
+
 
 def main() -> None:
-    rows = get_all_active_subscribers()
+    rows = _get_all_active_subscribers()
     if not rows:
         print("No active subscribers found.")
         return
@@ -18,8 +59,7 @@ def main() -> None:
         api_key = safe_decrypt(enc_key)
         password = safe_decrypt(enc_pass)
         email = safe_decrypt(enc_email)
-        creds = (api_key, password, is_demo, email)
-        base_url, headers = get_session(creds)
+        base_url, headers = _auth_session(api_key, password, is_demo, email)
         if not headers:
             print(f"skip chat_id={chat_id}: auth failed")
             continue
