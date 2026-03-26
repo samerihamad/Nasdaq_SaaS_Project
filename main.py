@@ -724,6 +724,10 @@ def run_trading_bot():
 
         except Exception as e:
             print(f"❌ خطأ في المحرك الرئيسي: {e}")
+            try:
+                print(traceback.format_exc())
+            except Exception:
+                pass
 
         print(f"\n⏰ اكتملت الدورة. الانتظار {CHECK_INTERVAL} ثانية...")
         print("=" * 55)

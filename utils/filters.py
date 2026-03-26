@@ -57,6 +57,28 @@ def _valid_symbol(sym) -> bool:
     )
 
 
+def _safe_volume_mean(df_like) -> float:
+    """
+    Return a scalar mean volume even when yfinance returns odd shapes
+    (e.g., MultiIndex slices that produce DataFrame/Series ambiguity).
+    """
+    try:
+        vol = df_like["Volume"]
+    except Exception:
+        return 0.0
+    try:
+        # Series -> scalar
+        if isinstance(vol, pd.Series):
+            return float(pd.to_numeric(vol, errors="coerce").mean())
+        # DataFrame (ambiguous in boolean contexts) -> collapse to scalar
+        if isinstance(vol, pd.DataFrame):
+            numeric = vol.apply(pd.to_numeric, errors="coerce")
+            return float(numeric.to_numpy(dtype=float).mean())
+        return float(pd.to_numeric(vol, errors="coerce").mean())
+    except Exception:
+        return 0.0
+
+
 # ── Ticker fetch ──────────────────────────────────────────────────────────────
 
 def get_nasdaq_tickers() -> list[str]:
@@ -180,7 +202,7 @@ def level1_filter(tickers: list[str], top_n: int = 300) -> list[str]:
                             sym_df = raw[sym] if len(batch) > 1 else raw
                             if sym_df is None or sym_df.empty:
                                 continue
-                            if sym_df["Volume"].mean() >= MIN_AVG_VOLUME:
+                            if _safe_volume_mean(sym_df) >= MIN_AVG_VOLUME:
                                 qualified.append(sym)
                         except Exception:
                             continue
@@ -207,7 +229,7 @@ def level1_filter(tickers: list[str], top_n: int = 300) -> list[str]:
                     sym_df = raw[sym] if len(batch) > 1 else raw
                     if sym_df is None or sym_df.empty:
                         continue
-                    if sym_df["Volume"].mean() >= MIN_AVG_VOLUME:
+                    if _safe_volume_mean(sym_df) >= MIN_AVG_VOLUME:
                         volume_qualified.append(sym)
                 except Exception:
                     continue
