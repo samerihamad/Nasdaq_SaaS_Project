@@ -136,6 +136,7 @@ def _place_pending_limit_order(
     action: str,
     strategy_label: str,
     confidence: float,
+    ai_prob: float | None,
     stop_loss_pct: float | None,
     limit_price: float,
 ):
@@ -156,8 +157,8 @@ def _place_pending_limit_order(
         return False, int(row[0]), "already_pending"
     c.execute(
         "INSERT INTO pending_limit_orders "
-        "(created_at, expires_at, chat_id, symbol, action, strategy_label, confidence, stop_loss_pct, limit_price, status, reason) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)",
+        "(created_at, expires_at, chat_id, symbol, action, strategy_label, confidence, ai_prob, stop_loss_pct, limit_price, status, reason) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)",
         (
             now.isoformat(),
             exp.isoformat(),
@@ -166,6 +167,7 @@ def _place_pending_limit_order(
             str(action),
             str(strategy_label or ""),
             float(confidence),
+            float(ai_prob) if ai_prob is not None else None,
             float(stop_loss_pct) if stop_loss_pct is not None else None,
             float(limit_price),
             "limit_policy",
@@ -1409,7 +1411,7 @@ def monitor_and_close(chat_id):
 
 # ── Trade execution ───────────────────────────────────────────────────────────
 
-def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct=None, strategy_label=None, force_market: bool = False):
+def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct=None, strategy_label=None, force_market: bool = False, ai_prob: float | None = None):
     """
     Open a new position.
 
@@ -1559,6 +1561,7 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             action=str(action),
             strategy_label=str(strategy_label or ""),
             confidence=float(confidence),
+            ai_prob=float(ai_prob) if ai_prob is not None else float(confidence),
             stop_loss_pct=float(stop_loss_pct) if stop_loss_pct is not None else None,
             limit_price=float(limit_px),
         )

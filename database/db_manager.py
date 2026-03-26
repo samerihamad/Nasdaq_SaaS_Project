@@ -172,6 +172,15 @@ def create_db():
             cancelled_at   TEXT)'''
     )
 
+    # Migration for existing DBs (add new columns if absent)
+    for col, definition in [
+        ('ai_prob', 'REAL'),
+    ]:
+        try:
+            c.execute(f"ALTER TABLE pending_limit_orders ADD COLUMN {col} {definition}")
+        except Exception:
+            pass
+
     # ── Global system settings (key-value store) ──────────────────────────────
     c.execute('''CREATE TABLE IF NOT EXISTS system_settings
                  (key   TEXT PRIMARY KEY,

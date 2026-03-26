@@ -22,6 +22,7 @@ Commands:
 import os
 import sqlite3
 from datetime import datetime, timezone
+import requests
 from telegram import Update
 from telegram.ext import ContextTypes
 
@@ -32,10 +33,12 @@ from database.db_manager import (
     get_user_risk_params, get_bank_details, set_bank_field, BANK_FIELDS,
 )
 from core.watcher import broadcast_to_all, run_watcher, get_all_active_subscribers
+from core.executor import get_user_credentials, get_session, resolve_epic_for_user
 from utils.market_hours import get_market_status, STATUS_OPEN
 from bot.licensing import issue_license
 from bot.notifier import send_telegram_message
 from bot.i18n import t
+from config import LIMIT_ORDER_TTL_BARS, LIMIT_ORDER_BAR_MINUTES
 
 ADMIN_CHAT_ID = os.getenv('ADMIN_CHAT_ID', '')
 DB_PATH       = 'database/trading_saas.db'
@@ -59,6 +62,56 @@ def _fmt_remaining(expires_at: str) -> str:
     if hours > 0:
         return f"{hours}h {minutes}m"
     return f"{minutes}m {seconds}s"
+
+
+def _bars_remaining(created_at: str, expires_at: str) -> tuple[int, int]:
+    try:
+        cr = datetime.fromisoformat(str(created_at))
+        ex = datetime.fromisoformat(str(expires_at))
+        now = datetime.now(timezone.utc)
+        total = max(1, int((ex - cr).total_seconds() // max(60, int(LIMIT_ORDER_BAR_MINUTES) * 60)))
+        left = int((ex - now).total_seconds() // max(60, int(LIMIT_ORDER_BAR_MINUTES) * 60))
+        left = max(0, min(total, left))
+        return left, total
+    except Exception:
+        return 0, int(LIMIT_ORDER_TTL_BARS)
+
+
+def _safe_strategy_label(strategy_label: str) -> str:
+    s = (strategy_label or "").strip().lower()
+    if s == "momentum":
+        return "⚡ Momentum [0.618 Retrace]"
+    if s in ("meanrev", "mean reversion"):
+        return "🔄 Mean Reversion"
+    return f"📊 {strategy_label or 'Unknown'}"
+
+
+def _fetch_current_price(uid: str, symbol: str) -> float | None:
+    creds = get_user_credentials(str(uid))
+    if not creds:
+        return None
+    base_url, headers = get_session(creds)
+    if not headers:
+        return None
+    epic = resolve_epic_for_user(str(uid), str(symbol), base_url=base_url, headers=headers, is_demo=bool(creds[2]))
+    if not epic:
+        return None
+    try:
+        res = requests.get(f"{base_url}/markets/{epic}", headers=headers, timeout=15)
+        if res.status_code != 200:
+            return None
+        snap = (res.json() or {}).get("snapshot") or {}
+        bid = snap.get("bid")
+        offer = snap.get("offer")
+        if bid is not None and offer is not None:
+            return (float(bid) + float(offer)) / 2.0
+        if bid is not None:
+            return float(bid)
+        if offer is not None:
+            return float(offer)
+    except Exception:
+        return None
+    return None
 
 
 def _get_lang(chat_id: str) -> str:
@@ -434,7 +487,8 @@ async def limits_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     c = conn.cursor()
     try:
         c.execute(
-            "SELECT id, chat_id, symbol, action, limit_price, expires_at "
+            "SELECT id, chat_id, symbol, action, strategy_label, confidence, ai_prob, "
+            "stop_loss_pct, limit_price, created_at, expires_at "
             "FROM pending_limit_orders "
             "WHERE status='PENDING' "
             "ORDER BY expires_at ASC, id ASC"
@@ -450,17 +504,49 @@ async def limits_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
 
     if not rows:
-        await update.message.reply_text("No active pending limit orders.")
+        await update.message.reply_text("No active pending limit orders at the moment.")
         return
 
-    lines = [f"*Active Pending Limit Orders ({len(rows)}):*"]
-    for oid, uid, symbol, action, limit_price, expires_at in rows[:50]:
-        rem = _fmt_remaining(expires_at)
+    lines = [f"*Active Pending Limit Orders: {len(rows)}*"]
+    for (
+        oid, uid, symbol, action, strategy_label, confidence, ai_prob,
+        stop_loss_pct, limit_price, created_at, expires_at
+    ) in rows[:30]:
+        lim = float(limit_price or 0.0)
+        cp = _fetch_current_price(str(uid), str(symbol))
+        if cp is not None and cp > 0:
+            dist_pts = abs(lim - cp)
+            dist_pct = (dist_pts / cp) * 100.0
+            cp_txt = f"`{cp:.4f}`"
+            dist_txt = f"`{dist_pts:.4f}` pts ({dist_pct:.2f}%)"
+        else:
+            cp_txt = "`N/A`"
+            dist_txt = "`N/A`"
+
+        sl_txt = "`N/A`"
+        try:
+            if stop_loss_pct is not None and lim > 0:
+                sl = lim * (1.0 - float(stop_loss_pct)) if str(action) == "BUY" else lim * (1.0 + float(stop_loss_pct))
+                sl_txt = f"`{sl:.4f}`"
+        except Exception:
+            pass
+
+        bars_left, bars_total = _bars_remaining(created_at, expires_at)
+        ttl_clock = _fmt_remaining(expires_at)
+        side_emoji = "🟢" if str(action) == "BUY" else "🔴"
+        ai_val = float(ai_prob) if ai_prob is not None else float(confidence or 0.0)
         lines.append(
-            f"• `#{oid}` `{uid}` | {symbol} {action} | "
-            f"`{float(limit_price):.4f}` | ⏳ {rem}"
+            f"\n*#{oid}* `{uid}`\n"
+            f"{side_emoji} *{symbol} - {action}*\n"
+            f"{_safe_strategy_label(strategy_label)}\n"
+            f"• Limit Price: `{lim:.4f}`\n"
+            f"• Current Price: {cp_txt}\n"
+            f"• Distance to Fill: {dist_txt}\n"
+            f"• Confidence: *{float(confidence or 0.0):.1f}%* | AI Prob: *{ai_val:.1f}%*\n"
+            f"• Stop Loss: {sl_txt}\n"
+            f"• TTL: ⏳ *{bars_left}/{bars_total} Bars remaining* ({ttl_clock})"
         )
-    if len(rows) > 50:
-        lines.append(f"\n... and {len(rows) - 50} more")
+    if len(rows) > 30:
+        lines.append(f"\n... and {len(rows) - 30} more")
 
     await update.message.reply_text("\n".join(lines), parse_mode='Markdown')

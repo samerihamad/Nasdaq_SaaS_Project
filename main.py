@@ -438,6 +438,7 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
     # Consistent decision model:
     # - We rely on validate_signal(..., min_probability=...) to produce the boolean gate.
     # - We allow a soft override only for Momentum/MeanRev when confidence is high.
+    ai_prob = None
     if timeframes:
         strategy_key = (strategy_label or "RF").strip()
         ai_min_by_strategy = {
@@ -514,6 +515,7 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
                     chat_id, symbol, action,
                     confidence=confidence, stop_loss_pct=stop_loss_pct,
                     strategy_label=strategy_label,
+                    ai_prob=ai_prob,
                 )
                 print(f"   [AUTO  {chat_id}] {symbol} {action} → {result}")
                 if isinstance(result, str) and result.startswith("✅ Opened"):
