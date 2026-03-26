@@ -80,6 +80,7 @@ def create_db():
         ('close_sync_attempts', "INTEGER DEFAULT 0"),
         ('close_sync_last_try_at', "TEXT"),
         ('close_sync_last_error', "TEXT"),
+        ('sync_status', "TEXT"),
         # Final broker-truth fields (synced from Capital.com history after close).
         # `pnl` remains for backward compatibility (reports/analytics) and is set to `actual_pnl`.
         ('actual_pnl', 'REAL'),
