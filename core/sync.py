@@ -13,13 +13,13 @@ Runs at the start of every monitoring cycle to fix any discrepancies:
     → Insert into DB so the trailing stop engine starts tracking it.
 """
 
+import os
 import sqlite3
 import requests
 import re
 import time
 from datetime import datetime as _dt
 
-from bot.notifier import send_telegram_message
 from core.trade_session_finalize import after_trade_leg_closed
 from core.trade_close_messages import (
     send_reconcile_generic_external,
@@ -29,6 +29,7 @@ from core.trade_close_messages import (
 from database.db_manager import is_maintenance_mode, get_subscriber_lang
 
 DB_PATH = 'database/trading_saas.db'
+ENABLE_CLOSE_PENDING_NOTIFY = (os.getenv("ENABLE_CLOSE_PENDING_NOTIFY", "false").strip().lower() == "true")
 
 
 def fetch_closed_deal_final_data(
@@ -245,25 +246,24 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
                 identifiers=[dr] if dr else None,
             )
             if not final:
-                # UX: confirm the bot detected the close even if broker history lags.
-                # Send once per trade_id to avoid spamming.
+                # Optional UX ping while waiting for broker history sync.
+                # Default is OFF to avoid notification floods.
                 try:
-                    if notify and int(close_sync_notified or 0) == 0:
+                    if ENABLE_CLOSE_PENDING_NOTIFY and notify and int(close_sync_notified or 0) == 0:
                         lang = get_subscriber_lang(chat_id)
-                        if lang == "en":
-                            msg = (
-                                "⏳ *Trade closed on platform*\n\n"
-                                f"📌 Asset: *{symbol}* ({direction})\n"
-                                f"🆔 Trade ID: *{int(trade_id)}*\n"
-                                "Syncing final P&L from Capital.com history…"
-                            )
-                        else:
-                            msg = (
-                                "⏳ *تم إغلاق الصفقة على المنصة*\n\n"
-                                f"📌 الأداة: *{symbol}* ({'شراء' if direction=='BUY' else 'بيع'})\n"
-                                f"🆔 رقم الصفقة: *{int(trade_id)}*\n"
-                                "جارٍ مزامنة الربح/الخسارة النهائية من سجل Capital.com…"
-                            )
+                        msg = (
+                            "⏳ *Trade closed on platform*\n\n"
+                            f"📌 Asset: *{symbol}* ({direction})\n"
+                            f"🆔 Trade ID: *{int(trade_id)}*\n"
+                            "Syncing final P&L from Capital.com history…"
+                            if lang == "en"
+                            else
+                            "⏳ *تم إغلاق الصفقة على المنصة*\n\n"
+                            f"📌 الأداة: *{symbol}* ({'شراء' if direction=='BUY' else 'بيع'})\n"
+                            f"🆔 رقم الصفقة: *{int(trade_id)}*\n"
+                            "جارٍ مزامنة الربح/الخسارة النهائية من سجل Capital.com…"
+                        )
+                        from bot.notifier import send_telegram_message
                         send_telegram_message(chat_id, msg)
                         c.execute(
                             "UPDATE trades SET close_sync_notified=1 WHERE trade_id=? AND status='OPEN'",
