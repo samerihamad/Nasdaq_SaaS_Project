@@ -95,7 +95,7 @@ def get_open_trades(chat_id):
     c = conn.cursor()
     c.execute(
         "SELECT trade_id, deal_id, symbol, direction, entry_price, size, trailing_stop, "
-        "COALESCE(leg_role,''), COALESCE(parent_session,''), stop_distance "
+        "COALESCE(leg_role,''), COALESCE(parent_session,''), stop_distance, COALESCE(target_reached,'') "
         "FROM trades WHERE chat_id=? AND status='OPEN'",
         (chat_id,)
     )
@@ -113,6 +113,7 @@ def get_open_trades(chat_id):
             'leg_role':       r[7] or None,
             'parent_session': r[8] or None,
             'stop_distance':  r[9],
+            'target_reached': r[10] or None,
         }
         for r in rows
     ]
@@ -129,13 +130,52 @@ def update_trade_stop(trade_id, new_stop):
     conn.close()
 
 
-def close_trade_in_db(trade_id, pnl):
-    """Mark a locally tracked trade as CLOSED with its final PnL and UTC timestamp."""
+def update_trade_target_reached(trade_id: int, target_reached: str) -> None:
+    """
+    Persist the highest target milestone reached so far.
+    Examples: 'TARGET_1_HIT', 'TARGET_2_HIT'
+    """
+    if not target_reached:
+        return
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE trades SET target_reached=? WHERE trade_id=?",
+        (str(target_reached), int(trade_id)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def close_trade_in_db(
+    trade_id: int,
+    *,
+    actual_pnl: float,
+    exit_price: float | None = None,
+    target_reached: str | None = None,
+    close_reason: str | None = None,
+):
+    """
+    Mark a locally tracked trade as CLOSED using broker-synced final data.
+
+    Notes:
+    - `pnl` is set to `actual_pnl` for backward compatibility with reports.
+    - Do NOT pass unrealized PnL here; call Capital.com history sync first.
+    """
     from utils.market_hours import utc_now
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
-        "UPDATE trades SET status='CLOSED', pnl=?, closed_at=? WHERE trade_id=?",
-        (pnl, utc_now().isoformat(), trade_id)
+        "UPDATE trades SET status='CLOSED', pnl=?, actual_pnl=?, exit_price=?, "
+        "target_reached=COALESCE(?, target_reached), close_reason=?, closed_at=? "
+        "WHERE trade_id=?",
+        (
+            float(actual_pnl),
+            float(actual_pnl),
+            float(exit_price) if exit_price is not None else None,
+            str(target_reached) if target_reached else None,
+            str(close_reason) if close_reason else None,
+            utc_now().isoformat(),
+            int(trade_id),
+        ),
     )
     conn.commit()
     conn.close()

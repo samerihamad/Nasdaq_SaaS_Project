@@ -15,10 +15,11 @@ from core.risk_manager import (
 from core.trade_session_finalize import after_trade_leg_closed
 from core.trailing_stop import (
     calculate_atr, compute_stop_candidate, advance_trailing_stop,
-    is_stop_hit, get_open_trades, update_trade_stop,
+    is_stop_hit, get_open_trades, update_trade_stop, update_trade_target_reached,
     close_trade_in_db, record_open_trade,
 )
 from core.sync import reconcile
+from core.sync import fetch_closed_deal_final_data
 from core.trade_close_messages import (
     send_bot_automated_close,
     count_open_sibling_same_session,
@@ -840,6 +841,12 @@ def monitor_and_close(chat_id):
             manage_leg = (leg_role or "").strip().upper() == "TP2"
 
             if tp2_hit and manage_leg:
+                # Persist milestone once TP2 threshold is first reached.
+                try:
+                    if (trade.get("target_reached") or "").strip() != "TARGET_2_HIT":
+                        update_trade_target_reached(trade_id, "TARGET_2_HIT")
+                except Exception:
+                    pass
                 candidate = compute_stop_candidate(direction, current_price, atr)
                 prev_stop = float(base_stop if base_stop is not None else candidate)
                 breakeven = entry_price
@@ -857,6 +864,12 @@ def monitor_and_close(chat_id):
                 stop_triggered = is_stop_hit(current_price, new_stop, direction)
                 stop_label = f"ATR trailing stop @ {new_stop:.4f} (TP2 passed)"
             elif tp1_hit and manage_leg:
+                # Persist milestone once TP1 threshold is first reached (for TP2 leg).
+                try:
+                    if (trade.get("target_reached") or "").strip() not in ("TARGET_1_HIT", "TARGET_2_HIT"):
+                        update_trade_target_reached(trade_id, "TARGET_1_HIT")
+                except Exception:
+                    pass
                 # After TP1: lock TP2 leg beyond breakeven.
                 # This prevents the trade from reverting back to entry.
                 breakeven_lock = (
@@ -938,8 +951,37 @@ def monitor_and_close(chat_id):
                 f"{base_url}/positions/{deal_id}", headers=headers
             )
             if del_res.status_code == 200:
-                close_trade_in_db(trade['trade_id'], upl)
-                after_trade_leg_closed(chat_id, parent_session, upl)
+                # Broker-truth sync (realized PnL + exit price) MUST happen after close.
+                final = fetch_closed_deal_final_data(base_url, headers, str(deal_id), wait_for_realized=True)
+                if not final:
+                    print("Error: Could not sync final data from Capital.com")
+                    # Leave DB row OPEN; reconcile() will retry next cycle.
+                    continue
+
+                actual_pnl = float(final["actual_pnl"])
+                exit_price = final.get("exit_price")
+
+                # Derive final label for reporting (milestone vs exit condition).
+                leg = (leg_role or "").strip().upper()
+                if leg == "TP2" and ("trailing" in str(stop_label).lower() or "tp2 passed" in str(stop_label).lower()):
+                    target_label = "TRAILING_STOP_EXIT"
+                elif leg == "TP1" and tp1_hit:
+                    target_label = "TARGET_1_HIT"
+                elif leg == "TP2" and tp2_hit:
+                    target_label = "TARGET_2_HIT"
+                elif leg == "TP2" and tp1_hit:
+                    target_label = "STOP_AFTER_TP1"
+                else:
+                    target_label = "STOP_LOSS"
+
+                close_trade_in_db(
+                    int(trade['trade_id']),
+                    actual_pnl=actual_pnl,
+                    exit_price=float(exit_price) if exit_price is not None else None,
+                    target_reached=target_label,
+                    close_reason=stop_label,
+                )
+                after_trade_leg_closed(chat_id, parent_session, actual_pnl)
 
                 sd_eff = sd_stored
                 if sd_eff is None and base_stop is not None and entry_price:
@@ -955,16 +997,19 @@ def monitor_and_close(chat_id):
                 if not is_maintenance_mode():
                     send_bot_automated_close(
                         chat_id,
+                        trade_id=int(trade_id),
                         symbol=symbol,
                         direction=direction,
                         entry_price=entry_price,
+                        exit_price=float(exit_price) if exit_price is not None else None,
                         size=size_leg or float(live["position"].get("size") or 0),
-                        pnl=upl,
+                        pnl=actual_pnl,
                         stop_distance=sd_eff,
                         trailing_stop=float(base_stop) if base_stop is not None else None,
                         stop_label=stop_label,
                         sibling_tp2_open=sibling_tp2_open,
                         leg_role=leg_role or "SINGLE",
+                        target_reached=target_label,
                     )
                 closed_any = True
 

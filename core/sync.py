@@ -30,6 +30,121 @@ from database.db_manager import is_maintenance_mode
 DB_PATH = 'database/trading_saas.db'
 
 
+def fetch_closed_deal_final_data(
+    base_url: str,
+    headers: dict,
+    deal_id: str,
+    *,
+    wait_for_realized: bool = True,
+) -> dict | None:
+    """
+    Fetch broker-truth final close data for a dealId from Capital.com history.
+
+    Returns dict:
+      { 'actual_pnl': float, 'exit_price': float|None }
+
+    Stop-condition:
+    - If history endpoint fails or the deal cannot be found (after retries),
+      return None and the caller MUST stop the close/report sequence.
+
+    Important:
+    - We do NOT calculate PnL manually. We only read realized PnL from broker history.
+    """
+
+    def _parse_float(v) -> float | None:
+        if v is None:
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        s = str(v).strip()
+        m = re.search(r"[-+]?\d+(?:\.\d+)?", s.replace(",", ""))
+        if not m:
+            return None
+        try:
+            return float(m.group(0))
+        except Exception:
+            return None
+
+    def _parse_pnl(tx: dict) -> float | None:
+        for k in (
+            "profitAndLoss",
+            "profitAndLossValue",
+            "pnl",
+            "realisedPnl",
+            "realizedPnl",
+        ):
+            if k in tx and tx.get(k) is not None:
+                p = _parse_float(tx.get(k))
+                if p is not None:
+                    return p
+        return None
+
+    def _parse_exit_price(tx: dict) -> float | None:
+        for k in (
+            "level",
+            "price",
+            "closeLevel",
+            "closingLevel",
+            "closePrice",
+            "executionPrice",
+        ):
+            if k in tx and tx.get(k) is not None:
+                px = _parse_float(tx.get(k))
+                if px is not None and px > 0:
+                    return px
+        return None
+
+    def _fetch(params: dict | None) -> tuple[bool, list]:
+        try:
+            res = requests.get(
+                f"{base_url}/history/transactions",
+                params=params or {},
+                headers=headers,
+                timeout=20,
+            )
+        except Exception:
+            return False, []
+        if res.status_code != 200:
+            return False, []
+        return True, (res.json() or {}).get("transactions", []) or []
+
+    attempts = 5 if wait_for_realized else 2
+    delay_s = 0.75 if wait_for_realized else 0.0
+
+    for attempt in range(attempts):
+        ok, txs = _fetch({"dealId": str(deal_id)})
+        if not ok:
+            # Stop-condition: endpoint failure (do not proceed with close reporting).
+            return None
+        if not txs:
+            ok2, txs2 = _fetch({"max": 200})
+            if not ok2:
+                return None
+            txs = txs2
+
+        for tx in txs:
+            tx_deal = tx.get("dealId")
+            tx_ref = tx.get("dealReference")
+            if str(tx_deal) != str(deal_id) and str(tx_ref) != str(deal_id):
+                continue
+            pnl = _parse_pnl(tx)
+            if pnl is None:
+                continue
+            # Capital sometimes returns 0.0 briefly right after close; allow retries.
+            if wait_for_realized and float(pnl) == 0.0 and attempt < attempts - 1:
+                break
+            return {
+                "actual_pnl": float(pnl),
+                "exit_price": _parse_exit_price(tx),
+            }
+
+        if delay_s and attempt < attempts - 1:
+            time.sleep(delay_s)
+
+    # Stop-condition: not found / not ready.
+    return None
+
+
 def reconcile(chat_id, base_url, headers, *, notify: bool = True):
     """
     Sync local DB with live Capital.com /positions.
@@ -88,21 +203,19 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
             # Broker realizedPnL can be delayed right after a manual close.
             # If we read too early, we may incorrectly get 0.0 and send
             # "Breakeven" to Telegram even though the final realized P&L is > 0.
-            pnl = _fetch_closed_pnl(
-                base_url,
-                headers,
-                str(deal_id),
-                wait_for_realized=True,
-                fallback_calc={
-                    "direction": direction,
-                    "entry_price": entry_price,
-                    "size": size,
-                },
+            final = fetch_closed_deal_final_data(
+                base_url, headers, str(deal_id), wait_for_realized=True
             )
+            if not final:
+                print("Error: Could not sync final data from Capital.com")
+                continue
+
+            pnl = float(final["actual_pnl"])
+            exit_price = final.get("exit_price")
             cur = c.execute(
-                "UPDATE trades SET status='CLOSED', pnl=?, closed_at=? "
+                "UPDATE trades SET status='CLOSED', pnl=?, actual_pnl=?, exit_price=?, closed_at=? "
                 "WHERE trade_id=? AND status='OPEN'",
-                (pnl, _dt.now().isoformat(), trade_id),
+                (pnl, pnl, float(exit_price) if exit_price is not None else None, _dt.now().isoformat(), trade_id),
             )
             # If rowcount is 0, another process updated it before this cycle.
             if cur.rowcount != 1:
@@ -132,6 +245,16 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
             lr = (leg_role or "").strip()
 
             if lr == "TP1" and ps:
+                # Persist milestone for reporting.
+                try:
+                    c.execute(
+                        "UPDATE trades SET target_reached=COALESCE(target_reached,'TARGET_1_HIT') "
+                        "WHERE trade_id=?",
+                        (trade_id,),
+                    )
+                    conn.commit()
+                except Exception:
+                    pass
                 tp2_open = c.execute(
                     "SELECT 1 FROM trades WHERE parent_session=? AND status='OPEN' "
                     "AND COALESCE(leg_role,'')='TP2' LIMIT 1",
@@ -139,9 +262,11 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
                 ).fetchone()
                 send_reconcile_tp1_hit(
                     chat_id,
+                    trade_id=int(trade_id),
                     symbol=symbol,
                     direction=direction,
                     entry_price=ep,
+                    exit_price=float(exit_price) if exit_price is not None else None,
                     size=sz,
                     pnl=pnl_f,
                     stop_distance=sd,
@@ -149,6 +274,15 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
                     tp2_still_open=bool(tp2_open),
                 )
             elif lr == "TP2" and ps:
+                try:
+                    c.execute(
+                        "UPDATE trades SET target_reached=COALESCE(target_reached,'TRAILING_STOP_EXIT') "
+                        "WHERE trade_id=?",
+                        (trade_id,),
+                    )
+                    conn.commit()
+                except Exception:
+                    pass
                 c.execute(
                     "SELECT COALESCE(SUM(pnl),0) FROM trades WHERE parent_session=? AND status='CLOSED'",
                     (ps,),
@@ -182,9 +316,11 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
                     sd_use = abs(ep0 - ts0)
                 send_reconcile_tp2_final(
                     chat_id,
+                    trade_id=int(trade_id),
                     symbol=sym0,
                     direction=dir0,
                     entry_price=ep0,
+                    exit_price=float(exit_price) if exit_price is not None else None,
                     total_qty=total_qty,
                     tp1_pnl=tp1_pnl,
                     tp2_pnl=tp2_pnl,
@@ -195,9 +331,11 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
             else:
                 send_reconcile_generic_external(
                     chat_id,
+                    trade_id=int(trade_id),
                     symbol=symbol,
                     direction=direction,
                     entry_price=ep,
+                    exit_price=float(exit_price) if exit_price is not None else None,
                     size=sz,
                     pnl=pnl_f,
                     stop_distance=sd,
@@ -229,147 +367,6 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
     conn.close()
 
 
-def _fetch_closed_pnl(
-    base_url,
-    headers,
-    deal_id,
-    *,
-    wait_for_realized: bool = False,
-    fallback_calc: dict | None = None,
-):
-    """
-    Attempt to retrieve the realized PnL of a closed deal from broker history.
-    Returns 0.0 if the endpoint is unavailable or the deal isn't found.
-    """
-    def _parse_pnl(tx: dict) -> float | None:
-        # Capital payloads may vary by account/region.
-        # Try several known keys and parse numeric strings safely.
-        for k in ("profitAndLoss", "profitAndLossValue", "pnl", "realisedPnl", "realizedPnl"):
-            if k not in tx or tx.get(k) is None:
-                continue
-            v = tx.get(k)
-            if isinstance(v, (int, float)):
-                return float(v)
-            s = str(v).strip()
-            m = re.search(r"[-+]?\d+(?:\.\d+)?", s.replace(",", ""))
-            if m:
-                try:
-                    return float(m.group(0))
-                except Exception:
-                    continue
-        return None
-
-    def _parse_price(tx: dict, keys: tuple[str, ...]) -> float | None:
-        for k in keys:
-            if k not in tx or tx.get(k) is None:
-                continue
-            v = tx.get(k)
-            if isinstance(v, (int, float)):
-                return float(v)
-            s = str(v).strip()
-            m = re.search(r"[-+]?\d+(?:\.\d+)?", s.replace(",", ""))
-            if m:
-                try:
-                    return float(m.group(0))
-                except Exception:
-                    continue
-        return None
-
-    def _fallback_compute(tx: dict) -> float | None:
-        """
-        If broker doesn't return realised PnL yet (or ever), attempt to compute it.
-        Uses entry_price/size/direction from the DB row and a close price from tx.
-        """
-        if not fallback_calc:
-            return None
-        try:
-            direction = str(fallback_calc.get("direction") or "").strip().upper()
-            entry = float(fallback_calc.get("entry_price") or 0)
-            qty = float(fallback_calc.get("size") or 0)
-            if not direction or entry <= 0 or qty <= 0:
-                return None
-        except Exception:
-            return None
-
-        # Try to locate an execution/close price in the transaction payload.
-        close_px = _parse_price(
-            tx,
-            (
-                "level",
-                "price",
-                "closeLevel",
-                "closingLevel",
-                "closePrice",
-                "executionPrice",
-            ),
-        )
-        if close_px is None or close_px <= 0:
-            return None
-
-        diff = (close_px - entry) if direction == "BUY" else (entry - close_px)
-        pnl_est = diff * qty
-        # Avoid rounding noise being treated as "real".
-        if abs(pnl_est) < 0.005:
-            return 0.0
-        return float(pnl_est)
-
-    def _fetch(params: dict | None) -> list:
-        res = requests.get(
-            f"{base_url}/history/transactions",
-            params=params or {},
-            headers=headers,
-        )
-        if res.status_code != 200:
-            return []
-        return (res.json() or {}).get("transactions", []) or []
-
-    # When called from sync for externally-closed deals, the broker may not
-    # have the realized PnL populated yet. We can safely retry briefly.
-    attempts = 1
-    delay_s = 0.0
-    if wait_for_realized:
-        attempts = 5
-        delay_s = 0.7
-
-    pnl_zero_candidate: float | None = None
-
-    for attempt in range(attempts):
-        try:
-            # Try direct dealId filter first.
-            txs = _fetch({"dealId": str(deal_id)})
-            # Fallback: fetch recent transactions window and match manually.
-            if not txs:
-                txs = _fetch({"max": 200})
-
-            for tx in txs:
-                tx_deal = tx.get("dealId")
-                tx_ref  = tx.get("dealReference")
-                if str(tx_deal) == str(deal_id) or str(tx_ref) == str(deal_id):
-                    p = _parse_pnl(tx)
-                    if p is None:
-                        # Try fallback compute when realisedPnL is absent.
-                        f = _fallback_compute(tx)
-                        if f is None:
-                            continue
-                        p = f
-                    p_f = float(p)
-
-                    # If realizedPnL is still not ready, broker may temporarily
-                    # return 0.0. Retry when we got 0.0.
-                    if p_f == 0.0:
-                        pnl_zero_candidate = 0.0
-                        continue
-                    return p_f
-        except Exception:
-            # On transient API/network issues we retry (when enabled).
-            pass
-
-        if delay_s and attempt < attempts - 1:
-            time.sleep(delay_s)
-
-    return float(pnl_zero_candidate) if pnl_zero_candidate is not None else 0.0
-
-
 def backfill_closed_pnls(chat_id, base_url, headers, lookback: int = 200) -> int:
     """
     Backfill missing/zero PnL values for already CLOSED trades from broker history.
@@ -395,23 +392,15 @@ def backfill_closed_pnls(chat_id, base_url, headers, lookback: int = 200) -> int
         # Backfill only unknown/zero rows.
         if pnl is not None and float(pnl) != 0.0:
             continue
-        fetched = _fetch_closed_pnl(base_url, headers, str(deal_id))
-        if fetched == 0.0:
-            fetched = _fetch_closed_pnl(
-                base_url,
-                headers,
-                str(deal_id),
-                wait_for_realized=True,
-                fallback_calc={
-                    "direction": direction,
-                    "entry_price": entry_price,
-                    "size": size,
-                },
-            )
-        # Skip when broker still returns zero/unknown.
-        if fetched == 0.0:
+        final = fetch_closed_deal_final_data(base_url, headers, str(deal_id), wait_for_realized=True)
+        if not final:
             continue
-        c.execute("UPDATE trades SET pnl=? WHERE trade_id=?", (float(fetched), int(trade_id)))
+        fetched = float(final["actual_pnl"])
+        exit_price = final.get("exit_price")
+        c.execute(
+            "UPDATE trades SET pnl=?, actual_pnl=?, exit_price=? WHERE trade_id=?",
+            (float(fetched), float(fetched), float(exit_price) if exit_price is not None else None, int(trade_id)),
+        )
         if c.rowcount == 1:
             updated += 1
 

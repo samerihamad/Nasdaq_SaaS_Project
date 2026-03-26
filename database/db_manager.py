@@ -71,6 +71,12 @@ def create_db():
         ('leg_role', "TEXT"),
         ('parent_session', "TEXT"),
         ('stop_distance', "REAL"),
+        # Final broker-truth fields (synced from Capital.com history after close).
+        # `pnl` remains for backward compatibility (reports/analytics) and is set to `actual_pnl`.
+        ('actual_pnl', 'REAL'),
+        ('exit_price', 'REAL'),
+        ('target_reached', "TEXT"),
+        ('close_reason', "TEXT"),
     ]:
         try:
             c.execute(f"ALTER TABLE trades ADD COLUMN {col} {definition}")

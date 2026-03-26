@@ -62,18 +62,44 @@ def _outcome_title_ar(pnl: float, partial: bool = False) -> str:
 
 def _outcome_title_en(pnl: float, partial: bool = False) -> str:
     if pnl > 0:
-        return "✅ *Winning trade*" + (" — partial" if partial else "") + "\n"
+        return "✅ *Profit Trade*" + (" — partial" if partial else "") + "\n"
     if pnl < 0:
-        return "❌ *Losing trade*" + (" — partial" if partial else "") + "\n"
-    return "⚖️ *Breakeven*\n"
+        return "❌ *Loss Trade*" + (" — partial" if partial else "") + "\n"
+    return "⚖️ *Break-even*\n"
+
+
+def _is_profit_exception_tp1_then_be(
+    *,
+    pnl: float,
+    tp1_was_hit: bool,
+) -> bool:
+    """
+    Exception rule:
+    If TP1 was hit, and later SL is hit around entry (or slight profit),
+    we must classify as Profit Trade.
+    """
+    if not tp1_was_hit:
+        return False
+    # Treat tiny negatives / zero as profit under this exception.
+    return float(pnl) >= -0.01
+
+
+def _outcome_title_en_with_exception(pnl: float, *, tp1_was_hit: bool, partial: bool = False) -> str:
+    if pnl > 0 or _is_profit_exception_tp1_then_be(pnl=pnl, tp1_was_hit=tp1_was_hit):
+        return "✅ *Profit Trade*" + (" — partial" if partial else "") + "\n"
+    if pnl < 0:
+        return "❌ *Loss Trade*" + (" — partial" if partial else "") + "\n"
+    return "⚖️ *Break-even*\n"
 
 
 def send_reconcile_tp1_hit(
     chat_id: str,
     *,
+    trade_id: int,
     symbol: str,
     direction: str,
     entry_price: float,
+    exit_price: float | None,
     size: float,
     pnl: float,
     stop_distance: float | None,
@@ -86,15 +112,17 @@ def send_reconcile_tp1_hit(
 
     if lang == "en":
         body = (
-            _outcome_title_en(pnl, partial=True)
+            _outcome_title_en_with_exception(pnl, tp1_was_hit=True, partial=True)
             + f"━━━━━━━━━━━━━━━━━━━━\n"
-            + f"📌 *Symbol*     : *{symbol}*\n"
+            + f"📌 *Asset*      : *{symbol}*\n"
+            + f"🆔 *Trade ID*   : *{trade_id}*\n"
             + f"▶️ *Direction*  : *{direction}*\n"
             + f"💰 *Entry*      : *${entry_price:,.2f}*\n"
+            + (f"🏁 *Exit*       : *${exit_price:,.2f}*\n" if exit_price is not None else "")
             + f"🔢 *Qty (leg 1)*: *{int(size)}* shares\n"
-            + f"💵 *P&L (broker)*: *{_fmt_money_signed(pnl)}*\n"
+            + f"💵 *Realized P&L*: *{_fmt_money_signed(pnl)}*\n"
             + f"🎯 *R (this leg)*: *{_fmt_r(r_leg)}*\n"
-            + f"📍 *Hit*        : *TP1 (1R target)*\n"
+            + f"📍 *Target*     : *Target 1 Hit*\n"
             + f"━━━━━━━━━━━━━━━━━━━━\n"
         )
         if tp2_still_open:
@@ -130,9 +158,11 @@ def send_reconcile_tp1_hit(
 def send_reconcile_tp2_final(
     chat_id: str,
     *,
+    trade_id: int,
     symbol: str,
     direction: str,
     entry_price: float,
+    exit_price: float | None,
     total_qty: float,
     tp1_pnl: float,
     tp2_pnl: float,
@@ -145,22 +175,24 @@ def send_reconcile_tp2_final(
     lang = get_subscriber_lang(chat_id)
 
     if lang == "en":
-        title = _outcome_title_en(total_pnl, partial=False)
+        title = _outcome_title_en_with_exception(total_pnl, tp1_was_hit=(tp1_pnl > 0), partial=False)
         body = (
             title
             + f"━━━━━━━━━━━━━━━━━━━━\n"
-            + f"📌 *Symbol*        : *{symbol}*\n"
+            + f"📌 *Asset*         : *{symbol}*\n"
+            + f"🆔 *Trade ID*      : *{trade_id}*\n"
             + f"▶️ *Direction*     : *{direction}*\n"
             + f"💰 *Entry*         : *${entry_price:,.2f}*\n"
+            + (f"🏁 *Exit*          : *${exit_price:,.2f}*\n" if exit_price is not None else "")
             + f"🔢 *Total quantity*: *{int(total_qty)}* shares\n"
             + f"━━━━━━━━━━━━━━━━━━━━\n"
             + f"💰 *TP1 (1R) P&L*  : *{_fmt_money_signed(tp1_pnl)}*\n"
             + f"💰 *TP2 (1.5%) P&L*: *{_fmt_money_signed(tp2_pnl)}*\n"
             + f"━━━━━━━━━━━━━━━━━━━━\n"
-            + f"*Total P&L*       : *{_fmt_money_signed(total_pnl)}*\n"
+            + f"*Final Realized P&L*: *{_fmt_money_signed(total_pnl)}*\n"
             + f"🎯 *R*             : *{_fmt_r(total_r)}*\n"
             + f"━━━━━━━━━━━━━━━━━━━━\n"
-            + f"_P&L from broker history where available._\n"
+            + f"📍 *Target*        : *Target 2 / Trailing Stop*\n"
         )
     else:
         title = _outcome_title_ar(total_pnl, partial=False)
@@ -187,9 +219,11 @@ def send_reconcile_tp2_final(
 def send_reconcile_generic_external(
     chat_id: str,
     *,
+    trade_id: int,
     symbol: str,
     direction: str,
     entry_price: float,
+    exit_price: float | None,
     size: float,
     pnl: float,
     stop_distance: float | None,
@@ -202,16 +236,18 @@ def send_reconcile_generic_external(
     lang = get_subscriber_lang(chat_id)
 
     if lang == "en":
-        title = _outcome_title_en(pnl, partial=False)
+        title = _outcome_title_en_with_exception(pnl, tp1_was_hit=False, partial=False)
         body = (
             title
             + f"━━━━━━━━━━━━━━━━━━━━\n"
-            + f"📌 *Symbol*     : *{symbol}*\n"
+            + f"📌 *Asset*      : *{symbol}*\n"
+            + f"🆔 *Trade ID*   : *{trade_id}*\n"
             + f"▶️ *Direction*  : *{direction}*\n"
             + f"💰 *Entry*      : *${entry_price:,.2f}*\n"
+            + (f"🏁 *Exit*       : *${exit_price:,.2f}*\n" if exit_price is not None else "")
             + f"🔢 *Quantity*   : *{int(size)}* shares\n"
             + f"━━━━━━━━━━━━━━━━━━━━\n"
-            + f"*Total P&L*    : *{_fmt_money_signed(pnl)}*\n"
+            + f"*Final Realized P&L*: *{_fmt_money_signed(pnl)}*\n"
             + f"🎯 *R*         : *{_fmt_r(r_mult)}*\n"
             + f"━━━━━━━━━━━━━━━━━━━━\n"
             + f"_Close synced from platform ({reason_hint})._\n"
@@ -238,9 +274,11 @@ def send_reconcile_generic_external(
 def send_bot_automated_close(
     chat_id: str,
     *,
+    trade_id: int | None = None,
     symbol: str,
     direction: str,
     entry_price: float,
+    exit_price: float | None = None,
     size: float,
     pnl: float,
     stop_distance: float | None,
@@ -248,6 +286,7 @@ def send_bot_automated_close(
     stop_label: str,
     sibling_tp2_open: bool,
     leg_role: str,
+    target_reached: str | None = None,
 ) -> None:
     sd = _resolve_stop_distance(stop_distance, entry_price, trailing_stop)
     r_mult = pnl_to_r_multiple(pnl, sd, size)
@@ -255,18 +294,24 @@ def send_bot_automated_close(
     partial = bool(leg_role == "TP1" and sibling_tp2_open)
 
     if lang == "en":
-        title = _outcome_title_en(pnl, partial=partial)
+        # Exception only applies when TP1 was hit earlier for the session; for bot-close
+        # we infer it from the target label if provided.
+        tp1_was_hit = str(target_reached or "").upper() in ("STOP_AFTER_TP1", "TARGET_1_HIT", "TARGET_2_HIT", "TRAILING_STOP_EXIT")
+        title = _outcome_title_en_with_exception(pnl, tp1_was_hit=tp1_was_hit, partial=partial)
         body = (
             title
             + f"🔔 *Auto close (bot)* — *{symbol}*\n"
             + f"━━━━━━━━━━━━━━━━━━━━\n"
+            + (f"🆔 *Trade ID*   : *{trade_id}*\n" if trade_id is not None else "")
             + f"▶️ *Direction*  : *{direction}*\n"
             + f"💰 *Entry*      : *${entry_price:,.2f}*\n"
+            + (f"🏁 *Exit*       : *${exit_price:,.2f}*\n" if exit_price is not None else "")
             + f"🔢 *Qty (leg)*  : *{int(size)}* shares\n"
             + f"📍 *Reason*     : _{stop_label}_\n"
             + f"━━━━━━━━━━━━━━━━━━━━\n"
-            + f"*Total P&L*    : *{_fmt_money_signed(pnl)}*\n"
+            + f"*Final Realized P&L*: *{_fmt_money_signed(pnl)}*\n"
             + f"🎯 *R*         : *{_fmt_r(r_mult)}*\n"
+            + (f"📍 *Target*     : *{target_reached}*\n" if target_reached else "")
         )
         if sibling_tp2_open and leg_role == "TP1":
             body += (
