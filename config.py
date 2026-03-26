@@ -77,7 +77,17 @@ ATR_PERIOD           = 14
 # These targets are used to set TP1/TP2 levels regardless of ATR/stop_distance.
 # TP1/T2 are percentages from entry price in the direction of the trade.
 TP1_PCT = 0.01   # 1%
-TP2_PCT = 0.015  # 1.5%
+TP2_PCT = 0.025  # 2.5%
+
+# ── Multi-leg execution split ────────────────────────────────────────────────
+# Capital.com only supports one TP per position, so we split into 2 legs:
+# - TP1 leg closes at Target 1
+# - TP2 leg closes at Target 2
+TP1_SPLIT_PCT = 0.70  # 70% size at TP1
+TP2_SPLIT_PCT = 0.30  # 30% size at TP2
+
+# When broker enforces min distance for profit targets, we can widen TP2 slightly.
+TP2_MIN_DISTANCE_BUFFER_MULT = 1.05
 
 # After TP1 is reached we "lock" the stop on TP2 leg so that the position
 # doesn't fall back to entry. We use a tiny buffer beyond breakeven to

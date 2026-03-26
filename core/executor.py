@@ -5,7 +5,14 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from bot.notifier import send_telegram_message
 from bot.licensing import safe_decrypt
-from config import TP1_PCT, TP2_PCT, BE_LOCK_BUFFER_PCT
+from config import (
+    TP1_PCT,
+    TP2_PCT,
+    TP1_SPLIT_PCT,
+    TP2_SPLIT_PCT,
+    TP2_MIN_DISTANCE_BUFFER_MULT,
+    BE_LOCK_BUFFER_PCT,
+)
 from database.db_manager import is_maintenance_mode, get_subscriber_lang
 from core.risk_manager import (
     can_open_trade,
@@ -308,6 +315,69 @@ def _get_min_stop_profit_distance(base_url, headers, epic) -> float | None:
     except Exception:
         return None
     return None
+
+
+def _market_tradeability(base_url: str, headers: dict, epic: str) -> tuple[bool, str]:
+    """
+    Check if an instrument is currently tradable on Capital.com.
+    Returns (is_tradeable, status_string).
+    """
+    if not epic:
+        return False, "UNKNOWN"
+    try:
+        res = requests.get(f"{base_url}/markets/{epic}", headers=headers, timeout=20)
+        if res.status_code != 200:
+            return False, f"HTTP_{res.status_code}"
+        data = res.json() or {}
+        status = str(data.get("marketStatus") or data.get("snapshot", {}).get("marketStatus") or "").upper()
+        if not status:
+            status = str((data.get("instrument") or {}).get("marketStatus") or "").upper()
+        return status in ("TRADEABLE", "OPEN"), (status or "UNKNOWN")
+    except Exception:
+        return False, "ERROR"
+
+
+def _split_qty_70_30(*, qty_total: float, min_deal_size: float) -> tuple[bool, float, float, str]:
+    """
+    Compute a robust 70/30 split and enforce broker min lot size.
+    Stop-condition: if either leg is below min_deal_size, caller must abort.
+    """
+    try:
+        q = int(round(float(qty_total)))
+    except Exception:
+        return False, 0.0, 0.0, "invalid total quantity"
+    if q <= 0:
+        return False, 0.0, 0.0, "total quantity <= 0"
+
+    md = float(min_deal_size or 1.0)
+    q1 = int(q * float(TP1_SPLIT_PCT))
+    q1 = max(0, q1)
+    q2 = int(q - q1)
+    if q1 <= 0 or q2 <= 0:
+        return False, float(q1), float(q2), "quantity split produced zero-size leg"
+    if float(q1) < md or float(q2) < md:
+        return (
+            False,
+            float(q1),
+            float(q2),
+            f"split below broker minimum lot size (min={md}, tp1={q1}, tp2={q2})",
+        )
+    return True, float(q1), float(q2), ""
+
+
+def _delete_position(base_url: str, headers: dict, deal_id: str) -> tuple[bool, str]:
+    """Attempt to close an open broker position by dealId."""
+    if not deal_id:
+        return False, "missing deal_id"
+    try:
+        res = requests.delete(f"{base_url}/positions/{deal_id}", headers=headers, timeout=20)
+        if res.status_code == 200:
+            return True, "ok"
+        t = (res.text or "").strip()
+        t = t[:240] + ("..." if len(t) > 240 else "")
+        return False, f"HTTP_{res.status_code} {t}"
+    except Exception as exc:
+        return False, str(exc)
 
 
 def _apply_min_distance_to_protection(
@@ -1086,6 +1156,12 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
     entry_price = _get_current_price(base_url, headers, order_epic)
     atr         = calculate_atr(symbol)
 
+    # ── Market hours / tradability gate (before opening ANY leg) ─────────────
+    is_tradeable, m_status = _market_tradeability(base_url, headers, order_epic)
+    if not is_tradeable:
+        print(f"Trade skipped: Market Closed for {symbol} ({order_epic}) status={m_status}")
+        return f"⏭️ Trade skipped: Market Closed for {symbol}"
+
     # ── R:R ratio gate ────────────────────────────────────────────────────────
     if atr and entry_price > 0:
         # Compute stop price from stop_loss_pct (strategy-supplied) or ATR fallback
@@ -1156,119 +1232,130 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
         action, entry_price, stop_level, target1, target2
     )
 
-    # Broker dealing rules: enforce minimum stop/profit distance if provided.
-    # This prevents failures like: error.invalid.takeprofit.minvalue
+    # Broker dealing rules: validate minimum stop/profit distance.
+    # Requirement:
+    # - TP1 must remain 1%. If it violates min distance, skip the trade (do not open any leg).
+    # - TP2 can be widened slightly if too tight.
     min_dist = _get_min_stop_profit_distance(base_url, headers, order_epic)
-    stop_level, target1 = _apply_min_distance_to_protection(
-        action, entry_price, stop_level, target1, min_dist
-    )
-    # Re-sanitize after widening levels.
-    stop_level, target1, target2 = _sanitize_protection_levels(
-        action, entry_price, stop_level, target1, target2
-    )
+    if min_dist and float(min_dist) > 0 and entry_price > 0:
+        md = float(min_dist)
+        tp1_dist = abs(float(target1) - float(entry_price))
+        if tp1_dist < md:
+            msg = (
+                f"⏭️ Trade skipped ({symbol} {action}): "
+                f"Target 1 distance too tight for broker rules (min={md:.4f}, got={tp1_dist:.4f})"
+            )
+            print(msg)
+            return msg
+        tp2_dist = abs(float(target2) - float(entry_price))
+        if tp2_dist < md:
+            widen = md * float(TP2_MIN_DISTANCE_BUFFER_MULT)
+            target2 = (
+                float(entry_price) + widen
+                if action == "BUY"
+                else float(entry_price) - widen
+            )
+            stop_level, target1, target2 = _sanitize_protection_levels(
+                action, entry_price, stop_level, target1, target2
+            )
 
     # Split into two positions to support TP1 + TP2 on broker.
     # Capital applies one TP per position, so we split size intentionally.
     min_deal_size = _get_min_deal_size(base_url, headers, order_epic)
-    required_for_two_legs = max(2.0, 2.0 * min_deal_size)
-    qty_total = max(required_for_two_legs, float(size))
-    # Keep integer-style execution to match current reporting semantics.
-    qty_total = float(int(round(qty_total)))
-    if qty_total < required_for_two_legs:
-        qty_total = required_for_two_legs
-
-    qty1 = float(int(round(qty_total / 2)))
-    qty2 = float(int(round(qty_total - qty1)))
-    if qty1 < min_deal_size:
-        qty1 = min_deal_size
-        qty2 = max(min_deal_size, qty_total - qty1)
-    if qty2 < min_deal_size:
-        qty2 = min_deal_size
-        qty1 = max(min_deal_size, qty_total - qty2)
+    qty_total = float(int(round(float(size))))
+    ok_split, qty1, qty2, split_err = _split_qty_70_30(qty_total=qty_total, min_deal_size=min_deal_size)
+    if not ok_split:
+        msg = f"❌ Order blocked ({symbol} {action}): {split_err}"
+        print(msg)
+        return msg
 
     qty_total = qty1 + qty2
-    # TP1 leg closes at TP1; TP2 leg has no fixed profitLevel and will be
-    # managed by trailing-stop after it reaches TP2 threshold.
-    legs = [(qty1, target1), (qty2, None)]
-    auto_upsized = qty_total > float(size)
 
-    opened_legs = []
-    opened_trade_ids: list[int] = []
+    # Both legs have fixed TPs now (70% at TP1, 30% at TP2).
+    legs = [
+        {"role": "TP1", "size": float(qty1), "tp": float(target1)},
+        {"role": "TP2", "size": float(qty2), "tp": float(target2)},
+    ]
+
+    # Atomic execution: open/confirm BOTH legs first, then write to DB.
+    opened_broker_legs: list[dict] = []
     parent_session = str(uuid.uuid4())
-    for idx, (leg_size, leg_target) in enumerate(legs):
-        leg_role = "TP1" if idx == 0 else "TP2"
-        ok, out = _open_position_with_protection(
-            base_url, headers, order_epic, action, leg_size, stop_level, leg_target
-        )
-        # If broker rejects TP as too close, retry once with widened TP from error code.
-        if (not ok) and isinstance(out, str) and "takeprofit.minvalue" in out.lower() and leg_target is not None:
-            try:
-                import re as _re
-                m = _re.search(r"minvalue:\s*([0-9]+(?:\.[0-9]+)?)", out, flags=_re.IGNORECASE)
-                req = float(m.group(1)) if m else None
-            except Exception:
-                req = None
-            if req and req > 0:
-                widened_stop, widened_tp = _apply_min_distance_to_protection(
-                    action, entry_price, stop_level, leg_target, req
-                )
-                widened_stop, widened_tp, _ = _sanitize_protection_levels(
-                    action, entry_price, widened_stop, widened_tp, widened_tp
-                )
-                ok, out = _open_position_with_protection(
-                    base_url, headers, order_epic, action, leg_size, widened_stop, widened_tp
-                )
-                if ok:
-                    stop_level = widened_stop
-                    leg_target = widened_tp
-        if not ok:
-            # If first leg fails, abort immediately. If second fails, keep first
-            # and warn user to avoid hidden exposure.
-            if not opened_legs:
-                msg = f"❌ Order failed ({symbol} {action}): {out}"
-                send_telegram_message(chat_id, msg)
-                return msg
-            send_telegram_message(
-                chat_id,
-                f"⚠️ {symbol}: first leg opened, second TP leg failed.\n"
-                f"Please review position manually.\n"
-                f"Error: {out}"
+
+    for idx, leg in enumerate(legs):
+        leg_role = str(leg["role"])
+        leg_size = float(leg["size"])
+        leg_target = float(leg["tp"])
+
+        # Retry TP2 once by widening TP2 if needed.
+        attempts = 2 if leg_role == "TP2" else 1
+        last_err = ""
+        for attempt in range(attempts):
+            ok, out = _open_position_with_protection(
+                base_url, headers, order_epic, action, leg_size, stop_level, leg_target
             )
+            if not ok:
+                last_err = str(out)
+                if leg_role == "TP2" and attempt == 0 and min_dist and float(min_dist) > 0 and entry_price > 0:
+                    widen = float(min_dist) * float(TP2_MIN_DISTANCE_BUFFER_MULT)
+                    leg_target = (float(entry_price) + widen) if action == "BUY" else (float(entry_price) - widen)
+                    stop_level, target1, leg_target = _sanitize_protection_levels(
+                        action, entry_price, stop_level, target1, leg_target
+                    )
+                    continue
+                break
+
+            payload = out if isinstance(out, dict) else {}
+            ok_deal, deal_id, cerr = _confirm_deal_and_visibility(
+                base_url,
+                headers,
+                payload,
+                order_epic=order_epic,
+                direction=action,
+                leg_size=float(leg_size),
+                exclude_deal_ids={str(x.get("deal_id")).strip() for x in opened_broker_legs if str(x.get("deal_id")).strip()},
+            )
+            if not ok_deal or not deal_id:
+                last_err = str(cerr)
+                break
+
+            opened_broker_legs.append(
+                {"role": leg_role, "size": float(leg_size), "tp": float(leg_target), "deal_id": str(deal_id)}
+            )
+            ok_sync, info = _sync_protection_to_broker(
+                base_url, headers, str(deal_id), stop_level, float(leg_target)
+            )
+            if not ok_sync:
+                print(
+                    f"⚠️  Broker TP/SL sync failed "
+                    f"[{symbol} {deal_id}] sl={stop_level:.4f} tp={float(leg_target):.4f} :: {info}"
+                )
             break
 
-        payload = out if isinstance(out, dict) else {}
-        ok_deal, deal_id, cerr = _confirm_deal_and_visibility(
-            base_url,
-            headers,
-            payload,
-            order_epic=order_epic,
-            direction=action,
-            leg_size=float(leg_size),
-            exclude_deal_ids={str(d).strip() for (_, _, d) in opened_legs if str(d).strip()},
-        )
-        if not ok_deal or not deal_id:
-            if not opened_legs:
-                msg = f"❌ Order failed ({symbol} {action}): {cerr}"
-                send_telegram_message(chat_id, msg)
-                return msg
-            send_telegram_message(
-                chat_id,
-                f"⚠️ {symbol}: first leg is open, second leg not confirmed on broker.\n"
-                f"{cerr}\n"
-                f"Please verify positions manually."
+        # If this leg failed, rollback any opened legs and abort (no half-configured trade).
+        if len(opened_broker_legs) != (idx + 1):
+            for ob in reversed(opened_broker_legs):
+                ok_del, info = _delete_position(base_url, headers, str(ob.get("deal_id") or ""))
+                if not ok_del:
+                    print(f"⚠️  Rollback failed for {symbol} deal={ob.get('deal_id')}: {info}")
+            reason = last_err or "unknown rejection"
+            msg = (
+                f"❌ Order rejected ({symbol} {action}) — {leg_role} failed.\n"
+                f"Reason: {reason}"
             )
-            break
+            send_telegram_message(chat_id, msg)
+            return msg
 
-        opened_legs.append((leg_size, leg_target, deal_id))
+    opened_trade_ids: list[int] = []
+    for ob in opened_broker_legs:
         tid = record_open_trade(
             chat_id,
             symbol,
             action,
             entry_price,
-            leg_size,
-            deal_id,
+            float(ob["size"]),
+            str(ob["deal_id"]),
             stop_level,
-            leg_role=leg_role,
+            leg_role=str(ob["role"]),
             parent_session=parent_session,
             stop_distance=stop_dist,
         )
@@ -1277,14 +1364,9 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
                 opened_trade_ids.append(int(tid))
         except Exception:
             pass
-        ok, info = _sync_protection_to_broker(
-            base_url, headers, deal_id, stop_level, leg_target
-        )
-        if not ok:
-            print(
-                f"⚠️  Broker TP/SL sync failed "
-                f"[{symbol} {deal_id}] sl={stop_level:.4f} tp={leg_target:.4f} :: {info}"
-            )
+
+    opened_legs = [(float(ob["size"]), float(ob["tp"]), str(ob["deal_id"])) for ob in opened_broker_legs]
+    partial_only_one_leg = False
 
     if not opened_legs:
         err = f"❌ Order failed ({symbol} {action}): no verified open position on broker"
@@ -1292,13 +1374,8 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
         return err
 
     verified_qty = float(sum(l[0] for l in opened_legs))
-    partial_only_one_leg = len(opened_legs) < len(legs)
-    if partial_only_one_leg:
-        total_amount = entry_price * verified_qty
-        risk_amount = stop_dist * verified_qty
-    else:
-        total_amount = entry_price * qty_total
-        risk_amount = stop_dist * qty_total
+    total_amount = entry_price * verified_qty
+    risk_amount = stop_dist * verified_qty
 
     qty_display = int(verified_qty)
 
@@ -1339,12 +1416,11 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🔴  Stop Loss    :  *{_fmt_money(stop_level)}*\n"
             f"🎯  Target 1     :  *{_fmt_money(target1)}*  ({int(qty1)} shares — +{TP1_PCT * 100:.2f}%)\n"
-            f"🏆  Target 2     :  *{_fmt_money(target2)}*  ({int(qty2)} shares — +{TP2_PCT * 100:.2f}% triggers trailing)\n"
+            f"🏆  Target 2     :  *{_fmt_money(target2)}*  ({int(qty2)} shares — +{TP2_PCT * 100:.2f}%)\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⚠️  Risk Amount  :  *{_fmt_money(risk_amount)}*\n"
             f"🕐  Time (ET)    :  {now_et_str}"
             f"{partial_note_en}"
-            f"{f'\\nℹ️  Size auto-adjusted to broker minimum for TP1/TP2: {int(qty_total)} shares' if auto_upsized else ''}"
         )
     else:
         override_line = "⚠️ تجاوز يدوي — جاري فتح صفقة جديدة\n\n" if is_override else ""
@@ -1359,12 +1435,11 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🔴  وقف الخسارة   :  *{_fmt_money(stop_level)}*\n"
             f"🎯  الهدف 1        :  *{_fmt_money(target1)}*  ({int(qty1)} سهم — +{TP1_PCT * 100:.2f}%)\n"
-            f"🏆  الهدف 2        :  *{_fmt_money(target2)}*  ({int(qty2)} سهم — +{TP2_PCT * 100:.2f}% لتفعيل التريلينج)\n"
+            f"🏆  الهدف 2        :  *{_fmt_money(target2)}*  ({int(qty2)} سهم — +{TP2_PCT * 100:.2f}%)\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⚠️  المخاطرة       :  *{_fmt_money(risk_amount)}*\n"
             f"🕐  التوقيت (ET)   :  {now_et_str}"
             f"{partial_note_ar}"
-            f"{f'\\nℹ️  تم تعديل الكمية تلقائيًا للحد الأدنى لدى الوسيط للحفاظ على الهدفين: {int(qty_total)} سهم' if auto_upsized else ''}"
         )
 
     send_telegram_message(chat_id, msg)
