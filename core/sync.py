@@ -37,7 +37,7 @@ def fetch_closed_deal_final_data(
     *,
     wait_for_realized: bool = True,
     identifiers: list[str] | None = None,
-    lookback_max: int = 500,
+    lookback_max: int = 2000,
 ) -> dict | None:
     """
     Fetch broker-truth final close data for a dealId from Capital.com history.
@@ -111,8 +111,10 @@ def fetch_closed_deal_final_data(
             return False, [], int(res.status_code), txt[:300]
         return True, (res.json() or {}).get("transactions", []) or [], int(res.status_code), ""
 
-    attempts = 5 if wait_for_realized else 2
-    delay_s = 0.75 if wait_for_realized else 0.0
+    # Capital history can lag after close (especially around session transitions).
+    # Use more attempts + a slightly longer delay to reduce "transaction not found yet".
+    attempts = 12 if wait_for_realized else 3
+    delay_s = 1.2 if wait_for_realized else 0.0
 
     ids = [str(deal_id)]
     if identifiers:
@@ -159,7 +161,8 @@ def fetch_closed_deal_final_data(
             }
 
         if delay_s and attempt < attempts - 1:
-            time.sleep(delay_s)
+            # Gentle linear backoff; keeps API pressure reasonable.
+            time.sleep(delay_s + (0.25 * attempt))
 
     # Stop-condition: not found / not ready.
     print("Error: Could not sync final data from Capital.com", flush=True)
