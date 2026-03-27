@@ -81,8 +81,12 @@ def _macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
 
 def _vwap(df: pd.DataFrame) -> pd.Series:
     """Session-reset VWAP for intraday; rolling-20 for daily."""
-    typical = (df['High'] + df['Low'] + df['Close']).squeeze() / 3
-    volume  = df['Volume'].squeeze()
+    df = _flatten(df)
+    high = _col_series(df, 'High')
+    low = _col_series(df, 'Low')
+    close = _col_series(df, 'Close')
+    typical = (high + low + close) / 3
+    volume = _col_series(df, 'Volume')
     is_intraday = len(df) > 1 and (df.index[1] - df.index[0]).total_seconds() < 86400
     if is_intraday:
         dates  = pd.Series([ts.date() for ts in df.index], index=df.index)
@@ -95,9 +99,9 @@ def _vwap(df: pd.DataFrame) -> pd.Series:
 
 
 def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    high  = df['High'].squeeze().astype(float)
-    low   = df['Low'].squeeze().astype(float)
-    close = df['Close'].squeeze().astype(float)
+    high  = _col_series(df, 'High')
+    low   = _col_series(df, 'Low')
+    close = _col_series(df, 'Close')
     prev  = close.shift(1)
     tr = pd.concat([
         (high - low),
@@ -114,6 +118,24 @@ def _flatten(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _col_series(df: pd.DataFrame, col: str) -> pd.Series:
+    """
+    Return a float Series for `col` with `df.index`, even if the input frame
+    has a single row (where `.squeeze()` would otherwise return a scalar).
+    """
+    if df is None or col not in df.columns:
+        return pd.Series([], dtype=float)
+    s = df[col]
+    if isinstance(s, pd.DataFrame):
+        s = s.iloc[:, 0]
+    # Avoid `.squeeze()` — it turns 1-row columns into numpy scalars.
+    try:
+        s = pd.Series(s.values, index=df.index, dtype=float)
+    except Exception:
+        s = pd.Series(list(s), index=df.index, dtype=float)
+    return s
+
+
 # ── Feature engineering ───────────────────────────────────────────────────────
 
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -126,10 +148,10 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     df = _flatten(df)
 
-    close  = df['Close'].squeeze().astype(float)
-    high   = df['High'].squeeze().astype(float)
-    low    = df['Low'].squeeze().astype(float)
-    volume = df['Volume'].squeeze().astype(float)
+    close  = _col_series(df, 'Close')
+    high   = _col_series(df, 'High')
+    low    = _col_series(df, 'Low')
+    volume = _col_series(df, 'Volume')
 
     ema20  = _ema(close, 20)
     ema50  = _ema(close, 50)
@@ -172,7 +194,7 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def _make_labels(df: pd.DataFrame) -> pd.Series:
     """Label each bar BUY / SELL / HOLD based on future price movement."""
-    close         = df['Close'].squeeze().astype(float)
+    close         = _col_series(df, 'Close')
     future_return = close.shift(-FUTURE_BARS) / close - 1
     labels        = pd.Series(LABEL_HOLD, index=df.index)
     labels[future_return >  RETURN_THRESHOLD] = LABEL_BUY
@@ -461,7 +483,8 @@ def _rule_based_probability(df: pd.DataFrame, direction: str) -> float:
     Returns 0–100.
     """
     try:
-        close = df['Close'].squeeze().astype(float)
+        df = _flatten(df)
+        close = _col_series(df, 'Close')
         ema20  = _ema(close, 20)
         ema50  = _ema(close, 50)
         ema200 = _ema(close, 200)
