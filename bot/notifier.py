@@ -60,30 +60,26 @@ def send_telegram_message(chat_id, message):
         return None
 
 
-def notify_admin_payment(chat_id: str, full_name: str, tier: int, proof_file_id: str):
+def notify_admin_payment(chat_id: str, full_name: str, proof_file_id: str):
     """
     Notify admin of a new payment via:
       1. Telegram photo with Approve / Reject inline buttons
       2. Email  (requires SMTP_* env vars)
       3. WhatsApp via Twilio  (requires TWILIO_* env vars)
     """
-    tier_label = (
-        "Basic Plan — $50/month (3 trades/day, 2x leverage)"
-        if tier == 1 else
-        "Advanced Plan — $100/month (Unlimited, up to 10x leverage)"
-    )
+    plan_label = "Institutional Plan — $100/month"
 
     caption = (
         f"*New Subscription Request*\n\n"
         f"Name: *{full_name}*\n"
-        f"Package: *{tier_label}*\n"
+        f"Plan: *{plan_label}*\n"
         f"Chat ID: `{chat_id}`\n\n"
         f"Approve or reject the payment proof below:"
     )
 
     _send_admin_photo(chat_id, proof_file_id, caption)
-    _send_email_alert(full_name, tier_label, chat_id)
-    _send_whatsapp_alert(full_name, tier_label)
+    _send_email_alert(full_name, chat_id)
+    _send_whatsapp_alert(full_name)
 
 
 def _send_admin_photo(user_chat_id: str, file_id: str, caption: str):
@@ -112,7 +108,7 @@ def _send_admin_photo(user_chat_id: str, file_id: str, caption: str):
         print(f"Admin Telegram photo error: {e}")
 
 
-def _send_email_alert(full_name: str, tier_label: str, chat_id: str):
+def _send_email_alert(full_name: str, chat_id: str):
     """Send email to admin if SMTP credentials are configured."""
     admin_email = (os.getenv('ADMIN_EMAIL') or '').strip()
     smtp_host   = (os.getenv('SMTP_HOST') or '').strip()
@@ -131,7 +127,7 @@ def _send_email_alert(full_name: str, tier_label: str, chat_id: str):
     body = (
         f"New NATB subscription payment received.\n\n"
         f"Name:       {full_name}\n"
-        f"Package:    {tier_label}\n"
+        f"Plan:       Institutional Plan — $100/month\n"
         f"Telegram:   {chat_id}\n\n"
         f"Please review the payment screenshot in Telegram and approve or reject."
     )
@@ -149,7 +145,7 @@ def _send_email_alert(full_name: str, tier_label: str, chat_id: str):
         print(f"Email notification error: {e}")
 
 
-def _send_whatsapp_alert(full_name: str, tier_label: str):
+def _send_whatsapp_alert(full_name: str):
     """Send WhatsApp via Twilio if configured (optional)."""
     twilio_sid  = os.getenv('TWILIO_ACCOUNT_SID', '')
     twilio_auth = os.getenv('TWILIO_AUTH_TOKEN', '')
@@ -167,7 +163,7 @@ def _send_whatsapp_alert(full_name: str, tier_label: str):
             body=(
                 f"NATB Payment Alert\n"
                 f"Name: {full_name}\n"
-                f"Package: {tier_label}\n"
+                f"Plan: Institutional Plan — $100/month\n"
                 f"Action required: Check Telegram to approve or reject."
             ),
             to=f"whatsapp:{admin_num}",

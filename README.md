@@ -169,7 +169,7 @@ Nasdaq_SaaS_Project/
 ├── bot/
 │   ├── dashboard.py           # Telegram bot commands
 │   ├── notifier.py            # Telegram message sender
-│   ├── registration.py        # User onboarding
+│   ├── dashboard.py           # User onboarding
 │   ├── licensing.py           # License key validation + encryption
 │   ├── admin.py               # Admin commands
 │   └── i18n.py                # Arabic / English translations

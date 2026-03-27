@@ -3,6 +3,70 @@ from datetime import date, timedelta
 
 DB_PATH = 'database/trading_saas.db'
 
+_SUBSCRIBERS_CANONICAL_COLUMNS = [
+    # identity
+    ("chat_id", "TEXT PRIMARY KEY"),
+    # broker creds / account
+    ("email", "TEXT"),
+    ("api_password", "TEXT"),
+    ("api_key", "TEXT"),
+    ("is_demo", "INTEGER DEFAULT 1"),
+    # risk controls
+    ("risk_percent", "REAL DEFAULT 1.5"),
+    ("max_risk_percent", "REAL DEFAULT 2.0"),
+    # status flags
+    ("is_active", "INTEGER DEFAULT 1"),
+    ("kill_switch", "INTEGER DEFAULT 0"),
+    ("trading_enabled", "INTEGER DEFAULT 0"),
+    # subscription
+    ("expiry_date", "TEXT"),
+    ("license_key", "TEXT"),
+    ("subscription_started_at", "TEXT"),
+    # profile / UX
+    ("lang", "TEXT DEFAULT 'ar'"),
+    ("mode", "TEXT DEFAULT 'AUTO'"),
+    ("first_name", "TEXT"),
+    ("last_name", "TEXT"),
+    ("phone", "TEXT"),
+    ("payment_proof", "TEXT"),
+    ("payment_status", "TEXT DEFAULT 'NONE'"),
+    ("preferred_leverage", "INTEGER"),
+]
+
+
+def _table_columns(cursor: sqlite3.Cursor, table: str) -> list[str]:
+    cursor.execute(f"PRAGMA table_info({table})")
+    return [str(r[1]) for r in (cursor.fetchall() or [])]
+
+
+def _rebuild_subscribers_table_without_tier(conn: sqlite3.Connection):
+    """
+    SQLite cannot DROP COLUMN; we rebuild `subscribers` with canonical columns.
+    This physically removes any legacy `tier` column (and keeps all other data).
+    """
+    c = conn.cursor()
+    cols = _table_columns(c, "subscribers")
+    if not cols or "tier" not in cols:
+        return
+
+    canonical_names = [c0 for (c0, _) in _SUBSCRIBERS_CANONICAL_COLUMNS]
+    present = [name for name in canonical_names if name in cols]
+
+    # Build new table
+    ddl_cols = ",\n                  ".join([f"{n} {d}" for (n, d) in _SUBSCRIBERS_CANONICAL_COLUMNS])
+    c.execute("ALTER TABLE subscribers RENAME TO subscribers__old")
+    c.execute(f"""CREATE TABLE subscribers
+                 ({ddl_cols})""")
+
+    # Copy intersection columns from old -> new
+    col_list = ", ".join(present)
+    c.execute(
+        f"INSERT INTO subscribers ({col_list}) SELECT {col_list} FROM subscribers__old"
+    )
+
+    # Drop old table
+    c.execute("DROP TABLE subscribers__old")
+
 
 def create_db():
     conn = sqlite3.connect(DB_PATH)
@@ -26,7 +90,6 @@ def create_db():
                   first_name       TEXT,
                   last_name        TEXT,
                   phone            TEXT,
-                  tier             INTEGER DEFAULT 0,
                   payment_proof    TEXT,
                   payment_status   TEXT    DEFAULT 'NONE',
                   trading_enabled  INTEGER DEFAULT 0)''')
@@ -38,7 +101,6 @@ def create_db():
         ('first_name',       'TEXT'),
         ('last_name',        'TEXT'),
         ('phone',            'TEXT'),
-        ('tier',             'INTEGER DEFAULT 0'),
         ('payment_proof',    'TEXT'),
         ('payment_status',   "TEXT DEFAULT 'NONE'"),
         ('trading_enabled',  'INTEGER DEFAULT 0'),
@@ -49,6 +111,20 @@ def create_db():
             c.execute(f"ALTER TABLE subscribers ADD COLUMN {col} {definition}")
         except Exception:
             pass
+
+    # One-plan system migration:
+    # Ensure legacy rows remain valid under the single-plan framework.
+    try:
+        c.execute("UPDATE subscribers SET is_active=1 WHERE is_active IS NULL")
+    except Exception:
+        pass
+
+    # Physically remove legacy `tier` column if it exists.
+    try:
+        _rebuild_subscribers_table_without_tier(conn)
+    except Exception:
+        # Never fail boot on migration; engine/bot must still come up.
+        pass
 
     # ── Trade log ─────────────────────────────────────────────────────────────
     c.execute('''CREATE TABLE IF NOT EXISTS trades
@@ -360,20 +436,9 @@ def set_trading_enabled(chat_id: str, enabled: bool):
     conn.close()
 
 
-# ── User tier ─────────────────────────────────────────────────────────────────
-
-def get_user_tier(chat_id: str) -> int:
-    conn = sqlite3.connect(DB_PATH)
-    c    = conn.cursor()
-    c.execute("SELECT tier FROM subscribers WHERE chat_id=?", (str(chat_id),))
-    row  = c.fetchone()
-    conn.close()
-    return int(row[0]) if row and row[0] else 0
-
-
 # ── Subscription period / leverage preferences ────────────────────────────────
 
-TIER_SUBSCRIPTION_DAYS = {1: 30, 2: 30}
+SUBSCRIPTION_DAYS_DEFAULT = 30
 
 
 def get_subscription_started_at(chat_id: str) -> str | None:
@@ -400,14 +465,14 @@ def infer_subscription_start(chat_id: str) -> date | None:
     conn = sqlite3.connect(DB_PATH)
     c    = conn.cursor()
     c.execute(
-        "SELECT subscription_started_at, expiry_date, tier FROM subscribers WHERE chat_id=?",
+        "SELECT subscription_started_at, expiry_date FROM subscribers WHERE chat_id=?",
         (str(chat_id),),
     )
     row = c.fetchone()
     conn.close()
     if not row:
         return None
-    started, expiry, tier = row[0], row[1], int(row[2] or 0)
+    started, expiry = row[0], row[1]
     if started:
         try:
             return date.fromisoformat(started)
@@ -415,7 +480,7 @@ def infer_subscription_start(chat_id: str) -> date | None:
             pass
     if expiry:
         try:
-            d = int(TIER_SUBSCRIPTION_DAYS.get(tier, 30))
+            d = int(SUBSCRIPTION_DAYS_DEFAULT)
             return date.fromisoformat(expiry) - timedelta(days=d)
         except ValueError:
             pass

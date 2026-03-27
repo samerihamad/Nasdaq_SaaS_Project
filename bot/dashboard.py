@@ -2,7 +2,7 @@
 NATB v2.0 — Telegram Dashboard & Onboarding Bot
 
 New subscriber flow:
-  /start -> Language -> First Name -> Last Name -> Tier -> Bank Details
+  /start -> Language -> First Name -> Last Name -> Continue -> Bank Details
          -> Upload Payment Proof -> (Admin approves) -> Enter License Key
          -> Capital.com Email -> API Password -> API Key
          -> Connected + Balance -> Main Dashboard
@@ -49,7 +49,7 @@ from core.trailing_stop import close_trade_in_db
 from core.trade_session_finalize import after_trade_leg_closed
 from bot.admin import admin_handler, limits_handler
 from database.db_manager import (
-    create_db, get_bank_details, get_user_tier,
+    create_db, get_bank_details,
     get_trading_enabled, set_trading_enabled,
     apply_subscription_cancellation, get_preferred_leverage,
     set_preferred_leverage, infer_subscription_start, is_maintenance_mode,
@@ -83,16 +83,15 @@ create_db()
     GET_FIRSTNAME,
     GET_LASTNAME,
     GET_PHONE,
-    SELECT_TIER,
     AWAIT_BANK_ACK,
     UPLOAD_PROOF,
     ENTER_LICENSE,
     GET_EMAIL,
     GET_PASS,
     GET_APIKEY,
-) = range(11)
+) = range(10)
 
-TIER_DAYS = {1: 30, 2: 30}   # days of validity per tier on approval
+SUBSCRIPTION_DAYS = 30   # single-plan validity per approval
 
 
 # ── DB helpers ─────────────────────────────────────────────────────────────────
@@ -105,7 +104,7 @@ def _get_subscriber(chat_id: str) -> dict:
     conn = _db()
     c    = conn.cursor()
     c.execute(
-        """SELECT lang, first_name, last_name, phone, tier, payment_status,
+        """SELECT lang, first_name, last_name, phone, payment_status,
                   payment_proof, license_key, email, expiry_date, mode
            FROM subscribers WHERE chat_id=?""",
         (str(chat_id),)
@@ -115,7 +114,7 @@ def _get_subscriber(chat_id: str) -> dict:
     if not row:
         return {}
     keys = [
-        'lang', 'first_name', 'last_name', 'phone', 'tier', 'payment_status',
+        'lang', 'first_name', 'last_name', 'phone', 'payment_status',
         'payment_proof', 'license_key', 'email', 'expiry_date', 'mode'
     ]
     return dict(zip(keys, row))
@@ -206,9 +205,8 @@ def _get_user_onboarding_state(chat_id: str) -> str:
       LICENSE_READY    — admin approved, license issued, waiting for API creds
       PAYMENT_PENDING  — proof uploaded, awaiting admin review
       PAYMENT_REJECTED — admin rejected the payment
-      HAS_TIER         — chose tier, bank shown, needs to upload proof
       NEEDS_PHONE     — provided names but missing phone number
-      HAS_LAST_NAME    — has both names, needs to pick tier
+      HAS_LAST_NAME    — has both names, ready to proceed to payment
       HAS_FIRST_NAME   — has first name, needs last name
       NEW              — brand new, show language picker
     """
@@ -237,9 +235,6 @@ def _get_user_onboarding_state(chat_id: str) -> str:
     if ps == 'REJECTED':
         return 'PAYMENT_REJECTED'
 
-    if sub.get('tier'):
-        return 'HAS_TIER'
-
     if sub.get('last_name') and not sub.get('phone'):
         return 'NEEDS_PHONE'
 
@@ -261,10 +256,9 @@ def _lang_keyboard():
     ]])
 
 
-def _tier_keyboard(lang: str):
+def _continue_keyboard(lang: str):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(t('btn_tier1', lang), callback_data='onboard_tier_1')],
-        [InlineKeyboardButton(t('btn_tier2', lang), callback_data='onboard_tier_2')],
+        [InlineKeyboardButton(t('btn_continue', lang), callback_data='onboard_continue')],
     ])
 
 
@@ -303,7 +297,6 @@ def _main_keyboard(lang: str, mode: str, trading: bool):
          InlineKeyboardButton(switch_btn,              callback_data='toggle_mode')],
         [InlineKeyboardButton(t('btn_license',  lang), callback_data='license'),
          InlineKeyboardButton(t('btn_lang',     lang), callback_data='toggle_lang')],
-        [InlineKeyboardButton(t('btn_tier_info', lang), callback_data='tier_info')],
         row_settings,
         [InlineKeyboardButton(t('btn_support',      lang), url=SUPPORT_URL)],
     ])
@@ -571,11 +564,8 @@ def _settings_menu_keyboard(lang: str, chat_id: str):
     return InlineKeyboardMarkup(rows)
 
 
-def _leverage_choice_keyboard(lang: str, tier: int, cap: int):
-    if tier <= 1:
-        nums = [1, 2]
-    else:
-        nums = list(range(1, cap + 1))
+def _leverage_choice_keyboard(lang: str, cap: int):
+    nums = list(range(1, cap + 1))
     rows = []
     row = []
     for n in nums:
@@ -789,11 +779,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             t('license_expired', lang), parse_mode='Markdown'
         )
         await update.message.reply_text(
-            t('select_tier_title', lang),
-            reply_markup=_tier_keyboard(lang),
+            t('select_plan_title', lang),
+            reply_markup=_continue_keyboard(lang),
             parse_mode='Markdown',
         )
-        return SELECT_TIER
+        return AWAIT_BANK_ACK
 
     # ── Paid but license row missing (corruption / failed write) ────────────
     if state == 'APPROVED_MISSING_LICENSE':
@@ -817,11 +807,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 t('license_expired', lang), parse_mode='Markdown'
             )
             await update.message.reply_text(
-                t('select_tier_title', lang),
-                reply_markup=_tier_keyboard(lang),
+                t('select_plan_title', lang),
+                reply_markup=_continue_keyboard(lang),
                 parse_mode='Markdown',
             )
-            return SELECT_TIER
+            return AWAIT_BANK_ACK
         _schedule_status_job(context, chat_id)
         await _show_main_menu(update, context)
         return ConversationHandler.END
@@ -845,35 +835,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Payment was rejected ───────────────────────────────────────────────
     if state == 'PAYMENT_REJECTED':
-        _update_subscriber(chat_id, payment_status='NONE', payment_proof=None, tier=0)
+        _update_subscriber(chat_id, payment_status='NONE', payment_proof=None)
         await update.message.reply_text(
             t('payment_rejected_user', lang), parse_mode='Markdown'
         )
         await update.message.reply_text(t('lang_select'), reply_markup=_lang_keyboard())
         return LANG_SELECT
 
-    # ── Has tier, show bank details ────────────────────────────────────────
-    if state == 'HAS_TIER':
-        await update.message.reply_text(
-            _build_bank_text(lang),
-            reply_markup=_paid_keyboard(lang),
-            parse_mode='Markdown',
-        )
-        return AWAIT_BANK_ACK
-
-    # ── Has last name, show tier selection ─────────────────────────────────
+    # ── Has last name, proceed to payment ──────────────────────────────────
     if state == 'NEEDS_PHONE':
         await update.message.reply_text(t('ask_phone', lang), parse_mode='Markdown')
         return GET_PHONE
 
-    # ── Has last name, show tier selection ─────────────────────────────────
+    # ── Has last name, proceed to payment ──────────────────────────────────
     if state == 'HAS_LAST_NAME':
         await update.message.reply_text(
-            t('select_tier_title', lang),
-            reply_markup=_tier_keyboard(lang),
+            t('select_plan_title', lang),
+            reply_markup=_continue_keyboard(lang),
             parse_mode='Markdown',
         )
-        return SELECT_TIER
+        return AWAIT_BANK_ACK
 
     # ── Has first name, ask last name ──────────────────────────────────────
     if state == 'HAS_FIRST_NAME':
@@ -970,23 +951,21 @@ async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _update_subscriber(chat_id, phone=phone_norm)
 
     await update.message.reply_text(
-        t('select_tier_title', lang),
-        reply_markup=_tier_keyboard(lang),
+        t('select_plan_title', lang),
+        reply_markup=_continue_keyboard(lang),
         parse_mode='Markdown',
     )
-    return SELECT_TIER
+    return AWAIT_BANK_ACK
 
 
-# ── Onboarding: tier selection ─────────────────────────────────────────────────
+# ── Onboarding: continue ──────────────────────────────────────────────────────
 
-async def tier_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def continue_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     await query.answer()
     chat_id = str(query.message.chat_id)
     lang    = _get_lang(chat_id)
-    tier    = 1 if query.data == 'onboard_tier_1' else 2
-
-    _update_subscriber(chat_id, tier=tier)
+    # Single-plan system: treat selection as continue.
 
     bank_text = _build_bank_text(lang)
     await query.edit_message_text(
@@ -1028,7 +1007,6 @@ async def upload_proof(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Get largest photo size
     file_id = update.message.photo[-1].file_id
     sub     = _get_subscriber(chat_id)
-    tier    = sub.get('tier', 1)
 
     # Immediate feedback so the user knows their upload was received
     processing_msg = await update.message.reply_text(
@@ -1041,7 +1019,7 @@ async def upload_proof(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Notify admin
     full_name = f"{sub.get('first_name', '')} {sub.get('last_name', '')}".strip()
-    notify_admin_payment(chat_id, full_name, tier, file_id)
+    notify_admin_payment(chat_id, full_name, file_id)
 
     await processing_msg.edit_text(
         t('payment_received', lang), parse_mode='Markdown'
@@ -1165,9 +1143,8 @@ async def reg_get_apikey(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _handle_approve_payment(query, chat_id: str, user_chat_id: str):
     """Admin pressed Approve for a user's payment proof."""
     sub  = _get_subscriber(user_chat_id)
-    tier = sub.get('tier', 1)
     lang = sub.get('lang', 'ar')
-    days = TIER_DAYS.get(tier, 30)
+    days = int(SUBSCRIPTION_DAYS)
 
     license_key = generate_license_key()
     expiry = str(date.today() + timedelta(days=days))
@@ -1265,9 +1242,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if data.startswith('onboard_tier_'):
-        tier = 1 if data == 'onboard_tier_1' else 2
-        # Enforce phone registration before tier selection.
+    if data == 'onboard_continue':
+        # Enforce phone registration before continuing.
         sub = _get_subscriber(chat_id)
         if not sub.get('phone'):
             await query.edit_message_text(
@@ -1276,11 +1252,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        _update_subscriber(chat_id, tier=tier)
         await query.edit_message_text(
-            ('تم اختيار الباقة. أرسل /start للمتابعة.'
+            ('تمت المتابعة. أرسل /start للمتابعة.'
              if lang == 'ar' else
-             'Plan saved. Send /start to continue.'),
+             'Continue saved. Send /start to continue.'),
             parse_mode='Markdown',
         )
         return
@@ -1717,26 +1692,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=keyboard, parse_mode='Markdown',
             )
 
-    # ── Tier info ──────────────────────────────────────────────────────────
-    elif data == 'tier_info':
-        from core.risk_manager import get_tier_limits
-        tier   = get_user_tier(chat_id)
-        limits = get_tier_limits(chat_id)
-        max_t  = str(limits['max_trades']) if limits['max_trades'] != float('inf') else ('غير محدود' if lang == 'ar' else 'Unlimited')
-        max_w  = str(limits['max_watchlist']) if limits['max_watchlist'] != float('inf') else ('غير محدودة' if lang == 'ar' else 'Unlimited')
-        label  = (
-            (t('btn_tier1', lang) if tier == 1 else t('btn_tier2', lang))
-            if tier in (1, 2) else ('—')
-        )
-        msg = t('tier_info', lang,
-                tier_label   = label,
-                max_trades   = max_t,
-                max_leverage = limits['max_leverage'],
-                max_watchlist= max_w)
-        await query.edit_message_text(
-            msg, reply_markup=_back_keyboard(lang), parse_mode='Markdown'
-        )
-
     # ── Toggle language ────────────────────────────────────────────────────
     elif data == 'toggle_lang':
         new_lang = 'en' if lang == 'ar' else 'ar'
@@ -1798,13 +1753,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _show_main_menu(update, context, edit=True)
 
     elif data == 'settings_leverage':
-        tier = get_user_tier(chat_id)
         cap  = get_user_max_leverage(chat_id)
         eff  = get_effective_leverage(chat_id)
         await query.edit_message_text(
             t('leverage_settings_body', lang, cap=cap, current=eff)
             + '\n\n' + t('leverage_disclaimer', lang),
-            reply_markup=_leverage_choice_keyboard(lang, tier, cap),
+            reply_markup=_leverage_choice_keyboard(lang, cap),
             parse_mode='Markdown',
         )
 
@@ -2276,8 +2230,10 @@ if __name__ == "__main__":
             GET_FIRSTNAME:  [MessageHandler(filters.TEXT & ~filters.COMMAND, get_firstname)],
             GET_LASTNAME:   [MessageHandler(filters.TEXT & ~filters.COMMAND, get_lastname)],
             GET_PHONE:      [MessageHandler(filters.TEXT & ~filters.COMMAND, get_phone)],
-            SELECT_TIER:    [CallbackQueryHandler(tier_selected,  pattern='^onboard_tier_')],
-            AWAIT_BANK_ACK: [CallbackQueryHandler(bank_acked,     pattern='^onboard_paid$')],
+            AWAIT_BANK_ACK: [
+                CallbackQueryHandler(continue_selected,  pattern='^onboard_continue$'),
+                CallbackQueryHandler(bank_acked,     pattern='^onboard_paid$'),
+            ],
             UPLOAD_PROOF:   [MessageHandler(filters.PHOTO, upload_proof)],
             ENTER_LICENSE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_license)],
             GET_EMAIL:      [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_get_email)],

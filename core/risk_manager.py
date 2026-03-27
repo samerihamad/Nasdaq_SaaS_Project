@@ -17,7 +17,7 @@ from datetime import date
 from bot.notifier import send_telegram_message
 from database.db_manager import (
     is_master_kill_switch, get_user_kill_switch, get_user_risk_params,
-    get_user_tier, get_preferred_leverage, set_trading_enabled,
+    get_preferred_leverage, set_trading_enabled,
 )
 
 STATE_NORMAL          = 'NORMAL'
@@ -37,32 +37,16 @@ MIN_RISK, MAX_RISK = 1.0,  2.0
 DAILY_DRAWDOWN_LIMIT = 5.0   # % drawdown from session start → hard stop
 MIN_RR_RATIO         = 2.0   # minimum reward:risk required (1:2)
 
-# ── Subscription tier limits ───────────────────────────────────────────────────
-# tier 0 = no tier set (treat as Tier 1 restrictions for safety)
-_TIER_LIMITS = {
-    0: {'max_trades': 3,              'max_leverage': 2,  'max_watchlist': 50},
-    1: {'max_trades': 3,              'max_leverage': 2,  'max_watchlist': 50},
-    2: {'max_trades': float('inf'),   'max_leverage': 10, 'max_watchlist': float('inf')},
-}
-
-
-def get_tier_limits(chat_id: str) -> dict:
-    """Return the trade/leverage/watchlist limits for this user's subscription tier."""
-    tier = get_user_tier(chat_id)
-    return _TIER_LIMITS.get(tier, _TIER_LIMITS[0])
-
-
 def get_user_max_leverage(chat_id: str) -> int:
-    """Return the maximum leverage allowed for this user's tier."""
-    return get_tier_limits(chat_id)['max_leverage']
+    """Return the maximum leverage allowed (single-plan system)."""
+    return 10
 
 
 def get_effective_leverage(chat_id: str) -> int:
     """
-    User-chosen leverage capped by tier (1–2 for tier 1, 1–10 for tier 2).
-    If unset, uses the tier maximum.
+    User-chosen leverage capped by global max (1–10). If unset, uses the max.
 
-    Used with tier max to form (effective / tier_max): scales risk budget for
+    Used with max leverage to form (effective / cap): scales risk budget for
     position sizing — not a multiplier on size after risk is computed.
     """
     cap = get_user_max_leverage(chat_id)
@@ -135,8 +119,7 @@ def can_open_trade(chat_id):
     Gate order (checked in priority):
       1. Master kill switch       — admin halted ALL trading globally
       2. User kill switch         — this specific user is halted
-      3. Subscription tier limit  — daily trade cap from subscription plan
-      4. Circuit Breaker / Hard Block state machine
+      3. Circuit Breaker / Hard Block state machine
     """
     # ── 1. Master kill switch ─────────────────────────────────────────────────
     if is_master_kill_switch():
@@ -146,18 +129,7 @@ def can_open_trade(chat_id):
     if get_user_kill_switch(chat_id):
         return False, "Your trading session has been halted by the admin"
 
-    # ── 3. Subscription tier daily trade limit ────────────────────────────────
-    limits     = get_tier_limits(chat_id)
-    max_trades = limits['max_trades']
-    if max_trades != float('inf'):
-        daily_count = _get_daily_trade_count(chat_id)
-        if daily_count >= max_trades:
-            return False, (
-                f"Daily trade limit reached ({daily_count}/{int(max_trades)}) — "
-                f"upgrade your plan or wait until tomorrow"
-            )
-
-    # ── 4. Circuit Breaker / Hard Block ───────────────────────────────────────
+    # ── 3. Circuit Breaker / Hard Block ───────────────────────────────────────
     state = get_risk_state(chat_id)
     if state in (STATE_NORMAL, STATE_MANUAL_OVERRIDE):
         return True, state
@@ -327,10 +299,10 @@ def calculate_position_size(balance: float, confidence: float,
       Mid-range confidence gets modest increases, while high-confidence
       setups accelerate faster toward max risk.
 
-    Leverage (tier cap vs user preference):
+    Leverage (cap vs user preference):
       Dollar risk at the stop is budgeted as
-      balance × risk_pct × (effective_leverage / tier_max_leverage).
-      Choosing the tier maximum uses the full risk band; choosing a lower
+      balance × risk_pct × (effective_leverage / cap_leverage).
+      Choosing the maximum uses the full risk band; choosing a lower
       leverage (e.g. 1× vs 2× cap) scales risk and size down in proportion.
       We never multiply the post-risk position size by leverage — that would
       exceed the intended risk percentage.

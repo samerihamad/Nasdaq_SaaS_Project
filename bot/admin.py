@@ -216,17 +216,16 @@ async def admin_handler(update: Update, context):
         for row in subs:
             cid = row[0]
             c.execute(
-                "SELECT expiry_date, mode, tier, payment_status, first_name, last_name "
+                "SELECT expiry_date, mode, payment_status, first_name, last_name "
                 "FROM subscribers WHERE chat_id=?", (cid,)
             )
             info   = c.fetchone()
             expiry = info[0] if info and info[0] else '—'
             mode   = info[1] if info and info[1] else 'AUTO'
-            tier   = info[2] if info and info[2] else 0
-            status = info[3] if info and info[3] else 'NONE'
-            name   = f"{info[4] or ''} {info[5] or ''}".strip() or '—'
+            status = info[2] if info and info[2] else 'NONE'
+            name   = f"{info[3] or ''} {info[4] or ''}".strip() or '—'
             lines.append(
-                f"• `{cid}` | {name} | T{tier} | {status} | exp:{expiry} | {mode}"
+                f"• `{cid}` | {name} | {status} | exp:{expiry} | {mode}"
             )
         conn.close()
         await update.message.reply_text('\n'.join(lines), parse_mode='Markdown')
@@ -446,7 +445,7 @@ async def admin_handler(update: Update, context):
         conn = sqlite3.connect(DB_PATH)
         c    = conn.cursor()
         c.execute(
-            """SELECT chat_id, first_name, last_name, tier, payment_status
+            """SELECT chat_id, first_name, last_name, payment_status
                FROM subscribers
                WHERE payment_status IN ('PENDING', 'APPROVED', 'REJECTED')
                ORDER BY rowid DESC LIMIT 20"""
@@ -460,9 +459,9 @@ async def admin_handler(update: Update, context):
 
         lines = ["*Recent Payment Records:*\n"]
         for row in rows:
-            cid, fn, ln, tier, ps = row
+            cid, fn, ln, ps = row
             name = f"{fn or ''} {ln or ''}".strip() or '—'
-            lines.append(f"• `{cid}` | {name} | T{tier or 0} | *{ps}*")
+            lines.append(f"• `{cid}` | {name} | *{ps}*")
         await update.message.reply_text('\n'.join(lines), parse_mode='Markdown')
 
     else:

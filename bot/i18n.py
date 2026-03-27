@@ -42,35 +42,28 @@ STRINGS = {
         'en': '⚠️ Phone is not registered. Send /start to continue.',
     },
 
-    # ── Tier selection ────────────────────────────────────────────────────────
-    'select_tier_title': {
+    # ── Plan (single plan) ─────────────────────────────────────────────────────
+    'select_plan_title': {
         'ar': (
-            '📦 *اختر باقة الاشتراك*\n\n'
-            '🥈 *الباقة الأساسية — $50/شهر*\n'
-            '• حد أقصى 3 صفقات يومياً\n'
-            '• رافعة مالية حتى 2x\n'
-            '• مراقبة حتى 50 سهماً\n\n'
-            '🥇 *الباقة المتقدمة — $100/شهر*\n'
+            '📦 *الاشتراك المتاح*\n\n'
+            '🥇 *باقة المؤسسات — $100/شهر*\n'
+            '• وصول كامل (Institutional)\n'
             '• صفقات غير محدودة\n'
             '• رافعة مالية حتى 10x (قابلة للتعديل)\n'
             '• قائمة مراقبة غير محدودة\n\n'
-            'اختر باقتك:'
+            'اضغط متابعة للانتقال إلى تفاصيل التحويل:'
         ),
         'en': (
-            '📦 *Choose Your Subscription Plan*\n\n'
-            '🥈 *Basic Plan — $50/month*\n'
-            '• Max 3 trades per day\n'
-            '• Leverage capped at 2x\n'
-            '• Monitor up to 50 tickers\n\n'
-            '🥇 *Advanced Plan — $100/month*\n'
+            '📦 *Available Subscription*\n\n'
+            '🥇 *Institutional Plan — $100/month*\n'
+            '• Full institutional access\n'
             '• Unlimited trades\n'
             '• Leverage up to 10x (user-configurable)\n'
             '• Unlimited watchlist\n\n'
-            'Choose your plan:'
+            'Press Continue to view banking details:'
         ),
     },
-    'btn_tier1': {'ar': '🥈 الباقة الأساسية — $50/شهر', 'en': '🥈 Basic Plan — $50/month'},
-    'btn_tier2': {'ar': '🥇 الباقة المتقدمة — $100/شهر', 'en': '🥇 Advanced Plan — $100/month'},
+    'btn_continue': {'ar': '▶️ متابعة', 'en': '▶️ Continue'},
 
     # ── Bank details ──────────────────────────────────────────────────────────
     'bank_details_title': {
@@ -145,16 +138,26 @@ STRINGS = {
     },
     'payment_approved_user': {
         'ar': (
-            '🎉 *تمت الموافقة على اشتراكك!*\n\n'
-            'مفتاح الترخيص الخاص بك:\n`{license_key}`\n\n'
-            'الصلاحية: *{days} يوم*\n\n'
-            'أرسل /start للمتابعة وإدخال بيانات وسيط التداول.'
+            '🛡️ *أهلاً بك في نظام التداول المؤسساتي الذكي (NATB)!*\n\n'
+            '✅ تم تفعيل حسابك بنجاح — *Institutional Premium ($100)*\n\n'
+            '🔑 *مفتاح الترخيص:*\n`{license_key}`\n'
+            '⏳ *الصلاحية:* *{days} يوم*\n\n'
+            '*مزايا المؤسسات:*\n'
+            '• 0.618 *Limit Orders* (تنفيذ هيكلي)\n'
+            '• حد أدنى ذكاء صناعي *65%+* (AI Floor)\n'
+            '• فلاتر *Market Structure* والسيولة (HTF)\n\n'
+            'أرسل /start للمتابعة وربط حساب *Capital.com*.'
         ),
         'en': (
-            '🎉 *Your subscription has been approved!*\n\n'
-            'Your License Key:\n`{license_key}`\n\n'
-            'Valid for: *{days} days*\n\n'
-            'Send /start to continue and enter your broker credentials.'
+            '🛡️ *Welcome to the Institutional Trade System (NATB)!*\n\n'
+            '✅ Your account is now active — *Institutional Premium ($100)*\n\n'
+            '🔑 *License Key:*\n`{license_key}`\n'
+            '⏳ *Validity:* *{days} days*\n\n'
+            '*Institutional features:*\n'
+            '• 0.618 *Limit Orders* (structure-first execution)\n'
+            '• *65%+ AI Floor* (minimum confluence)\n'
+            '• *Market Structure* & liquidity filters (HTF)\n\n'
+            'Send /start to continue and connect your *Capital.com* account.'
         ),
     },
     'payment_rejected_user': {
@@ -698,12 +701,12 @@ STRINGS = {
     'license_expired': {
         'ar': (
             '❌ *انتهت صلاحية ترخيصك.*\n\n'
-            'لتجديد اشتراكك، يرجى اختيار الباقة وتحويل الرسوم مجدداً.\n'
+            'لتجديد اشتراكك، يرجى دفع رسوم الاشتراك مجدداً.\n'
             'سيتم إعادة تفعيل حسابك فور مراجعة الدفعة.'
         ),
         'en': (
             '❌ *Your license has expired.*\n\n'
-            'To renew your subscription, please select a tier and transfer the fees again.\n'
+            'To renew your subscription, please pay the subscription fee again.\n'
             'Your account will be reactivated once payment is reviewed.'
         ),
     },
@@ -816,11 +819,11 @@ STRINGS = {
     'cancel_sub_done': {
         'ar': (
             '🚫 *تم إلغاء اشتراكك.*\n'
-            'لم يعد الترخيص نشطاً. لإعادة التفعيل اختر الباقة وادفع من جديد من /start'
+            'لم يعد الترخيص نشطاً. لإعادة التفعيل ادفع من جديد عبر /start.'
         ),
         'en': (
             '🚫 *Your subscription was cancelled.*\n'
-            'Your license is no longer active. To reactivate, pick a plan and pay again via /start.'
+            'Your license is no longer active. To reactivate, pay again via /start.'
         ),
     },
     'leverage_settings_body': {
@@ -912,25 +915,6 @@ STRINGS = {
         'en': 'Full-day block is on — lift it from ⚙️ Settings (Resume trading).',
     },
 
-    # ── Tier info (shown in dashboard) ────────────────────────────────────────
-    'tier_info': {
-        'ar': (
-            '📦 *باقتك الحالية*\n\n'
-            '{tier_label}\n'
-            '• الصفقات اليومية: *{max_trades}*\n'
-            '• الرافعة القصوى: *{max_leverage}x*\n'
-            '• قائمة المراقبة: *{max_watchlist}*'
-        ),
-        'en': (
-            '📦 *Your Current Plan*\n\n'
-            '{tier_label}\n'
-            '• Daily Trades: *{max_trades}*\n'
-            '• Max Leverage: *{max_leverage}x*\n'
-            '• Watchlist Limit: *{max_watchlist}*'
-        ),
-    },
-    'btn_tier_info': {'ar': '📦 باقتي', 'en': '📦 My Plan'},
-
     # ── Trade notifications ───────────────────────────────────────────────────
     'trade_opened': {
         'ar': (
@@ -980,14 +964,14 @@ STRINGS = {
         'ar': (
             '💰 *طلب اشتراك جديد*\n\n'
             '👤 الاسم: *{full_name}*\n'
-            '📦 الباقة: *{tier_label}*\n'
+            '📦 الخطة: *اشتراك المؤسسات — $100/شهر*\n'
             '🪪 Chat ID: `{chat_id}`\n\n'
             'وافق أو ارفض الطلب:'
         ),
         'en': (
             '💰 *New Subscription Request*\n\n'
             '👤 Name: *{full_name}*\n'
-            '📦 Package: *{tier_label}*\n'
+            '📦 Plan: *Institutional — $100/month*\n'
             '🪪 Chat ID: `{chat_id}`\n\n'
             'Approve or reject the payment:'
         ),
