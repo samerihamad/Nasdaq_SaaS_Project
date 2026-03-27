@@ -961,6 +961,14 @@ def _confirm_deal_and_visibility(
                     deal_id = str(did)
                     if _visible(deal_id):
                         return True, deal_id, deal_ref_str, ""
+                    # Capital can accept an order but lag in /positions visibility.
+                    # If /confirms produced a dealId and it was not rejected, treat this
+                    # as opened-pending-visibility and let reconcile() confirm later.
+                    st = str(
+                        data.get("dealStatus") or data.get("status") or ""
+                    ).upper()
+                    if st and st not in ("REJECTED", "FAILED"):
+                        return True, deal_id, deal_ref_str, "pending_visibility"
                 st = str(
                     data.get("dealStatus") or data.get("status") or ""
                 ).upper()
@@ -986,6 +994,10 @@ def _confirm_deal_and_visibility(
 
     if deal_id and _visible(str(deal_id)):
         return True, str(deal_id), deal_ref_str, ""
+    if deal_id and deal_ref_str:
+        # Same rationale as above: we have a dealId but visibility checks didn't pass
+        # within the verification window. Proceed and rely on reconcile().
+        return True, str(deal_id), deal_ref_str, "pending_visibility"
 
     # Epic + direction + size (single match) when list/API lags after a 200 POST.
     if order_epic and direction and leg_size is not None:
