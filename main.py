@@ -41,6 +41,7 @@ from bot.notifier import send_telegram_message
 from bot.dashboard import post_pending_signal, get_signal_status
 from bot.i18n import t
 from database.db_manager import set_trading_enabled
+from database.db_manager import touch_engine_activity
 from config import (
     MIN_CONFIDENCE,
     CHECK_INTERVAL,
@@ -511,6 +512,11 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
 
             if mode == 'AUTO':
                 attempted += 1
+                # Heartbeat for admin monitoring: engine is actively processing this user.
+                try:
+                    touch_engine_activity(chat_id)
+                except Exception:
+                    pass
                 result = place_trade_for_user(
                     chat_id, symbol, action,
                     confidence=confidence, stop_loss_pct=stop_loss_pct,

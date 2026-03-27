@@ -47,12 +47,13 @@ from core.executor import get_user_credentials, get_session
 from core.sync import reconcile, backfill_closed_pnls
 from core.trailing_stop import close_trade_in_db
 from core.trade_session_finalize import after_trade_leg_closed
-from bot.admin import admin_handler, limits_handler
+from bot.admin import admin_handler, limits_handler, monitor_handler
 from database.db_manager import (
     create_db, get_bank_details,
     get_trading_enabled, set_trading_enabled,
     apply_subscription_cancellation, get_preferred_leverage,
     set_preferred_leverage, infer_subscription_start, is_maintenance_mode,
+    touch_bot_activity,
 )
 from utils.market_hours import (
     get_market_status,
@@ -183,6 +184,10 @@ def _ensure_subscriber_row(chat_id: str):
     )
     conn.commit()
     conn.close()
+    try:
+        touch_bot_activity(chat_id)
+    except Exception:
+        pass
 
 
 def _update_subscriber(chat_id: str, **kwargs):
@@ -765,6 +770,10 @@ def _schedule_status_job(context: ContextTypes.DEFAULT_TYPE, chat_id: str):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.message.chat_id)
     _ensure_subscriber_row(chat_id)
+    try:
+        touch_bot_activity(chat_id)
+    except Exception:
+        pass
 
     state = _get_user_onboarding_state(chat_id)
     lang  = _get_lang(chat_id)
@@ -1200,6 +1209,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(query.message.chat_id)
     lang    = _get_lang(chat_id)
     data    = query.data
+    try:
+        touch_bot_activity(chat_id)
+    except Exception:
+        pass
 
     # ── Session guard ───────────────────────────────────────────────────────
     # Admin and onboarding callbacks bypass the guard; everything else requires
@@ -2202,6 +2215,7 @@ async def _post_init(app):
         BotCommand('stop_today', 'Block trading for the rest of today (stops engine)'),
         BotCommand('limits',     'Admin: active pending limit orders'),
         BotCommand('orders',     'Admin alias for /limits'),
+        BotCommand('monitor',    'Admin: live subscriber monitor'),
     ])
 
 
@@ -2255,6 +2269,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler('admin',      admin_handler))
     app.add_handler(CommandHandler('limits',     limits_handler))
     app.add_handler(CommandHandler('orders',     limits_handler))
+    app.add_handler(CommandHandler('monitor',    monitor_handler))
 
     print("NATB Dashboard Bot running...")
     app.run_polling()

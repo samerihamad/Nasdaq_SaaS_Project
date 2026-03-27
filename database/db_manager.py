@@ -31,6 +31,9 @@ _SUBSCRIBERS_CANONICAL_COLUMNS = [
     ("payment_proof", "TEXT"),
     ("payment_status", "TEXT DEFAULT 'NONE'"),
     ("preferred_leverage", "INTEGER"),
+    # monitoring / heartbeat
+    ("last_bot_activity_at", "TEXT"),
+    ("last_engine_activity_at", "TEXT"),
 ]
 
 
@@ -106,6 +109,8 @@ def create_db():
         ('trading_enabled',  'INTEGER DEFAULT 0'),
         ('subscription_started_at', "TEXT"),
         ('preferred_leverage', 'INTEGER'),
+        ('last_bot_activity_at', "TEXT"),
+        ('last_engine_activity_at', "TEXT"),
     ]:
         try:
             c.execute(f"ALTER TABLE subscribers ADD COLUMN {col} {definition}")
@@ -431,6 +436,34 @@ def set_trading_enabled(chat_id: str, enabled: bool):
     conn.execute(
         "UPDATE subscribers SET trading_enabled=? WHERE chat_id=?",
         (1 if enabled else 0, str(chat_id))
+    )
+    conn.commit()
+    conn.close()
+
+
+def _utc_now_iso() -> str:
+    """UTC ISO timestamp without microseconds (stable for SQLite text)."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def touch_bot_activity(chat_id: str):
+    """Record latest bot interaction time for subscriber."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE subscribers SET last_bot_activity_at=? WHERE chat_id=?",
+        (_utc_now_iso(), str(chat_id)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def touch_engine_activity(chat_id: str):
+    """Record latest engine activity time for subscriber."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE subscribers SET last_engine_activity_at=? WHERE chat_id=?",
+        (_utc_now_iso(), str(chat_id)),
     )
     conn.commit()
     conn.close()

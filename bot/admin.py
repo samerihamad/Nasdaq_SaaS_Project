@@ -31,6 +31,7 @@ from database.db_manager import (
     is_master_kill_switch, set_master_kill_switch,
     get_user_kill_switch, set_user_kill_switch,
     get_user_risk_params, get_bank_details, set_bank_field, BANK_FIELDS,
+    touch_bot_activity,
 )
 from core.watcher import broadcast_to_all, run_watcher, get_all_active_subscribers
 from core.executor import get_user_credentials, get_session, resolve_epic_for_user
@@ -134,12 +135,105 @@ def _broadcast_localized(i18n_key: str) -> int:
     return count
 
 
+def _parse_iso_ts(s: str) -> datetime | None:
+    try:
+        if not s:
+            return None
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _build_monitor_panel(window_sec: int = 300) -> str:
+    now = datetime.now(timezone.utc)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute("PRAGMA table_info(subscribers)")
+        cols = {str(r[1]) for r in (c.fetchall() or [])}
+    except Exception:
+        cols = set()
+
+    has_bot = "last_bot_activity_at" in cols
+    has_eng = "last_engine_activity_at" in cols
+
+    select = (
+        "SELECT chat_id, first_name, last_name, payment_status, trading_enabled, "
+        + ("last_bot_activity_at, " if has_bot else "NULL AS last_bot_activity_at, ")
+        + ("last_engine_activity_at " if has_eng else "NULL AS last_engine_activity_at ")
+        + "FROM subscribers ORDER BY rowid DESC"
+    )
+    c.execute(select)
+    rows = c.fetchall() or []
+    conn.close()
+
+    online = 0
+    offline = 0
+    lines = []
+    for cid, fn, ln, ps, te, bot_ts, eng_ts in rows:
+        name = f"{fn or ''} {ln or ''}".strip() or "—"
+        bot_dt = _parse_iso_ts(bot_ts)
+        eng_dt = _parse_iso_ts(eng_ts)
+        last_dt = None
+        src = ""
+        if bot_dt and eng_dt:
+            last_dt = bot_dt if bot_dt >= eng_dt else eng_dt
+            src = "bot" if last_dt == bot_dt else "engine"
+        elif bot_dt:
+            last_dt = bot_dt
+            src = "bot"
+        elif eng_dt:
+            last_dt = eng_dt
+            src = "engine"
+
+        is_on = False
+        if last_dt:
+            age = (now - last_dt).total_seconds()
+            is_on = age <= float(window_sec)
+        if is_on:
+            online += 1
+            icon = "🟢"
+        else:
+            offline += 1
+            icon = "🔴"
+
+        last_s = last_dt.isoformat() if last_dt else "—"
+        ps0 = ps or "NONE"
+        te0 = int(te or 0)
+        lines.append(
+            f"{icon} `{cid}` | {name} | {ps0} | trading={te0} | last={last_s} ({src or '—'})"
+        )
+
+    return (
+        "*Admin Live Monitor*\n\n"
+        f"Total: *{len(rows)}* | Online (<={int(window_sec/60)}m): *{online}* | Offline: *{offline}*\n\n"
+        + ("\n".join(lines) if lines else "_No subscribers._")
+    )
+
+
+async def monitor_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only /monitor command (separate from user UI)."""
+    uid = str(update.effective_chat.id)
+    if not _is_admin(uid):
+        await update.message.reply_text("Access denied.")
+        return
+    try:
+        touch_bot_activity(uid)
+    except Exception:
+        pass
+    await update.message.reply_text(_build_monitor_panel(), parse_mode="Markdown")
+
+
 async def admin_handler(update: Update, context):
     chat_id = str(update.message.chat_id)
 
     if not _is_admin(chat_id):
         await update.message.reply_text("Access denied.")
         return
+    try:
+        touch_bot_activity(chat_id)
+    except Exception:
+        pass
 
     args = context.args or []
     if not args:
@@ -202,6 +296,46 @@ async def admin_handler(update: Update, context):
         message = ' '.join(args[1:])
         count   = broadcast_to_all(f"*Message from Admin*\n\n{message}")
         await update.message.reply_text(f"Sent to {count} subscriber(s).")
+
+    # ── purge ALL subscribers (broadcast first) ───────────────────────────────
+    elif cmd in ('purgeusers', 'purge', 'resetusers'):
+        # Safety: require explicit confirmation token.
+        if len(args) < 2 or args[1].strip().upper() != "CONFIRM":
+            await update.message.reply_text(
+                "Usage: /admin purgeusers CONFIRM\n\n"
+                "This will broadcast a final reset notice, then DELETE ALL rows from `subscribers`."
+            )
+            return
+
+        ar = (
+            "⚠️ تنبيه هام: تم تحديث النظام بالكامل إلى النسخة المؤسساتية (Institutional). "
+            "تم إعادة ضبط قاعدة البيانات، يرجى إعادة التسجيل وتفعيل اشتراكك الآن للاستفادة من الفلاتر والمميزات الجديدة."
+        )
+        en = (
+            "⚠️ Important: The system has been upgraded to the Institutional Version. "
+            "Database reset complete. Please re-register to activate your subscription and access new features."
+        )
+        msg = f"{ar}\n\n{en}"
+
+        # 1) broadcast
+        sent = broadcast_to_all(msg)
+
+        # 2) purge subscribers
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute("DELETE FROM subscribers")
+            conn.commit()
+            conn.close()
+        except Exception as exc:
+            await update.message.reply_text(f"Broadcast sent to {sent}. Purge FAILED: {exc}")
+            return
+
+        await update.message.reply_text(f"Broadcast sent to {sent}. Purged ALL subscribers successfully.")
+
+    # ── monitor snapshot ──────────────────────────────────────────────────────
+    elif cmd in ('monitor', 'panel', 'adminpanel'):
+        text = _build_monitor_panel()
+        await update.message.reply_text(text, parse_mode='Markdown')
 
     # ── subscribers list ──────────────────────────────────────────────────────
     elif cmd == 'subscribers':
