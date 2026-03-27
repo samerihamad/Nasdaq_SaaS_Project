@@ -52,7 +52,7 @@ def scan_multi_timeframe(symbol):
         df_1h = df_1h[~df_1h.index.duplicated(keep="last")]
 
         df_4h = (
-            df_1h.resample("4H")
+            df_1h.resample("4h")
             .agg(
                 Open=("Open", lambda s: s.iloc[0]),
                 High=("High", "max"),
