@@ -31,7 +31,11 @@ def main():
         sys.exit(1)
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     r = requests.post(url, json={"chat_id": chat_id, "text": message}, timeout=25)
-    print(r.status_code, (r.json() if r.headers.get("content-type", "").startswith("application/json") else r.text)[:500])
+    try:
+        body = r.json()
+    except Exception:
+        body = r.text
+    print(r.status_code, str(body)[:500])
 
 
 if __name__ == "__main__":
