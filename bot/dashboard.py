@@ -48,7 +48,7 @@ from core.executor import get_user_credentials, get_session
 from core.sync import reconcile, backfill_closed_pnls
 from core.trailing_stop import close_trade_in_db
 from core.trade_session_finalize import after_trade_leg_closed
-from bot.admin import admin_handler, limits_handler, monitor_handler
+from bot.admin import admin_handler, limits_handler, monitor_handler, audit_sync_handler
 from database.db_manager import (
     create_db, get_bank_details,
     get_trading_enabled, set_trading_enabled,
@@ -1533,8 +1533,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 rows = c.fetchall()
                 conn.close()
                 for trade_id, ps in rows:
-                    close_trade_in_db(int(trade_id), upl)
-                    after_trade_leg_closed(chat_id, (ps or "").strip(), upl)
+                    close_trade_in_db(int(trade_id), actual_pnl=float(upl))
+                    after_trade_leg_closed(chat_id, (ps or "").strip(), float(upl))
                 closed += 1
             except Exception:
                 failed += 1
@@ -2217,6 +2217,7 @@ async def _post_init(app):
         BotCommand('limits',     'Admin: active pending limit orders'),
         BotCommand('orders',     'Admin alias for /limits'),
         BotCommand('monitor',    'Admin: live subscriber monitor'),
+        BotCommand('audit_sync', 'Admin: DB vs broker position audit'),
     ])
 
 
@@ -2286,6 +2287,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler('limits',     limits_handler))
     app.add_handler(CommandHandler('orders',     limits_handler))
     app.add_handler(CommandHandler('monitor',    monitor_handler))
+    app.add_handler(CommandHandler('audit_sync', audit_sync_handler))
     app.add_error_handler(_on_error)
 
     print("NATB Dashboard Bot running...")

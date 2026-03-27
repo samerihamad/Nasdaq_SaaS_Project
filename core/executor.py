@@ -4,7 +4,7 @@ import time
 import uuid
 import math
 from datetime import datetime, timedelta, timezone
-from bot.notifier import send_telegram_message
+from bot.notifier import send_telegram_message, notify_admin_alert
 from bot.licensing import safe_decrypt
 from config import (
     TP1_PCT,
@@ -37,10 +37,8 @@ from core.trailing_stop import (
 from core.sync import reconcile
 from core.sync import fetch_closed_deal_final_data
 from core.sync import mark_trade_closed_pending
-from core.trade_close_messages import (
-    send_bot_automated_close,
-    count_open_sibling_same_session,
-)
+from core.sync import capital_verify_deal_closed_after_close_request
+from core.trade_close_messages import send_bot_automated_close_from_db
 
 # Daily per-user symbol→epic cache (and unsupported symbols) to avoid
 # repeating broker lookups for every signal cycle.
@@ -1392,7 +1390,20 @@ def monitor_and_close(chat_id):
                     or close_payload.get("dealRef")
                     or close_payload.get("reference")
                 )
-                # Broker-truth sync (realized PnL + exit price) MUST happen after close.
+                # Gold rule: never trust HTTP 200 alone — confirm GET /positions no longer lists this deal.
+                if not capital_verify_deal_closed_after_close_request(
+                    base_url, headers, str(deal_id)
+                ):
+                    try:
+                        notify_admin_alert(
+                            "Desync: Close request returned HTTP 200 but position still OPEN on broker.\n"
+                            f"chat_id={chat_id} trade_id={trade_id} {symbol} deal_id={deal_id}"
+                        )
+                    except Exception:
+                        pass
+                    continue
+
+                # Broker-truth sync (realized PnL + exit price) only after verified absence from /positions.
                 final = fetch_closed_deal_final_data(
                     base_url,
                     headers,
@@ -1401,8 +1412,7 @@ def monitor_and_close(chat_id):
                     identifiers=[str(deal_ref)] if deal_ref else None,
                 )
                 if not final:
-                    # fetch_closed_deal_final_data already logged the root cause details.
-                    # Mark CLOSED pending immediately to avoid ghost OPEN trades.
+                    # Position is gone but history not ready — mark CLOSED pending PnL (no full close Telegram).
                     mark_trade_closed_pending(
                         chat_id,
                         int(trade['trade_id']),
@@ -1436,38 +1446,12 @@ def monitor_and_close(chat_id):
                     exit_price=float(exit_price) if exit_price is not None else None,
                     target_reached=target_label,
                     close_reason=stop_label,
+                    sync_status="SYNCED",
                 )
                 after_trade_leg_closed(chat_id, parent_session, actual_pnl)
 
-                sd_eff = sd_stored
-                if sd_eff is None and base_stop is not None and entry_price:
-                    sd_eff = abs(float(entry_price) - float(base_stop))
-                sibling_tp2_open = False
-                if leg_role == "TP1" and parent_session:
-                    sibling_tp2_open = (
-                        count_open_sibling_same_session(
-                            parent_session, trade_id, "TP2"
-                        )
-                        > 0
-                    )
-                # Even in maintenance mode we still send close notifications,
-                # because maintenance should block NEW entries, not hide trade exits.
-                send_bot_automated_close(
-                    chat_id,
-                    trade_id=int(trade_id),
-                    symbol=symbol,
-                    direction=direction,
-                    entry_price=entry_price,
-                    exit_price=float(exit_price) if exit_price is not None else None,
-                    size=size_leg or float(live["position"].get("size") or 0),
-                    pnl=actual_pnl,
-                    stop_distance=sd_eff,
-                    trailing_stop=float(base_stop) if base_stop is not None else None,
-                    stop_label=stop_label,
-                    sibling_tp2_open=sibling_tp2_open,
-                    leg_role=leg_role or "SINGLE",
-                    target_reached=target_label,
-                )
+                # DB-first: Telegram body is built from persisted trade row.
+                send_bot_automated_close_from_db(int(trade_id))
                 closed_any = True
 
     return closed_any

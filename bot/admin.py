@@ -17,6 +17,7 @@ Commands:
   /admin setbank <field> <value> — update a bank detail field
   /admin getbank                 — display current bank details
   /admin payments                — list pending payment approvals
+  /admin audit_sync [chat_id] [fix] — DB vs Capital position audit (alias: /audit_sync)
 """
 
 import os
@@ -228,6 +229,26 @@ async def monitor_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(_build_monitor_panel(), parse_mode="Markdown")
 
 
+async def audit_sync_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only /audit_sync — compare DB trades vs Capital /positions."""
+    uid = str(update.effective_chat.id)
+    if not _is_admin(uid):
+        await update.message.reply_text("Access denied.")
+        return
+    try:
+        touch_bot_activity(uid)
+    except Exception:
+        pass
+    args = context.args or []
+    fix = any(str(x).lower() == "fix" for x in args)
+    cid_parts = [x for x in args if str(x).lower() != "fix"]
+    target = cid_parts[0] if cid_parts else None
+    from core.sync import run_zombie_trade_audit
+
+    report = run_zombie_trade_audit(chat_id_filter=target, fix=fix)
+    await update.message.reply_text(report[:4000])
+
+
 async def admin_handler(update: Update, context):
     chat_id = str(update.message.chat_id)
 
@@ -257,7 +278,8 @@ async def admin_handler(update: Update, context):
             "`/admin setbank <field> <value>`\n"
             "`/admin getbank`\n"
             "`/admin payments`\n"
-            "`/admin purgeusers CONFIRM`",
+            "`/admin purgeusers CONFIRM`\n"
+            "`/admin audit_sync [chat_id] [fix]`",
             parse_mode='Markdown'
         )
         return
@@ -342,6 +364,17 @@ async def admin_handler(update: Update, context):
     elif cmd in ('monitor', 'panel', 'adminpanel'):
         text = _build_monitor_panel()
         await update.message.reply_text(text, parse_mode='Markdown')
+
+    # ── DB vs Capital zombie audit ────────────────────────────────────────────
+    elif cmd in ('audit_sync', 'auditsync'):
+        rest = args[1:]
+        fix = any(str(x).lower() == "fix" for x in rest)
+        cid_parts = [x for x in rest if str(x).lower() != "fix"]
+        target = cid_parts[0] if cid_parts else None
+        from core.sync import run_zombie_trade_audit
+
+        report = run_zombie_trade_audit(chat_id_filter=target, fix=fix)
+        await update.message.reply_text(report[:4000])
 
     # ── subscribers list ──────────────────────────────────────────────────────
     elif cmd == 'subscribers':

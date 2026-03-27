@@ -153,6 +153,7 @@ def close_trade_in_db(
     exit_price: float | None = None,
     target_reached: str | None = None,
     close_reason: str | None = None,
+    sync_status: str | None = "SYNCED",
 ):
     """
     Mark a locally tracked trade as CLOSED using broker-synced final data.
@@ -163,20 +164,37 @@ def close_trade_in_db(
     """
     from utils.market_hours import utc_now
     conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        "UPDATE trades SET status='CLOSED', pnl=?, actual_pnl=?, exit_price=?, "
-        "target_reached=COALESCE(?, target_reached), close_reason=?, closed_at=? "
-        "WHERE trade_id=?",
-        (
-            float(actual_pnl),
-            float(actual_pnl),
-            float(exit_price) if exit_price is not None else None,
-            str(target_reached) if target_reached else None,
-            str(close_reason) if close_reason else None,
-            utc_now().isoformat(),
-            int(trade_id),
-        ),
-    )
+    if sync_status is None:
+        conn.execute(
+            "UPDATE trades SET status='CLOSED', pnl=?, actual_pnl=?, exit_price=?, "
+            "target_reached=COALESCE(?, target_reached), close_reason=?, closed_at=? "
+            "WHERE trade_id=?",
+            (
+                float(actual_pnl),
+                float(actual_pnl),
+                float(exit_price) if exit_price is not None else None,
+                str(target_reached) if target_reached else None,
+                str(close_reason) if close_reason else None,
+                utc_now().isoformat(),
+                int(trade_id),
+            ),
+        )
+    else:
+        conn.execute(
+            "UPDATE trades SET status='CLOSED', pnl=?, actual_pnl=?, exit_price=?, "
+            "target_reached=COALESCE(?, target_reached), close_reason=?, closed_at=?, sync_status=? "
+            "WHERE trade_id=?",
+            (
+                float(actual_pnl),
+                float(actual_pnl),
+                float(exit_price) if exit_price is not None else None,
+                str(target_reached) if target_reached else None,
+                str(close_reason) if close_reason else None,
+                utc_now().isoformat(),
+                str(sync_status),
+                int(trade_id),
+            ),
+        )
     conn.commit()
     conn.close()
 

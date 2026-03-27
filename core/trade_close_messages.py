@@ -342,6 +342,65 @@ def send_bot_automated_close(
     send_telegram_message(chat_id, body)
 
 
+def send_bot_automated_close_from_db(trade_id: int) -> bool:
+    """
+    Send the automated close Telegram using persisted rows only (DB-first reporting).
+    Call after close_trade_in_db() with status CLOSED and synced PnL.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT chat_id, symbol, direction, entry_price, exit_price, size, pnl, "
+        "trailing_stop, stop_distance, COALESCE(leg_role,''), COALESCE(parent_session,''), "
+        "COALESCE(target_reached,''), COALESCE(close_reason,'') "
+        "FROM trades WHERE trade_id=? AND status='CLOSED'",
+        (int(trade_id),),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return False
+    (
+        chat_id,
+        symbol,
+        direction,
+        entry_price,
+        exit_price,
+        size,
+        pnl,
+        trailing_stop,
+        stop_distance,
+        leg_role,
+        parent_session,
+        target_reached,
+        close_reason,
+    ) = row
+    tid = int(trade_id)
+    sibling_tp2_open = False
+    if (leg_role or "").strip().upper() == "TP1" and (parent_session or "").strip():
+        sibling_tp2_open = (
+            count_open_sibling_same_session(
+                str(parent_session).strip(), tid, "TP2"
+            )
+            > 0
+        )
+    send_bot_automated_close(
+        str(chat_id),
+        trade_id=tid,
+        symbol=str(symbol),
+        direction=str(direction),
+        entry_price=float(entry_price or 0),
+        exit_price=float(exit_price) if exit_price is not None else None,
+        size=float(size or 0),
+        pnl=float(pnl or 0),
+        stop_distance=float(stop_distance) if stop_distance is not None else None,
+        trailing_stop=float(trailing_stop) if trailing_stop is not None else None,
+        stop_label=str(close_reason or "—"),
+        sibling_tp2_open=sibling_tp2_open,
+        leg_role=str(leg_role or "SINGLE"),
+        target_reached=str(target_reached or "") or None,
+    )
+    return True
+
+
 def count_open_sibling_same_session(
     parent_session: str | None,
     exclude_trade_id: int | None,

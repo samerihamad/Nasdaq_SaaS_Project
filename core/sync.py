@@ -37,6 +37,85 @@ PENDING_FINAL = "PENDING_FINAL"
 SYNCED = "SYNCED"
 FINALIZED_NO_PNL = "FINALIZED_NO_PNL"
 
+# After DELETE / manual close, poll /positions before trusting "closed" (2s, 5s, 10s gaps in fetch_closed_deal_final_data).
+VERIFY_CLOSE_MAX_POLLS = int(os.getenv("VERIFY_CLOSE_MAX_POLLS", "10"))
+VERIFY_CLOSE_POLL_SEC = float(os.getenv("VERIFY_CLOSE_POLL_SEC", "0.6"))
+
+
+def _capital_deal_id_from_row(p: dict) -> str | None:
+    """Capital may expose dealId and/or positionId on the nested position object."""
+    if not isinstance(p, dict):
+        return None
+    pos = p.get("position") or {}
+    if not isinstance(pos, dict):
+        pos = {}
+    for k in ("dealId", "positionId"):
+        v = pos.get(k)
+        if v is not None:
+            return str(v).strip()
+    v2 = p.get("dealId")
+    return str(v2).strip() if v2 is not None else None
+
+
+def capital_deal_still_open(base_url: str, headers: dict, deal_id: str) -> bool:
+    """
+    True if the broker still lists this deal/position as OPEN.
+    If /positions is unavailable, returns True (conservative: do not claim 'closed').
+    """
+    if not deal_id:
+        return False
+    try:
+        res = requests.get(f"{base_url}/positions", headers=headers, timeout=20)
+        if res.status_code != 200:
+            return True
+        for p in (res.json() or {}).get("positions", []) or []:
+            row_id = _capital_deal_id_from_row(p)
+            if row_id and str(row_id) == str(deal_id):
+                return True
+        res2 = requests.get(
+            f"{base_url}/positions/{deal_id}", headers=headers, timeout=15
+        )
+        if res2.status_code == 200:
+            data = res2.json() or {}
+            if data.get("errorCode"):
+                return False
+            if _capital_deal_id_from_row(data):
+                return True
+            pos = data.get("position") or {}
+            if isinstance(pos, dict) and pos.get("dealId") is not None:
+                return True
+    except Exception:
+        return True
+    return False
+
+
+def capital_verify_deal_closed_after_close_request(
+    base_url: str,
+    headers: dict,
+    deal_id: str,
+) -> bool:
+    """
+    After DELETE /positions/{id}, poll until the deal disappears from GET /positions.
+    Returns True only when the position is confirmed absent (safe to read history).
+    Returns False if still open after VERIFY_CLOSE_MAX_POLLS (close failed / lag).
+    """
+    if not deal_id:
+        return False
+    n = max(1, VERIFY_CLOSE_MAX_POLLS)
+    for i in range(n):
+        if not capital_deal_still_open(base_url, headers, str(deal_id)):
+            print(
+                f"[Capital verify] deal {deal_id} absent from /positions after {i + 1}/{n} poll(s)",
+                flush=True,
+            )
+            return True
+        time.sleep(max(0.1, VERIFY_CLOSE_POLL_SEC))
+    print(
+        f"[Capital verify] deal {deal_id} STILL OPEN on broker after {n} poll(s) — close not confirmed",
+        flush=True,
+    )
+    return False
+
 
 def _send_pending_close_notice(chat_id, symbol, direction, trade_id):
     try:
@@ -202,10 +281,9 @@ def fetch_closed_deal_final_data(
             return False, [], int(res.status_code), txt[:300]
         return True, (res.json() or {}).get("transactions", []) or [], int(res.status_code), ""
 
-    # Capital history can lag after close (especially around session transitions).
-    # Use more attempts + a slightly longer delay to reduce "transaction not found yet".
+    # Capital history can lag after close. Retry with 2s, 5s, 10s (then 10s) between attempts.
     attempts = 12 if wait_for_realized else 3
-    delay_s = 1.2 if wait_for_realized else 0.0
+    post_fail_delays = [2.0, 5.0, 10.0]
 
     ids = [str(deal_id)]
     if identifiers:
@@ -254,6 +332,7 @@ def fetch_closed_deal_final_data(
             tx_ref = tx.get("dealReference")
             tx_related = tx.get("relatedDealId") or tx.get("relatedDealReference")
             tx_reference = tx.get("reference") or tx.get("transactionReference")
+            tx_opening = tx.get("openingDealId") or tx.get("openDealId") or tx.get("positionId")
             match = False
             for x in ids:
                 if (
@@ -261,6 +340,7 @@ def fetch_closed_deal_final_data(
                     or _id_match(tx_ref, x)
                     or _id_match(tx_related, x)
                     or _id_match(tx_reference, x)
+                    or _id_match(tx_opening, x)
                 ):
                     match = True
                     break
@@ -277,9 +357,9 @@ def fetch_closed_deal_final_data(
                 "exit_price": _parse_exit_price(tx),
             }
 
-        if delay_s and attempt < attempts - 1:
-            # Gentle linear backoff; keeps API pressure reasonable.
-            time.sleep(delay_s + (0.25 * attempt))
+        if wait_for_realized and attempt < attempts - 1:
+            idx = min(attempt, len(post_fail_delays) - 1)
+            time.sleep(post_fail_delays[idx])
 
     # Stop-condition: not found / not ready.
     print("Error: Could not sync final data from Capital.com", flush=True)
@@ -297,14 +377,16 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
         return
 
     live_positions = pos_res.json().get('positions', [])
-    # Normalize dealId types: broker may return int while DB stores str (or vice versa).
-    # If we don't normalize, membership checks will fail and we keep "re-syncing"
-    # the same position every monitoring cycle.
-    live_deal_ids = {
-        str(p['position']['dealId'])
-        for p in live_positions
-        if p.get('position', {}).get('dealId') is not None
-    }
+    # Normalize dealId / positionId: broker may use either; DB stores opening dealId.
+    live_deal_ids = set()
+    for p in live_positions:
+        pos = p.get("position") or {}
+        if not isinstance(pos, dict):
+            continue
+        for k in ("dealId", "positionId"):
+            v = pos.get(k)
+            if v is not None:
+                live_deal_ids.add(str(v).strip())
 
     conn = sqlite3.connect(DB_PATH)
     c    = conn.cursor()
@@ -352,6 +434,9 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
         close_sync_last_try_at,
     ) in local_open:
         if deal_id and str(deal_id) not in live_deal_ids:
+            # Gold rule: list membership can race; confirm the broker truly has no open position.
+            if capital_deal_still_open(base_url, headers, str(deal_id)):
+                continue
             # Prevent hot-loop hammering when Capital history lags.
             # Retry with cooldown and bounded attempt tracking per trade.
             try:
@@ -584,6 +669,19 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
             attempts_i = 0
         if attempts_i >= SYNC_MAX_ATTEMPTS:
             if FINAL_SYNC_FALLBACK_ENABLED:
+                # Never tell the user "closed / no PnL" if the position is still open at the broker.
+                if deal_id and capital_deal_still_open(base_url, headers, str(deal_id)):
+                    try:
+                        from bot.notifier import notify_admin_alert
+
+                        notify_admin_alert(
+                            "Desync (PENDING_FINAL): DB CLOSED but broker still shows OPEN position.\n"
+                            f"chat_id={chat_id} trade_id={trade_id} deal_id={deal_id} {symbol} {direction}\n"
+                            "Skipped misleading 'PnL unavailable' user message."
+                        )
+                    except Exception:
+                        pass
+                    continue
                 c.execute(
                     "SELECT COALESCE(sync_status,''), COALESCE(close_sync_last_error,'') FROM trades WHERE trade_id=?",
                     (int(trade_id),),
@@ -737,10 +835,9 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
 
     # ── Case 2: manually opened, not tracked ─────────────────────────────────
     for p in live_positions:
-        deal_id = p.get('position', {}).get('dealId')
-        if deal_id is None:
+        deal_id_str = _capital_deal_id_from_row(p)
+        if not deal_id_str:
             continue
-        deal_id_str = str(deal_id)
         if deal_id_str not in local_deal_ids:
             exists = c.execute(
                 "SELECT 1 FROM trades WHERE chat_id=? AND deal_id=? AND status='OPEN' LIMIT 1",
@@ -806,3 +903,91 @@ def backfill_closed_pnls(chat_id, base_url, headers, lookback: int = 200) -> int
         conn.commit()
     conn.close()
     return updated
+
+
+def run_zombie_trade_audit(
+    chat_id_filter: str | None = None,
+    *,
+    fix: bool = False,
+) -> str:
+    """
+    Admin tool: compare DB rows to GET /positions.
+    - OPEN locally but flat at broker → optional `reconcile()` to mark closed + PnL.
+    - CLOSED locally but still OPEN at broker → alert; optional fix sets row back to OPEN.
+    """
+    from core.executor import get_user_credentials, get_session
+    from bot.notifier import notify_admin_alert
+
+    lines: list[str] = []
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT DISTINCT chat_id FROM trades WHERE status IN ('OPEN','CLOSED')"
+    )
+    chats = [str(r[0]) for r in c.fetchall()]
+    conn.close()
+
+    if not chats:
+        return "No trades in database."
+
+    for cid in chats:
+        if chat_id_filter and str(chat_id_filter).strip() != str(cid).strip():
+            continue
+        creds = get_user_credentials(cid)
+        if not creds:
+            lines.append(f"[{cid}] skip — no broker credentials")
+            continue
+        base_url, headers = get_session(creds)
+        if not headers:
+            lines.append(f"[{cid}] skip — session failed")
+            continue
+
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            "SELECT trade_id, deal_id, symbol, status, COALESCE(sync_status,'') FROM trades "
+            "WHERE chat_id=? AND deal_id IS NOT NULL AND TRIM(deal_id) != ''",
+            (cid,),
+        )
+        rows = c.fetchall()
+        conn.close()
+
+        need_reconcile = False
+        for trade_id, deal_id, symbol, status, sync_st in rows:
+            did = str(deal_id).strip()
+            broker_open = capital_deal_still_open(base_url, headers, did)
+
+            if status == "OPEN" and not broker_open:
+                lines.append(
+                    f"[{cid}] trade_id={trade_id} {symbol} deal={did}: DB OPEN, flat at broker → reconcile"
+                )
+                need_reconcile = True
+
+            if status == "CLOSED" and broker_open:
+                lines.append(
+                    f"[{cid}] trade_id={trade_id} {symbol} deal={did} sync={sync_st}: "
+                    f"DB CLOSED but position STILL OPEN at broker"
+                )
+                if fix:
+                    notify_admin_alert(
+                        "audit_sync: re-opening local row (CLOSED in DB, OPEN at broker).\n"
+                        f"chat_id={cid} trade_id={trade_id} {symbol} deal_id={did}"
+                    )
+                    conn2 = sqlite3.connect(DB_PATH)
+                    conn2.execute(
+                        "UPDATE trades SET status='OPEN', closed_at=NULL, "
+                        "sync_status=NULL, close_sync_last_error=? WHERE trade_id=?",
+                        ("audit_reopen_desync", int(trade_id)),
+                    )
+                    conn2.commit()
+                    conn2.close()
+
+        if fix and need_reconcile:
+            reconcile(cid, base_url, headers, notify=True)
+
+    if not lines:
+        return "OK — no DB vs broker mismatches detected for scanned rows."
+    out = "\n".join(lines)
+    if len(out) > 3500:
+        return out[:3500] + "\n…(truncated)"
+    return out

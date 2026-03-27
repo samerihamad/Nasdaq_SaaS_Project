@@ -60,6 +60,30 @@ def send_telegram_message(chat_id, message):
         return None
 
 
+def notify_admin_alert(message: str) -> None:
+    """
+    Plain-text operational alert to ADMIN_CHAT_ID (no Markdown) so deal IDs and symbols
+    do not break parsing.
+    """
+    admin_id = (os.getenv("ADMIN_CHAT_ID") or "").strip()
+    token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+    text = str(message or "")[:4000]
+    if not text:
+        return
+    if not admin_id or not token:
+        print(f"[Admin alert] {text}", flush=True)
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        requests.post(
+            url,
+            json={"chat_id": admin_id, "text": text},
+            timeout=20,
+        )
+    except Exception as e:
+        print(f"notify_admin_alert error: {e}", flush=True)
+
+
 def notify_admin_payment(chat_id: str, full_name: str, proof_file_id: str):
     """
     Notify admin of a new payment via:
