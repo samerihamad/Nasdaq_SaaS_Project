@@ -91,6 +91,21 @@ def _is_expected_rejection(reason: str) -> bool:
     return any(m in r for m in markers)
 
 
+def _extract_min_tp_value(err: str) -> float | None:
+    """
+    Parse Capital error like: error.invalid.takeprofit.minvalue: 14.38
+    Returns the numeric minimum TP level, if present.
+    """
+    try:
+        import re
+        m = re.search(r"takeprofit\.minvalue\s*:\s*([0-9]+(?:\.[0-9]+)?)", str(err or ""), re.I)
+        if not m:
+            return None
+        return float(m.group(1))
+    except Exception:
+        return None
+
+
 def _calculate_limit_price(symbol: str, action: str, strategy_label: str, entry_price: float, atr: float | None) -> float:
     """
     Sprint 2 policy map:
@@ -273,6 +288,18 @@ def process_pending_limit_orders():
                 "UPDATE pending_limit_orders SET status=?, last_error=? WHERE id=?",
                 (final_status, "" if final_status == "FILLED" else str(result or "")[:400], int(oid)),
             )
+        if final_status != "FILLED":
+            # Ensure the user gets an explicit outcome after "executing".
+            lang = get_subscriber_lang(str(chat_id))
+            err = str(result or "").strip()
+            err = err[:700] + ("..." if len(err) > 700 else "")
+            fail_msg = (
+                f"❌ *Limit execution failed*\n{symbol} {action}\nReason: {err}"
+                if lang == "en"
+                else
+                f"❌ *فشل تنفيذ أمر الليمِت*\n{symbol} {('شراء' if action=='BUY' else 'بيع')}\nالسبب: {err}"
+            )
+            send_telegram_message(str(chat_id), fail_msg)
         processed += 1
     return processed
 
@@ -550,6 +577,31 @@ def _get_min_stop_profit_distance(base_url, headers, epic) -> float | None:
                     return f
             except Exception:
                 continue
+
+        # Fallback: scan for any plausible min-*-distance key variants.
+        # Capital payloads can vary (e.g. minNormalStopOrLimitDistance, etc.).
+        vals: list[float] = []
+        for k, v in (rules or {}).items():
+            ks = str(k or "")
+            kl = ks.lower()
+            if "min" not in kl:
+                continue
+            if "distance" not in kl:
+                continue
+            if not (("stop" in kl) or ("profit" in kl) or ("limit" in kl)):
+                continue
+            if isinstance(v, dict):
+                v = v.get("value")
+            if v is None:
+                continue
+            try:
+                f = float(v)
+                if f > 0:
+                    vals.append(f)
+            except Exception:
+                continue
+        if vals:
+            return min(vals)
     except Exception:
         return None
     return None
@@ -1652,39 +1704,51 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
         action, entry_price, stop_level, target1, target2
     )
 
-    # Broker dealing rules: validate minimum stop/profit distance.
-    # Requirement:
-    # - TP1 must remain 1%. If it violates min distance, skip the trade (do not open any leg).
-    # - TP2 can be widened slightly if too tight.
+    # Broker dealing rules: enforce minimum stop/profit distance.
+    # Policy (institutional, broker-compliant):
+    # - If TP1/TP2 are too tight, widen them to broker minimum distance (with a small buffer)
+    #   instead of skipping strong signals.
     min_dist = _get_min_stop_profit_distance(base_url, headers, order_epic)
+    tp_adjust_note = ""
     if min_dist and float(min_dist) > 0 and entry_price > 0:
         md = float(min_dist)
         tp1_dist = abs(float(target1) - float(entry_price))
         if tp1_dist < md:
-            if lang == "en":
-                msg = (
-                    f"⏭️ Trade skipped ({symbol} {action}): "
-                    f"Target 1 distance too tight for broker rules (min={md:.4f}, got={tp1_dist:.4f})"
-                )
-            else:
-                msg = (
-                    f"⏭️ تم التخطي ({symbol} {action}): "
-                    f"مسافة الهدف الأول صغيرة جداً حسب شروط الوسيط (الحد الأدنى={md:.4f}، الحالي={tp1_dist:.4f})"
-                )
-            print(msg)
-            _log_trade_rejection(chat_id, symbol, action, "tp1_distance", msg, f"min={md:.4f}, got={tp1_dist:.4f}")
-            return msg
-        tp2_dist = abs(float(target2) - float(entry_price))
-        if tp2_dist < md:
             widen = md * float(TP2_MIN_DISTANCE_BUFFER_MULT)
-            target2 = (
+            target1 = (
                 float(entry_price) + widen
                 if action == "BUY"
                 else float(entry_price) - widen
             )
-            stop_level, target1, target2 = _sanitize_protection_levels(
-                action, entry_price, stop_level, target1, target2
+            if lang == "en":
+                tp_adjust_note += (
+                    f"\nℹ️ Adjusted: TP1 widened to broker minimum distance ({md:.4f})."
+                )
+            else:
+                tp_adjust_note += (
+                    f"\nℹ️ تم التعديل: توسيع الهدف 1 ليتوافق مع الحد الأدنى للوسيط ({md:.4f})."
+                )
+        tp2_dist = abs(float(target2) - float(entry_price))
+        widen2 = md * float(TP2_MIN_DISTANCE_BUFFER_MULT)
+        if tp2_dist < md:
+            target2 = (
+                float(entry_price) + widen2
+                if action == "BUY"
+                else float(entry_price) - widen2
             )
+            if lang == "en":
+                tp_adjust_note += (
+                    f"\nℹ️ Adjusted: TP2 widened to broker minimum distance ({md:.4f})."
+                )
+            else:
+                tp_adjust_note += (
+                    f"\nℹ️ تم التعديل: توسيع الهدف 2 ليتوافق مع الحد الأدنى للوسيط ({md:.4f})."
+                )
+
+        # Re-sanitize after any TP adjustments.
+        stop_level, target1, target2 = _sanitize_protection_levels(
+            action, entry_price, stop_level, target1, target2
+        )
 
     # Split into two positions to support TP1 + TP2 on broker.
     # Capital applies one TP per position, so we split size intentionally.
@@ -1775,9 +1839,20 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
                 if not ok_del:
                     print(f"⚠️  Rollback failed for {symbol} deal={ob.get('deal_id')}: {info}")
             reason = last_err or "unknown rejection"
+            min_tp = _extract_min_tp_value(reason)
+            broker_note = ""
+            if min_tp is not None and entry_price and float(entry_price) > 0:
+                # Explain common broker rule: TP is too close for this instrument.
+                try:
+                    if lang == "en":
+                        broker_note = f"\nBroker rule: minimum take-profit level is {float(min_tp):.4f}."
+                    else:
+                        broker_note = f"\nشرط الوسيط: الحد الأدنى للهدف (TP) هو {float(min_tp):.4f}."
+                except Exception:
+                    broker_note = ""
             msg = (
                 f"❌ Order rejected ({symbol} {action}) — {leg_role} failed.\n"
-                f"Reason: {reason}"
+                f"Reason: {reason}{broker_note}"
             )
             _log_trade_rejection(chat_id, symbol, action, f"{leg_role}_execution", msg, reason)
             if (not SUPPRESS_EXPECTED_REJECTION_TELEGRAM) or (not _is_expected_rejection(reason)):
@@ -1862,6 +1937,7 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             f"🕐  Time (ET)    :  {now_et_str}"
             f"{partial_note_en}"
             f"{sl_adjust_note}"
+            f"{tp_adjust_note}"
         )
     else:
         override_line = "⚠️ تجاوز يدوي — جاري فتح صفقة جديدة\n\n" if is_override else ""
@@ -1882,6 +1958,7 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             f"🕐  التوقيت (ET)   :  {now_et_str}"
             f"{partial_note_ar}"
             f"{sl_adjust_note}"
+            f"{tp_adjust_note}"
         )
 
     tg_res = send_telegram_message(chat_id, msg)
