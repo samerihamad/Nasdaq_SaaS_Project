@@ -157,11 +157,15 @@ def _build_monitor_panel(window_sec: int = 300) -> str:
     has_bot = "last_bot_activity_at" in cols
     has_eng = "last_engine_activity_at" in cols
 
+    # Show only real active subscribers (not partial onboarding rows).
     select = (
         "SELECT chat_id, first_name, last_name, payment_status, trading_enabled, "
         + ("last_bot_activity_at, " if has_bot else "NULL AS last_bot_activity_at, ")
         + ("last_engine_activity_at " if has_eng else "NULL AS last_engine_activity_at ")
-        + "FROM subscribers ORDER BY rowid DESC"
+        + "FROM subscribers "
+          "WHERE is_active=1 AND payment_status='APPROVED' "
+          "AND email IS NOT NULL AND api_key IS NOT NULL "
+          "ORDER BY rowid DESC"
     )
     c.execute(select)
     rows = c.fetchall() or []
@@ -245,13 +249,15 @@ async def admin_handler(update: Update, context):
             "`/admin reviveuser <chat_id>`\n"
             "`/admin riskset <chat_id> <min%> <max%>`\n"
             "`/admin broadcast <message>`\n"
+            "`/admin monitor`\n"
             "`/admin subscribers`\n"
             "`/admin status`\n"
             "`/admin orphans`\n"
             "`/admin issue <chat_id> <days>`\n"
             "`/admin setbank <field> <value>`\n"
             "`/admin getbank`\n"
-            "`/admin payments`",
+            "`/admin payments`\n"
+            "`/admin purgeusers CONFIRM`",
             parse_mode='Markdown'
         )
         return
