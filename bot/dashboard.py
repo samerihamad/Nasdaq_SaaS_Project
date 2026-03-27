@@ -31,6 +31,7 @@ from telegram.ext import (
     PicklePersistence,
 )
 from telegram.request import HTTPXRequest
+from telegram.error import BadRequest
 
 from bot.i18n import t
 from bot.licensing import (
@@ -2219,6 +2220,21 @@ async def _post_init(app):
     ])
 
 
+async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Suppress noisy, harmless Telegram edit collisions:
+    "Message is not modified".
+    Keep logging all other errors.
+    """
+    err = getattr(context, "error", None)
+    if isinstance(err, BadRequest) and "Message is not modified" in str(err):
+        return
+    try:
+        print(f"[dashboard] Unhandled error: {err}", flush=True)
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
     persistence = PicklePersistence(filepath='conversation_states.pkl')
 
@@ -2270,6 +2286,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler('limits',     limits_handler))
     app.add_handler(CommandHandler('orders',     limits_handler))
     app.add_handler(CommandHandler('monitor',    monitor_handler))
+    app.add_error_handler(_on_error)
 
     print("NATB Dashboard Bot running...")
     app.run_polling()
