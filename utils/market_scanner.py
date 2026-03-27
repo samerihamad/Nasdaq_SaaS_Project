@@ -37,14 +37,31 @@ def scan_multi_timeframe(symbol):
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
 
-        # Resample 1H → 4H
-        df_4h = df_1h.resample("4h").agg({
-            "Open":   "first",
-            "High":   "max",
-            "Low":    "min",
-            "Close":  "last",
-            "Volume": "sum"
-        }).dropna()
+        # Resample 1H → 4H (defensive against odd yfinance shapes / indices)
+        if not isinstance(df_1h, pd.DataFrame):
+            return None
+        required = {"Open", "High", "Low", "Close", "Volume"}
+        if not required.issubset(set(df_1h.columns)):
+            return None
+
+        df_1h = df_1h.copy()
+        if not isinstance(df_1h.index, pd.DatetimeIndex):
+            df_1h.index = pd.to_datetime(df_1h.index, errors="coerce")
+            df_1h = df_1h.dropna(subset=[] if df_1h.empty else None)
+        df_1h = df_1h.sort_index()
+        df_1h = df_1h[~df_1h.index.duplicated(keep="last")]
+
+        df_4h = (
+            df_1h.resample("4H")
+            .agg(
+                Open=("Open", lambda s: s.iloc[0]),
+                High=("High", "max"),
+                Low=("Low", "min"),
+                Close=("Close", lambda s: s.iloc[-1]),
+                Volume=("Volume", "sum"),
+            )
+            .dropna()
+        )
 
         return {"1d": df_1d, "4h": df_4h, "15m": df_15m}
 
