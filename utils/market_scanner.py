@@ -1,5 +1,6 @@
 import yfinance as yf
 import pandas as pd
+import numpy as np
 
 
 def scan_market(ticker_symbol, period="1d", interval="5m"):
@@ -51,13 +52,19 @@ def scan_multi_timeframe(symbol):
         df_1h = df_1h.sort_index()
         df_1h = df_1h[~df_1h.index.duplicated(keep="last")]
 
+        def _safe_first(s):
+            return s.iloc[0] if len(s) else np.nan
+
+        def _safe_last(s):
+            return s.iloc[-1] if len(s) else np.nan
+
         df_4h = (
             df_1h.resample("4h")
             .agg(
-                Open=("Open", lambda s: s.iloc[0]),
+                Open=("Open", _safe_first),
                 High=("High", "max"),
                 Low=("Low", "min"),
-                Close=("Close", lambda s: s.iloc[-1]),
+                Close=("Close", _safe_last),
                 Volume=("Volume", "sum"),
             )
             .dropna()
