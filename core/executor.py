@@ -38,6 +38,8 @@ from core.sync import reconcile
 from core.sync import fetch_closed_deal_final_data
 from core.sync import mark_trade_closed_pending
 from core.sync import capital_verify_deal_closed_after_close_request
+from core.sync import capital_deal_still_open
+from core.sync import _capital_all_ids_from_row
 from core.trade_close_messages import send_bot_automated_close_from_db
 
 # Daily per-user symbol→epic cache (and unsupported symbols) to avoid
@@ -1203,12 +1205,14 @@ def monitor_and_close(chat_id):
     balance         = _get_balance(base_url, headers)
     hard_stop_limit = -(balance * 0.03)   # -3% of balance
 
-    # Index live positions by normalized dealId for O(1) lookup.
-    live_by_id = {
-        str(p.get('position', {}).get('dealId')): p
-        for p in live_positions
-        if p.get('position', {}).get('dealId') is not None
-    }
+    # Index by every dealId/positionId Capital exposes (DB may store either).
+    live_by_id = {}
+    for p in live_positions:
+        ids = _capital_all_ids_from_row(p)
+        if not ids and p.get("position", {}).get("dealId") is not None:
+            ids = {str(p["position"]["dealId"]).strip()}
+        for rid in ids:
+            live_by_id[str(rid).strip()] = p
 
     closed_any = False
 
@@ -1391,8 +1395,17 @@ def monitor_and_close(chat_id):
                     or close_payload.get("reference")
                 )
                 # Gold rule: never trust HTTP 200 alone — confirm GET /positions no longer lists this deal.
+                try:
+                    _sz_v = float(size_leg) if size_leg is not None else float(live["position"].get("size") or 0)
+                except (TypeError, ValueError):
+                    _sz_v = None
                 if not capital_verify_deal_closed_after_close_request(
-                    base_url, headers, str(deal_id)
+                    base_url,
+                    headers,
+                    str(deal_id),
+                    symbol=str(symbol or ""),
+                    direction=str(direction or ""),
+                    size=_sz_v,
                 ):
                     try:
                         notify_admin_alert(
@@ -1412,6 +1425,23 @@ def monitor_and_close(chat_id):
                     identifiers=[str(deal_ref)] if deal_ref else None,
                 )
                 if not final:
+                    # History miss: never mark CLOSED if GET /positions still shows this leg.
+                    if capital_deal_still_open(
+                        base_url,
+                        headers,
+                        str(deal_id),
+                        symbol=str(symbol or ""),
+                        direction=str(direction or ""),
+                        size=_sz_v,
+                    ):
+                        try:
+                            notify_admin_alert(
+                                "ABORT mark_trade_closed_pending: DELETE ok but position still on broker "
+                                f"(history miss). chat_id={chat_id} trade_id={trade_id} {symbol} deal_id={deal_id}"
+                            )
+                        except Exception:
+                            pass
+                        continue
                     # Position is gone but history not ready — mark CLOSED pending PnL (no full close Telegram).
                     mark_trade_closed_pending(
                         chat_id,

@@ -40,27 +40,104 @@ FINALIZED_NO_PNL = "FINALIZED_NO_PNL"
 # After DELETE / manual close, poll /positions before trusting "closed" (2s, 5s, 10s gaps in fetch_closed_deal_final_data).
 VERIFY_CLOSE_MAX_POLLS = int(os.getenv("VERIFY_CLOSE_MAX_POLLS", "10"))
 VERIFY_CLOSE_POLL_SEC = float(os.getenv("VERIFY_CLOSE_POLL_SEC", "0.6"))
+VERIFY_CLOSE_CONSECUTIVE_ABSENT = max(1, int(os.getenv("VERIFY_CLOSE_CONSECUTIVE_ABSENT", "2")))
 
 
-def _capital_deal_id_from_row(p: dict) -> str | None:
-    """Capital may expose dealId and/or positionId on the nested position object."""
+def _capital_norm_id(v) -> str:
+    if v is None:
+        return ""
+    return re.sub(r"[^a-zA-Z0-9]", "", str(v)).lower()
+
+
+def _capital_ids_match(a: str, b: str) -> bool:
+    """Same deal can appear as dealId vs positionId or with formatting drift."""
+    na = _capital_norm_id(a)
+    nb = _capital_norm_id(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    if len(na) >= 8 and nb.endswith(na):
+        return True
+    if len(nb) >= 8 and na.endswith(nb):
+        return True
+    return False
+
+
+def _capital_all_ids_from_row(p: dict) -> set[str]:
+    """Collect dealId + positionId from both top-level and nested position (Capital varies)."""
+    out: set[str] = set()
     if not isinstance(p, dict):
-        return None
+        return out
     pos = p.get("position") or {}
     if not isinstance(pos, dict):
         pos = {}
-    for k in ("dealId", "positionId"):
-        v = pos.get(k)
-        if v is not None:
-            return str(v).strip()
-    v2 = p.get("dealId")
-    return str(v2).strip() if v2 is not None else None
+    for obj in (pos, p):
+        if not isinstance(obj, dict):
+            continue
+        for k in ("dealId", "positionId"):
+            v = obj.get(k)
+            if v is not None:
+                out.add(str(v).strip())
+    return out
 
 
-def capital_deal_still_open(base_url: str, headers: dict, deal_id: str) -> bool:
+def _capital_deal_id_from_row(p: dict) -> str | None:
+    """First available id (legacy callers)."""
+    ids = _capital_all_ids_from_row(p)
+    return next(iter(ids)) if ids else None
+
+
+def _capital_row_matches_symbol_direction_size(
+    p: dict,
+    *,
+    symbol: str | None,
+    direction: str | None,
+    size: float | None,
+) -> bool:
+    """Last-resort match when dealId/positionId in DB drifted from API strings."""
+    if not symbol or not direction:
+        return False
+    m = p.get("market") or {}
+    pos = p.get("position") or {}
+    if not isinstance(pos, dict):
+        return False
+    epic = str(m.get("epic", "") or m.get("instrumentName", "") or "").upper()
+    sym = str(symbol).strip().upper()
+    sym_tok = sym.split(".")[-1].split(":")[-1]
+    epic_ok = sym in epic or sym_tok and sym_tok in epic
+    if not epic_ok:
+        return False
+    if str(pos.get("direction")) != str(direction):
+        return False
+    if size is None:
+        return True
+    try:
+        sz = float(pos.get("size") or 0)
+    except (TypeError, ValueError):
+        return False
+    return abs(sz - float(size)) <= 0.51
+
+
+def capital_deal_still_open(
+    base_url: str,
+    headers: dict,
+    deal_id: str,
+    *,
+    symbol: str | None = None,
+    direction: str | None = None,
+    size: float | None = None,
+) -> bool:
     """
     True if the broker still lists this deal/position as OPEN.
-    If /positions is unavailable, returns True (conservative: do not claim 'closed').
+
+    Conservative rules (false "closed" is unacceptable):
+    - Non-200 on GET /positions → assume OPEN (cannot verify absence).
+    - Any row in /positions whose dealId OR positionId matches (normalized) → OPEN.
+    - If /positions returns at least one open row but NO id match for our deal_id,
+      assume OPEN anyway (ID drift / TP split / API shape) — log once.
+    - GET /positions/{deal_id} returning 404 while the list is non-empty and did not
+      match is treated as ambiguous id, not as proof of absence.
     """
     if not deal_id:
         return False
@@ -68,22 +145,57 @@ def capital_deal_still_open(base_url: str, headers: dict, deal_id: str) -> bool:
         res = requests.get(f"{base_url}/positions", headers=headers, timeout=20)
         if res.status_code != 200:
             return True
-        for p in (res.json() or {}).get("positions", []) or []:
-            row_id = _capital_deal_id_from_row(p)
-            if row_id and str(row_id) == str(deal_id):
+        positions = (res.json() or {}).get("positions", []) or []
+        for p in positions:
+            for rid in _capital_all_ids_from_row(p):
+                if _capital_ids_match(deal_id, rid):
+                    return True
+            if symbol and direction and _capital_row_matches_symbol_direction_size(
+                p, symbol=symbol, direction=direction, size=size
+            ):
+                print(
+                    f"[Capital sync] Matched open row by epic+direction+size for deal_id={deal_id} "
+                    f"symbol={symbol} (id drift safety)",
+                    flush=True,
+                )
                 return True
+        if len(positions) > 0 and symbol and str(symbol).strip():
+            sym_u = str(symbol).strip().upper()
+            sym_tok = sym_u.split(".")[-1].split(":")[-1]
+            for p in positions:
+                m = p.get("market") or {}
+                epic = str(m.get("epic", "") or m.get("instrumentName", "") or "").upper()
+                if sym_u in epic or (sym_tok and sym_tok in epic):
+                    print(
+                        f"[Capital sync] CONSERVATIVE: open row(s) on same symbol {sym_u} but no id match "
+                        f"for deal_id={deal_id} — treating as STILL OPEN",
+                        flush=True,
+                    )
+                    return True
+
         res2 = requests.get(
             f"{base_url}/positions/{deal_id}", headers=headers, timeout=15
         )
         if res2.status_code == 200:
             data = res2.json() or {}
             if data.get("errorCode"):
-                return False
-            if _capital_deal_id_from_row(data):
+                return True
+            if _capital_all_ids_from_row(data):
                 return True
             pos = data.get("position") or {}
-            if isinstance(pos, dict) and pos.get("dealId") is not None:
+            if isinstance(pos, dict) and (
+                pos.get("dealId") is not None or pos.get("positionId") is not None
+            ):
                 return True
+        # List empty + detail not 200 with position: treat as flat only when list was empty.
+        if res2.status_code == 404 and len(positions) == 0:
+            return False
+        if res2.status_code == 404 and len(positions) > 0:
+            print(
+                f"[Capital sync] CONSERVATIVE: detail 404 for deal_id={deal_id} but list non-empty earlier — OPEN",
+                flush=True,
+            )
+            return True
     except Exception:
         return True
     return False
@@ -93,22 +205,41 @@ def capital_verify_deal_closed_after_close_request(
     base_url: str,
     headers: dict,
     deal_id: str,
+    *,
+    symbol: str | None = None,
+    direction: str | None = None,
+    size: float | None = None,
 ) -> bool:
     """
-    After DELETE /positions/{id}, poll until the deal disappears from GET /positions.
-    Returns True only when the position is confirmed absent (safe to read history).
-    Returns False if still open after VERIFY_CLOSE_MAX_POLLS (close failed / lag).
+    After DELETE /positions/{id}, poll until GET /positions shows the deal absent.
+    Requires VERIFY_CLOSE_CONSECUTIVE_ABSENT consecutive "absent" reads (default 2) so a
+    single flaky empty response cannot confirm a close.
     """
     if not deal_id:
         return False
     n = max(1, VERIFY_CLOSE_MAX_POLLS)
+    need_absent = max(1, VERIFY_CLOSE_CONSECUTIVE_ABSENT)
+    absent_streak = 0
     for i in range(n):
-        if not capital_deal_still_open(base_url, headers, str(deal_id)):
+        still = capital_deal_still_open(
+            base_url,
+            headers,
+            str(deal_id),
+            symbol=symbol,
+            direction=direction,
+            size=size,
+        )
+        if not still:
+            absent_streak += 1
             print(
-                f"[Capital verify] deal {deal_id} absent from /positions after {i + 1}/{n} poll(s)",
+                f"[Capital verify] deal {deal_id} absent poll streak {absent_streak}/{need_absent} "
+                f"(iteration {i + 1}/{n})",
                 flush=True,
             )
-            return True
+            if absent_streak >= need_absent:
+                return True
+        else:
+            absent_streak = 0
         time.sleep(max(0.1, VERIFY_CLOSE_POLL_SEC))
     print(
         f"[Capital verify] deal {deal_id} STILL OPEN on broker after {n} poll(s) — close not confirmed",
@@ -377,16 +508,11 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
         return
 
     live_positions = pos_res.json().get('positions', [])
-    # Normalize dealId / positionId: broker may use either; DB stores opening dealId.
+    # Every dealId + positionId from each row (DB may store either).
     live_deal_ids = set()
     for p in live_positions:
-        pos = p.get("position") or {}
-        if not isinstance(pos, dict):
-            continue
-        for k in ("dealId", "positionId"):
-            v = pos.get(k)
-            if v is not None:
-                live_deal_ids.add(str(v).strip())
+        for pid in _capital_all_ids_from_row(p):
+            live_deal_ids.add(str(pid).strip())
 
     conn = sqlite3.connect(DB_PATH)
     c    = conn.cursor()
@@ -435,7 +561,18 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
     ) in local_open:
         if deal_id and str(deal_id) not in live_deal_ids:
             # Gold rule: list membership can race; confirm the broker truly has no open position.
-            if capital_deal_still_open(base_url, headers, str(deal_id)):
+            try:
+                sz_f = float(size) if size is not None else None
+            except (TypeError, ValueError):
+                sz_f = None
+            if capital_deal_still_open(
+                base_url,
+                headers,
+                str(deal_id),
+                symbol=str(symbol or ""),
+                direction=str(direction or ""),
+                size=sz_f,
+            ):
                 continue
             # Prevent hot-loop hammering when Capital history lags.
             # Retry with cooldown and bounded attempt tracking per trade.
@@ -483,6 +620,21 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
                 identifiers=[dr] if dr else None,
             )
             if not final:
+                # Hard check: never mark CLOSED / notify if the broker still lists this leg.
+                if capital_deal_still_open(
+                    base_url,
+                    headers,
+                    str(deal_id),
+                    symbol=str(symbol or ""),
+                    direction=str(direction or ""),
+                    size=sz_f,
+                ):
+                    print(
+                        f"[Capital Sync] ABORT mark_trade_closed_pending: trade_id={trade_id} "
+                        f"deal_id={deal_id} still OPEN at broker (history miss, position present)",
+                        flush=True,
+                    )
+                    continue
                 mark_trade_closed_pending(
                     chat_id,
                     int(trade_id),
@@ -669,8 +821,19 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
             attempts_i = 0
         if attempts_i >= SYNC_MAX_ATTEMPTS:
             if FINAL_SYNC_FALLBACK_ENABLED:
+                try:
+                    sz_pf = float(size) if size is not None else None
+                except (TypeError, ValueError):
+                    sz_pf = None
                 # Never tell the user "closed / no PnL" if the position is still open at the broker.
-                if deal_id and capital_deal_still_open(base_url, headers, str(deal_id)):
+                if deal_id and capital_deal_still_open(
+                    base_url,
+                    headers,
+                    str(deal_id),
+                    symbol=str(symbol or ""),
+                    direction=str(direction or ""),
+                    size=sz_pf,
+                ):
                     try:
                         from bot.notifier import notify_admin_alert
 
@@ -945,7 +1108,7 @@ def run_zombie_trade_audit(
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute(
-            "SELECT trade_id, deal_id, symbol, status, COALESCE(sync_status,'') FROM trades "
+            "SELECT trade_id, deal_id, symbol, direction, size, status, COALESCE(sync_status,'') FROM trades "
             "WHERE chat_id=? AND deal_id IS NOT NULL AND TRIM(deal_id) != ''",
             (cid,),
         )
@@ -953,9 +1116,20 @@ def run_zombie_trade_audit(
         conn.close()
 
         need_reconcile = False
-        for trade_id, deal_id, symbol, status, sync_st in rows:
+        for trade_id, deal_id, symbol, direction, size, status, sync_st in rows:
             did = str(deal_id).strip()
-            broker_open = capital_deal_still_open(base_url, headers, did)
+            try:
+                sz_a = float(size) if size is not None else None
+            except (TypeError, ValueError):
+                sz_a = None
+            broker_open = capital_deal_still_open(
+                base_url,
+                headers,
+                did,
+                symbol=str(symbol or ""),
+                direction=str(direction or ""),
+                size=sz_a,
+            )
 
             if status == "OPEN" and not broker_open:
                 lines.append(
