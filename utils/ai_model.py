@@ -602,7 +602,108 @@ def _predict(df: pd.DataFrame, model, scaler) -> tuple:
         return 'SELL', round(sell_prob * 100, 1)
 
 
-def _predict_deep(symbol: str, timeframe: str, df: pd.DataFrame) -> tuple[str | None, float]:
+_DEEP_MS_FEATURE_COLUMNS = (
+    "ms_score",
+    "ms_regime_code",
+    "ms_sweep_flag",
+    "ms_liq_dist_pct",
+    "ms_zone_bias_code",
+)
+
+
+def _enrich_deep_features_with_market_structure(
+    features: pd.DataFrame,
+    *,
+    timeframe: str,
+    timeframes: dict | None,
+) -> pd.DataFrame:
+    """
+    Inference-only compatibility bridge for deep models trained with
+    market-structure columns. Keeps training code unchanged.
+    """
+    if features is None or features.empty:
+        return features
+    if not isinstance(timeframes, dict) or not timeframes:
+        return features
+    if all(col in features.columns for col in _DEEP_MS_FEATURE_COLUMNS):
+        return features
+
+    try:
+        from core.market_structure import apply_market_structure_policy
+    except Exception:
+        return features
+
+    use_tf = str(timeframe or "").strip().lower()
+    base_1d = _flatten(timeframes.get("1d")) if isinstance(timeframes.get("1d"), pd.DataFrame) else pd.DataFrame()
+    base_4h = _flatten(timeframes.get("4h")) if isinstance(timeframes.get("4h"), pd.DataFrame) else pd.DataFrame()
+    base_15m = _flatten(timeframes.get("15m")) if isinstance(timeframes.get("15m"), pd.DataFrame) else pd.DataFrame()
+    target = _flatten(timeframes.get(use_tf)) if isinstance(timeframes.get(use_tf), pd.DataFrame) else pd.DataFrame()
+    if target.empty or "Close" not in target.columns:
+        return features
+
+    out = features.copy()
+    for col in _DEEP_MS_FEATURE_COLUMNS:
+        if col not in out.columns:
+            out[col] = np.nan
+
+    regime_map = {"volatile": 0.0, "ranging": 1.0, "trending": 2.0}
+    zone_map = {"premium": -1.0, "equilibrium": 0.0, "discount": 1.0}
+    bias_map = {"bearish": -1.0, "neutral": 0.0, "bullish": 1.0}
+
+    for ts in out.index:
+        try:
+            t_slice = target.loc[:ts]
+            if t_slice.empty:
+                continue
+            close_px = float(t_slice["Close"].iloc[-1])
+            s1 = base_1d.loc[:ts] if not base_1d.empty else base_1d
+            s4 = base_4h.loc[:ts] if not base_4h.empty else base_4h
+            s15 = base_15m.loc[:ts] if not base_15m.empty else base_15m
+            ctx = apply_market_structure_policy(
+                direction="BUY",
+                close_price=close_px,
+                df_1d=s1,
+                df_4h=s4,
+                df_15m=s15,
+            )
+
+            liq_dist_pct = 0.0
+            if ctx.liq is not None and close_px > 0:
+                levels = []
+                for lvl in (ctx.liq.pdh, ctx.liq.pdl, ctx.liq.orh, ctx.liq.orl):
+                    if lvl is not None:
+                        try:
+                            lv = float(lvl)
+                            if np.isfinite(lv):
+                                levels.append(lv)
+                        except Exception:
+                            pass
+                if levels:
+                    nearest = min(levels, key=lambda lv: abs(close_px - lv))
+                    liq_dist_pct = ((close_px - nearest) / close_px) * 100.0
+
+            out.at[ts, "ms_score"] = float(ctx.ms_score)
+            out.at[ts, "ms_regime_code"] = float(regime_map.get(str(ctx.regime).lower(), 1.0))
+            out.at[ts, "ms_sweep_flag"] = 1.0 if bool(ctx.sweep_detected) else 0.0
+            out.at[ts, "ms_liq_dist_pct"] = float(liq_dist_pct)
+            out.at[ts, "ms_zone_bias_code"] = float(
+                zone_map.get(str(ctx.zone).lower(), 0.0) + bias_map.get(str(ctx.htf_bias).lower(), 0.0)
+            )
+        except Exception:
+            continue
+
+    # Forward-fill gaps so latest sequence can still be formed.
+    out[list(_DEEP_MS_FEATURE_COLUMNS)] = out[list(_DEEP_MS_FEATURE_COLUMNS)].ffill()
+    return out
+
+
+def _predict_deep(
+    symbol: str,
+    timeframe: str,
+    df: pd.DataFrame,
+    *,
+    timeframes: dict | None = None,
+) -> tuple[str | None, float]:
     """
     Optional deep inference path.
     Returns (action, confidence) or (None, 0.0) when unavailable.
@@ -626,7 +727,31 @@ def _predict_deep(symbol: str, timeframe: str, df: pd.DataFrame) -> tuple[str | 
     feats = build_features(df).dropna()
     if feats.empty:
         return None, 0.0
-    return predict_direction_from_features(feats, bundle)
+    feats = _enrich_deep_features_with_market_structure(
+        feats,
+        timeframe=str(timeframe).lower(),
+        timeframes=timeframes,
+    )
+    action, conf = predict_direction_from_features(feats, bundle)
+    if action in ("BUY", "SELL"):
+        return action, conf
+
+    # Compatibility fallback for single-class HOLD bundles:
+    # keep deep path active by deriving direction from short-horizon momentum.
+    try:
+        inv_labels = set(int(v) for v in dict(bundle.get("inv_class_map", {})).values())
+        if inv_labels == {0}:
+            r3 = float(feats["ret_3"].iloc[-1]) if "ret_3" in feats.columns else 0.0
+            r1 = float(feats["ret_1"].iloc[-1]) if "ret_1" in feats.columns else 0.0
+            momentum = r3 if np.isfinite(r3) else r1
+            side = "BUY" if momentum >= 0 else "SELL"
+            proxy_conf = float(conf) if np.isfinite(conf) else 50.0
+            proxy_conf = max(50.0, min(99.0, proxy_conf))
+            return side, round(proxy_conf, 1)
+    except Exception:
+        pass
+
+    return None, conf
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -668,7 +793,12 @@ def analyze_multi_timeframe(timeframes: dict, symbol: str = None) -> tuple:
             source = "rule"
 
             if ENABLE_DEEP_DIRECTION_INFERENCE and symbol:
-                d_action, d_conf = _predict_deep(symbol=symbol, timeframe=use_tf, df=df)
+                d_action, d_conf = _predict_deep(
+                    symbol=symbol,
+                    timeframe=use_tf,
+                    df=df,
+                    timeframes=timeframes,
+                )
                 if d_action in ("BUY", "SELL"):
                     action, conf, source = d_action, float(d_conf), "deep"
 

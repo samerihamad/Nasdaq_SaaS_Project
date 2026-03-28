@@ -13,6 +13,7 @@ from .trainer import DIRECTION_MODEL_VERSION
 
 MODEL_DIR = "models"
 _CACHE: dict[str, dict[str, Any]] = {}
+_V2_COMPAT_MODEL_NAME = "direction_model_v2.pt"
 
 
 def _model_path(symbol: str, timeframe: str, kind: str) -> str:
@@ -39,11 +40,22 @@ def load_direction_bundle(symbol: str, timeframe: str, kind: str = "lstm") -> di
     path = _model_path(symbol, timeframe, kind)
     scaler_path = path + ".scaler.pkl"
     if not os.path.exists(path) or not os.path.exists(scaler_path):
-        return None
+        compat_path = os.path.join(MODEL_DIR, _V2_COMPAT_MODEL_NAME)
+        compat_scaler = compat_path + ".scaler.pkl"
+        if os.path.exists(compat_path) and os.path.exists(compat_scaler):
+            path = compat_path
+            scaler_path = compat_scaler
+        else:
+            return None
 
     try:
         payload = torch.load(path, map_location="cpu")
-        if int(payload.get("version", -1)) != int(DIRECTION_MODEL_VERSION):
+        payload_version = int(payload.get("version", -1))
+        is_v2_compat = (
+            os.path.basename(path).lower() == _V2_COMPAT_MODEL_NAME
+            and payload_version == 2
+        )
+        if payload_version != int(DIRECTION_MODEL_VERSION) and not is_v2_compat:
             return None
         feature_names = list(payload.get("feature_names", []) or [])
         class_map = payload.get("class_map", {}) or {}
