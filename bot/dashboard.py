@@ -2217,6 +2217,7 @@ async def _post_init(app):
         BotCommand('limits',     'Admin: active pending limit orders'),
         BotCommand('orders',     'Admin alias for /limits'),
         BotCommand('monitor',    'Admin: live subscriber monitor'),
+        BotCommand('admin',      'Admin controls (/admin ai, /admin status, ...)'),
         BotCommand('audit_sync', 'Admin: DB vs broker position audit'),
     ])
 

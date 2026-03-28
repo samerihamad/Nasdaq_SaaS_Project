@@ -3,6 +3,7 @@ import sqlite3
 import time
 import uuid
 import math
+import os
 from datetime import datetime, timedelta, timezone
 from bot.notifier import send_telegram_message, notify_admin_alert
 from bot.licensing import safe_decrypt
@@ -20,6 +21,7 @@ from config import (
     LIMIT_ORDER_MOMENTUM_RETRACE,
     LIMIT_ORDER_MEANREV_ATR_OFFSET,
     LIMIT_ORDER_ALLOW_MARKET_FALLBACK,
+    EXECUTION_REJECTION_NOTIFY_COOLDOWN_SEC,
 )
 from utils.market_scanner import scan_multi_timeframe
 from database.db_manager import is_maintenance_mode, get_subscriber_lang
@@ -48,6 +50,48 @@ _EPIC_CACHE = {}
 _SESSION_CACHE = {}
 SESSION_TTL_SECONDS = 45
 DB_PATH = 'database/trading_saas.db'
+LOG_ROOT = os.getenv("ENGINE_LOG_ROOT", "logs")
+_REJECTION_NOTIFY_CACHE: dict[str, float] = {}
+
+
+def _append_daily_exec_log(filename: str, message: str):
+    """Write execution-layer events into daily logs/<date>/ files."""
+    try:
+        day_dir = os.path.join(LOG_ROOT, datetime.now().strftime("%Y-%m-%d"))
+        os.makedirs(day_dir, exist_ok=True)
+        path = os.path.join(day_dir, filename)
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {message}\n")
+    except Exception:
+        pass
+
+
+def _audit_exec_event(stage: str, chat_id: str | None, symbol: str | None, action: str | None, details: str):
+    _append_daily_exec_log(
+        "execution_events.txt",
+        (
+            f"stage={stage} chat_id={chat_id or 'n/a'} symbol={symbol or 'n/a'} "
+            f"action={action or 'n/a'} details={details}"
+        ),
+    )
+
+
+def _maybe_notify_rejection(chat_id: str, message: str, *, symbol: str = "", action: str = "", stage: str = "generic"):
+    """
+    Cooldown-throttled rejection notification to reduce repetitive user spam.
+    """
+    try:
+        now_ts = time.time()
+        key = f"{chat_id}|{str(symbol).upper()}|{str(action).upper()}|{stage}"
+        last_ts = float(_REJECTION_NOTIFY_CACHE.get(key, 0.0))
+        if (now_ts - last_ts) < float(EXECUTION_REJECTION_NOTIFY_COOLDOWN_SEC):
+            return False
+        _REJECTION_NOTIFY_CACHE[key] = now_ts
+        send_telegram_message(chat_id, message)
+        return True
+    except Exception:
+        return False
 
 
 def _log_trade_rejection(chat_id, symbol, action, stage: str, reason: str, details: str = ""):
@@ -106,14 +150,104 @@ def _extract_min_tp_value(err: str) -> float | None:
         return None
 
 
-def _calculate_limit_price(symbol: str, action: str, strategy_label: str, entry_price: float, atr: float | None) -> float:
+def _safe_json_response(res: requests.Response) -> dict:
+    try:
+        data = res.json()
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _normalize_broker_error(res: requests.Response | None = None, payload: dict | None = None) -> str:
+    """
+    Unified Capital.com error parser to avoid scattered string handling.
+    """
+    data = payload or {}
+    if (not data) and res is not None:
+        data = _safe_json_response(res)
+
+    fields = (
+        "errorCode",
+        "message",
+        "errorMessage",
+        "reason",
+        "rejectionReason",
+        "dealError",
+        "details",
+    )
+    pieces: list[str] = []
+    for k in fields:
+        v = data.get(k) if isinstance(data, dict) else None
+        if v is None:
+            continue
+        s = str(v).strip()
+        if not s:
+            continue
+        if k == "errorCode":
+            pieces.insert(0, s)
+        else:
+            pieces.append(s)
+    if pieces:
+        merged = ": ".join([pieces[0], " | ".join(pieces[1:])]) if len(pieces) > 1 else pieces[0]
+        return merged[:320]
+
+    if res is None:
+        return "unknown broker error"
+    txt = (res.text or "").strip()
+    if txt:
+        return f"HTTP_{res.status_code} {txt[:280]}"
+    return f"HTTP_{res.status_code}"
+
+
+def _broker_request(
+    method: str,
+    url: str,
+    *,
+    headers: dict,
+    json_payload: dict | None = None,
+    params: dict | None = None,
+    timeout: int = 20,
+) -> tuple[bool, dict, str, int]:
+    """
+    Unified broker request wrapper.
+    Returns: (ok, payload, error_msg, status_code)
+    """
+    try:
+        res = requests.request(
+            method=method.upper(),
+            url=url,
+            headers=headers,
+            json=json_payload,
+            params=params,
+            timeout=timeout,
+        )
+    except Exception as exc:
+        return False, {}, str(exc), 0
+
+    data = _safe_json_response(res)
+    if res.status_code != 200:
+        return False, data, _normalize_broker_error(res=res, payload=data), int(res.status_code)
+    if isinstance(data, dict) and data.get("errorCode"):
+        return False, data, _normalize_broker_error(res=res, payload=data), int(res.status_code)
+    return True, data, "", int(res.status_code)
+
+
+def _calculate_limit_price(
+    symbol: str,
+    action: str,
+    strategy_label: str,
+    entry_price: float,
+    atr: float | None,
+    *,
+    session_context: dict | None = None,
+) -> float:
     """
     Sprint 2 policy map:
     - Momentum: 0.618 retrace of last 15m candle range.
     - MeanRev: ATR offset from current extreme/reclaimed area proxy.
     """
     s = (strategy_label or "").strip().lower()
-    tf = scan_multi_timeframe(symbol) or {}
+    tf = scan_multi_timeframe(symbol, session_context=session_context) or {}
     df_15m = tf.get("15m")
     if df_15m is None or len(df_15m) < 2:
         return float(entry_price)
@@ -235,6 +369,13 @@ def process_pending_limit_orders():
                     "UPDATE pending_limit_orders SET status='CANCELLED', cancelled_at=?, reason=? WHERE id=? AND status='PENDING'",
                     (now.isoformat(), "ttl_expired", int(oid)),
                 )
+            _audit_exec_event(
+                stage="pending_limit_cancelled",
+                chat_id=str(chat_id),
+                symbol=str(symbol),
+                action=str(action),
+                details=f"oid={int(oid)} reason=ttl_expired limit={float(limit_price):.4f}",
+            )
             lang = get_subscriber_lang(str(chat_id))
             msg = (
                 f"⏱️ *Limit order expired*\n\n📌 {symbol} {action}\n💰 Limit: {float(limit_price):.4f}\nReason: TTL reached ({int(LIMIT_ORDER_TTL_BARS)} bars)."
@@ -288,6 +429,13 @@ def process_pending_limit_orders():
                 "UPDATE pending_limit_orders SET status=?, last_error=? WHERE id=?",
                 (final_status, "" if final_status == "FILLED" else str(result or "")[:400], int(oid)),
             )
+        _audit_exec_event(
+            stage="pending_limit_triggered",
+            chat_id=str(chat_id),
+            symbol=str(symbol),
+            action=str(action),
+            details=f"oid={int(oid)} status={final_status} limit={float(limit_price):.4f} now={float(px):.4f}",
+        )
         if final_status != "FILLED":
             # Ensure the user gets an explicit outcome after "executing".
             lang = get_subscriber_lang(str(chat_id))
@@ -385,7 +533,27 @@ def get_session(creds):
         f"is_demo={is_demo} base_url={base_url}\n"
         f"response={err_text}"
     )
+    _audit_exec_event(
+        stage="capital_auth_failed",
+        chat_id=None,
+        symbol=None,
+        action=None,
+        details=f"status={status} is_demo={is_demo} response={err_text[:180]}",
+    )
     return None, None
+
+
+def _scanner_context_from_creds(chat_id: str, creds) -> dict:
+    """
+    Build scanner session context from decrypted user credentials.
+    """
+    return {
+        "api_key": str(creds[0]).strip(),
+        "password": str(creds[1]).strip(),
+        "email": str(creds[3]).strip(),
+        "is_demo": bool(creds[2]),
+        "label": f"user:{chat_id}",
+    }
 
 
 def _get_balance(base_url, headers):
@@ -715,15 +883,15 @@ def _delete_position(base_url: str, headers: dict, deal_id: str) -> tuple[bool, 
     """Attempt to close an open broker position by dealId."""
     if not deal_id:
         return False, "missing deal_id"
-    try:
-        res = requests.delete(f"{base_url}/positions/{deal_id}", headers=headers, timeout=20)
-        if res.status_code == 200:
-            return True, "ok"
-        t = (res.text or "").strip()
-        t = t[:240] + ("..." if len(t) > 240 else "")
-        return False, f"HTTP_{res.status_code} {t}"
-    except Exception as exc:
-        return False, str(exc)
+    ok, data, err, _ = _broker_request(
+        "DELETE",
+        f"{base_url}/positions/{deal_id}",
+        headers=headers,
+        timeout=20,
+    )
+    if ok:
+        return True, "ok"
+    return False, err or _normalize_broker_error(payload=data)
 
 
 def _apply_min_distance_to_protection(
@@ -826,18 +994,16 @@ def _open_position_with_protection(base_url, headers, epic, action, size, stop_l
     payloads = [base, base2]
     last_err = ""
     for payload in payloads:
-        try:
-            res = requests.post(f"{base_url}/positions", json=payload, headers=headers)
-            if res.status_code == 200:
-                data = res.json() or {}
-                # Capital sometimes returns HTTP 200 with an error payload.
-                if data.get("errorCode"):
-                    last_err = f"{data.get('errorCode')}: {str(data.get('message', ''))[:200]}"
-                    continue
-                return True, data
-            last_err = (res.text or "")[:300]
-        except Exception as exc:
-            last_err = str(exc)
+        ok, data, err, _ = _broker_request(
+            "POST",
+            f"{base_url}/positions",
+            headers=headers,
+            json_payload=payload,
+            timeout=20,
+        )
+        if ok:
+            return True, data
+        last_err = err or _normalize_broker_error(payload=data)
     return False, last_err or "unknown error"
 
 
@@ -1091,17 +1257,16 @@ def _sync_stop_to_broker(base_url, headers, deal_id, stop_level):
     ]
     last_err = ""
     for payload in payloads:
-        try:
-            res = requests.put(
-                f"{base_url}/positions/{deal_id}",
-                json=payload,
-                headers=headers,
-            )
-            if res.status_code == 200:
-                return True, "ok"
-            last_err = (res.text or "")[:300]
-        except Exception as exc:
-            last_err = str(exc)
+        ok, data, err, _ = _broker_request(
+            "PUT",
+            f"{base_url}/positions/{deal_id}",
+            headers=headers,
+            json_payload=payload,
+            timeout=20,
+        )
+        if ok:
+            return True, "ok"
+        last_err = err or _normalize_broker_error(payload=data)
     return False, last_err or "unknown error"
 
 
@@ -1120,17 +1285,16 @@ def _sync_protection_to_broker(base_url, headers, deal_id, stop_level, profit_le
     ]
     last_err = ""
     for payload in payloads:
-        try:
-            res = requests.put(
-                f"{base_url}/positions/{deal_id}",
-                json=payload,
-                headers=headers,
-            )
-            if res.status_code == 200:
-                return True, "ok"
-            last_err = (res.text or "")[:300]
-        except Exception as exc:
-            last_err = str(exc)
+        ok, data, err, _ = _broker_request(
+            "PUT",
+            f"{base_url}/positions/{deal_id}",
+            headers=headers,
+            json_payload=payload,
+            timeout=20,
+        )
+        if ok:
+            return True, "ok"
+        last_err = err or _normalize_broker_error(payload=data)
     return False, last_err or "unknown error"
 
 
@@ -1238,8 +1402,11 @@ def monitor_and_close(chat_id):
         )
         upl = float(live['position']['upl'])
 
-        # Calculate ATR (try yfinance with the epic as ticker symbol)
-        atr = calculate_atr(symbol)
+        # Calculate ATR from unified scanner provider data
+        atr = calculate_atr(
+            symbol,
+            session_context=_scanner_context_from_creds(str(chat_id), creds),
+        )
         entry_price = float(trade.get('entry_price') or current_price)
         base_stop = trade.get('trailing_stop')
 
@@ -1533,19 +1700,21 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
     creds = get_user_credentials(chat_id)
     if not creds:
         msg = "❌ User not registered"
-        send_telegram_message(chat_id, msg)
+        _maybe_notify_rejection(chat_id, msg, symbol=symbol, action=action, stage="user_not_registered")
         return msg
     base_url, headers = get_session(creds)
     if not headers:
         msg = "❌ Capital.com authentication failed"
-        send_telegram_message(chat_id, msg)
+        _maybe_notify_rejection(chat_id, msg, symbol=symbol, action=action, stage="capital_auth_failed")
         return msg
 
     # ── Daily drawdown gate ───────────────────────────────────────────────────
     balance = _get_balance(base_url, headers)
     within_dd, dd_pct = check_daily_drawdown(chat_id, balance)
     if not within_dd:
-        return f"🔴 Daily drawdown limit reached ({dd_pct:.1f}%) — no new entries today."
+        msg = f"🔴 Daily drawdown limit reached ({dd_pct:.1f}%) — no new entries today."
+        _maybe_notify_rejection(chat_id, msg, symbol=symbol, action=action, stage="daily_drawdown")
+        return msg
 
     # ── Resolve broker epic from scanner ticker ────────────────────────────────
     order_epic = resolve_epic_for_user(
@@ -1573,7 +1742,19 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
 
     # ── ATR fetch (used for both RR check and initial stop) ───────────────────
     entry_price = _get_current_price(base_url, headers, order_epic)
-    atr         = calculate_atr(symbol)
+    scanner_ctx = _scanner_context_from_creds(str(chat_id), creds)
+    atr         = calculate_atr(symbol, session_context=scanner_ctx)
+    if not isinstance(entry_price, (int, float)) or not math.isfinite(float(entry_price)) or float(entry_price) <= 0:
+        msg = f"❌ Order failed ({symbol} {action}): invalid broker entry price"
+        _log_trade_rejection(chat_id, symbol, action, "entry_price_validation", msg, f"entry={entry_price}")
+        _audit_exec_event(
+            stage="entry_price_invalid",
+            chat_id=str(chat_id),
+            symbol=str(symbol),
+            action=str(action),
+            details=f"entry_price={entry_price}",
+        )
+        return msg
 
     # ── Market hours / tradability gate (before opening ANY leg) ─────────────
     is_tradeable, m_status = _market_tradeability(base_url, headers, order_epic)
@@ -1591,6 +1772,21 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             if stop_loss_pct is not None
             else (atr * 2.0 / entry_price)
         )
+        try:
+            effective_sl_pct = float(effective_sl_pct)
+        except Exception:
+            effective_sl_pct = 0.0
+        if (not math.isfinite(effective_sl_pct)) or effective_sl_pct <= 0 or effective_sl_pct >= 0.50:
+            msg = f"❌ Order failed ({symbol} {action}): invalid stop-loss ratio"
+            _log_trade_rejection(
+                chat_id,
+                symbol,
+                action,
+                "rr_gate",
+                msg,
+                f"effective_sl_pct={effective_sl_pct}",
+            )
+            return msg
         stop_price = (
             entry_price * (1 - effective_sl_pct) if action == 'BUY'
             else entry_price * (1 + effective_sl_pct)
@@ -1614,10 +1810,16 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
                 )
             _log_trade_rejection(chat_id, symbol, action, "rr_gate", msg, rr_reason or "")
             if not SUPPRESS_EXPECTED_REJECTION_TELEGRAM:
-                send_telegram_message(chat_id, msg)
+                _maybe_notify_rejection(chat_id, msg, symbol=symbol, action=action, stage="rr_gate")
             return msg
     else:
         effective_sl_pct = stop_loss_pct if stop_loss_pct is not None else 0.01
+        try:
+            effective_sl_pct = float(effective_sl_pct)
+        except Exception:
+            effective_sl_pct = 0.01
+        if (not math.isfinite(effective_sl_pct)) or effective_sl_pct <= 0:
+            effective_sl_pct = 0.01
         rr_ratio = 0.0
         stop_price = (
             entry_price * (1 - effective_sl_pct) if action == 'BUY'
@@ -1632,6 +1834,7 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             strategy_label=str(strategy_label or ""),
             entry_price=float(entry_price),
             atr=float(atr) if atr is not None else None,
+            session_context=scanner_ctx,
         )
         ok_lim, oid, lim_reason = _place_pending_limit_order(
             chat_id=str(chat_id),
@@ -1726,6 +1929,14 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
     tp_adjust_note = ""
     if min_dist and float(min_dist) > 0 and entry_price > 0:
         md = float(min_dist)
+        # Enforce broker minimum stop distance as well (not only TP widening).
+        stop_level, _ = _apply_min_distance_to_protection(
+            action=action,
+            entry_price=float(entry_price),
+            stop_level=float(stop_level),
+            profit_level=None,
+            min_dist=md,
+        )
         tp1_dist = abs(float(target1) - float(entry_price))
         if tp1_dist < md:
             widen = md * float(TP2_MIN_DISTANCE_BUFFER_MULT)
@@ -1776,6 +1987,7 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             msg = f"❌ تم منع الأمر ({symbol} {action}): {split_err}"
         print(msg)
         _log_trade_rejection(chat_id, symbol, action, "split_qty", msg, split_err or "")
+        _maybe_notify_rejection(chat_id, msg, symbol=symbol, action=action, stage="split_qty")
         return msg
 
     qty_total = qty1 + qty2
@@ -1868,9 +2080,16 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
                 f"❌ Order rejected ({symbol} {action}) — {leg_role} failed.\n"
                 f"Reason: {reason}{broker_note}"
             )
+            _audit_exec_event(
+                stage="order_leg_failed",
+                chat_id=str(chat_id),
+                symbol=str(symbol),
+                action=str(action),
+                details=f"leg={leg_role} reason={reason[:220]}",
+            )
             _log_trade_rejection(chat_id, symbol, action, f"{leg_role}_execution", msg, reason)
             if (not SUPPRESS_EXPECTED_REJECTION_TELEGRAM) or (not _is_expected_rejection(reason)):
-                send_telegram_message(chat_id, msg)
+                _maybe_notify_rejection(chat_id, msg, symbol=symbol, action=action, stage=f"{leg_role}_execution")
             return msg
 
     opened_trade_ids: list[int] = []
@@ -1899,7 +2118,7 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
 
     if not opened_legs:
         err = f"❌ Order failed ({symbol} {action}): no verified open position on broker"
-        send_telegram_message(chat_id, err)
+        _maybe_notify_rejection(chat_id, err, symbol=symbol, action=action, stage="verify_open_position")
         return err
 
     verified_qty = float(sum(l[0] for l in opened_legs))
@@ -1985,6 +2204,16 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
         pass
 
     stop_info = f"{stop_level:.4f}" if stop_level is not None else "N/A"
+    _audit_exec_event(
+        stage="order_opened",
+        chat_id=str(chat_id),
+        symbol=str(symbol),
+        action=str(action),
+        details=(
+            f"legs={len(opened_legs)} qty={verified_qty:.2f} entry={entry_price:.4f} "
+            f"sl={stop_info} rr={float(rr_ratio):.2f}"
+        ),
+    )
     return (
         f"✅ Opened — legs: {len(opened_legs)} | size: {verified_qty} | "
         f"stop: {stop_info} | RR: {rr_ratio:.1f}"

@@ -6,8 +6,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 def test_capital_connection():
-    # الرابط الخاص بـ API Capital.com (التجريبي)
-    url = "https://demo-api-capital.backend-capital.com/api/v1/session"
+    # يدعم LIVE/DEMO حسب متغير البيئة CAPITAL_IS_DEMO
+    is_demo = str(os.getenv("CAPITAL_IS_DEMO", "true")).strip().lower() == "true"
+    url = (
+        "https://demo-api-capital.backend-capital.com/api/v1/session"
+        if is_demo
+        else "https://api-capital.backend-capital.com/api/v1/session"
+    )
     
     headers = {
         "X-CAP-API-KEY": os.getenv("CAPITAL_API_KEY"),
@@ -15,7 +20,8 @@ def test_capital_connection():
     }
     
     payload = {
-        "identifier": os.getenv("CAPITAL_IDENTIFIER"),
+        # توافق خلفي: CAPITAL_EMAIL هو المفتاح الجديد، CAPITAL_IDENTIFIER قديم.
+        "identifier": os.getenv("CAPITAL_EMAIL") or os.getenv("CAPITAL_IDENTIFIER"),
         "password": os.getenv("CAPITAL_PASSWORD")
     }
 

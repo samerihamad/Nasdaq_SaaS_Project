@@ -14,7 +14,7 @@ main.py
  └── Trading loop
       ├── market hours check   (pre-market / open / closed)
       ├── daily scan           (Nasdaq universe → Level 1/2/3 filters)
-      ├── RF model analysis    (utils/ai_model.py)
+      ├── AI model analysis    (utils/ai_model.py)
       ├── Mean Reversion       (core/strategy_meanrev.py)
       ├── Momentum             (core/strategy_momentum.py)
       └── dispatch_signal()
@@ -36,11 +36,12 @@ Position monitoring (core/executor.py → monitor_and_close)
 Three independent analyzers run on every ticker each cycle.
 The **highest-confidence** signal that passes its threshold is dispatched.
 
-### 1. RF Model (`utils/ai_model.py`)
-- Random Forest trained on 5 years of daily bars per ticker.
-- Features: EMA20/50/200 distances, RSI, MACD, VWAP, volume ratio.
+### 1. AI Direction Model (`utils/ai_model.py`)
+- Default path is **RF model** per timeframe (1D/4H/15M).
+- Optional deep models (LSTM/GRU/Transformer) can be enabled for inference.
+- Fallback order when enabled: **Deep -> RF -> rule-based**.
 - Three-timeframe alignment required: 1D + 4H + 15M must all agree.
-- Threshold: `MIN_CONFIDENCE = 63%` (set in `config.py`).
+- Confidence threshold is profile-driven via `SIGNAL_PROFILE` config.
 
 ### 2. Mean Reversion (`core/strategy_meanrev.py`)
 - Entry: RSI < 30 (BUY) or RSI > 70 (SELL) on the 15m chart.
@@ -102,6 +103,26 @@ ENCRYPTION_KEY=your_fernet_key          # generate with: python -c "from cryptog
 # Optional — enables momentum news quality boost
 NEWS_API_KEY=your_newsapi_org_key
 
+# Optional — scanner fallback provider (earnings calendar + market-cap profile)
+FMP_API_KEY=
+EARNINGS_TIMEOUT_SEC=15
+EARNINGS_CACHE_TTL_SEC=1800
+
+# Optional — dedicated shared scanner identity (if unset, uses CAPITAL_* defaults)
+MARKET_DATA_CAPITAL_API_KEY=
+MARKET_DATA_CAPITAL_EMAIL=
+MARKET_DATA_CAPITAL_PASSWORD=
+MARKET_DATA_CAPITAL_IS_DEMO=
+
+# AI gate tuning + ms_score integration
+AI_MIN_PROB_RF=62.0
+AI_MIN_PROB_MOMENTUM=65.0
+AI_MIN_PROB_MEANREV=64.0
+ENABLE_MS_SCORE_AI_INTEGRATION=true
+MS_SCORE_AI_SCALE=0.18
+MS_SCORE_AI_MAX_IMPACT=8.0
+EXECUTION_REJECTION_NOTIFY_COOLDOWN_SEC=600
+
 # Optional — enables auto-restart on crash
 WATCHDOG_AUTO_RESTART=true
 ```
@@ -161,8 +182,9 @@ Nasdaq_SaaS_Project/
 │   └── strategy_momentum.py   # Momentum strategy
 │
 ├── utils/
-│   ├── market_scanner.py      # Multi-timeframe yfinance data fetcher
+│   ├── market_scanner.py      # Multi-timeframe Capital.com data fetcher
 │   ├── ai_model.py            # Random Forest model + rule-based fallback
+│   ├── ml_direction/          # Optional deep direction models (LSTM/GRU/Transformer)
 │   ├── filters.py             # Nasdaq universe Level 1/2 filters
 │   └── market_hours.py        # Market open/closed/pre-market detection
 │
@@ -188,6 +210,10 @@ Nasdaq_SaaS_Project/
 | `/override`     | Allow one extra trade after Circuit Breaker      |
 | `/stop_today`   | Lock all new entries until tomorrow              |
 | `/mode`         | Toggle AUTO / HYBRID signal approval             |
+| `/admin ...`    | Admin controls (`/admin ai`, `/admin status`, ...) |
+| `/monitor`      | Admin live subscriber monitor                    |
+| `/limits`       | Admin pending-limit order panel                  |
+| `/audit_sync`   | Admin DB vs broker position audit                |
 
 ---
 

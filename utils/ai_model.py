@@ -9,6 +9,8 @@ Architecture:
      If probability < AI_PROBABILITY_THRESHOLD (65%), the trade is BLOCKED.
   3. detect_regime() classifies market context (TRENDING / RANGING / VOLATILE).
      A VOLATILE regime applies a probability penalty.
+  4. analyze_multi_timeframe() supports optional deep inference fallback chain:
+     Deep -> RF -> rule-based (RF path remains default).
 
 Key public API:
   validate_signal(symbol, direction, timeframes) -> (approved, probability, regime)
@@ -31,12 +33,20 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
-import yfinance as yf
+from utils.market_scanner import scan_market
+from config import (
+    ENABLE_DEEP_DIRECTION_INFERENCE,
+    DEEP_DIRECTION_INFERENCE_KIND,
+    ENABLE_MS_SCORE_AI_INTEGRATION,
+    MS_SCORE_AI_NEUTRAL,
+    MS_SCORE_AI_SCALE,
+    MS_SCORE_AI_MAX_IMPACT,
+)
 
 log = logging.getLogger(__name__)
 
 MODEL_DIR             = "models"
-MODEL_VERSION         = 3          # bump to force retrain after gate/training changes
+MODEL_VERSION         = 4          # bump to force retrain after provider/feature alignment changes
 AI_PROBABILITY_THRESHOLD = 60.0    # minimum probability to approve a trade
 MIN_TRAIN_BARS        = 220        # supports EMA200 + labeling while allowing newer listings
 TRAIN_RETRY_HOURS     = 6          # avoid retry spam for symbols with short history
@@ -111,6 +121,43 @@ def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return tr.rolling(period).mean()
 
 
+def _adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """
+    ADX(14) to align ML feature-space with Momentum trend logic.
+    """
+    high = _col_series(df, "High")
+    low = _col_series(df, "Low")
+    close = _col_series(df, "Close")
+    prev_high = high.shift(1)
+    prev_low = low.shift(1)
+    prev_close = close.shift(1)
+
+    up_move = high - prev_high
+    down_move = prev_low - low
+    plus_dm = pd.Series(
+        np.where((up_move > down_move) & (up_move > 0), up_move, 0.0),
+        index=high.index,
+    )
+    minus_dm = pd.Series(
+        np.where((down_move > up_move) & (down_move > 0), down_move, 0.0),
+        index=high.index,
+    )
+
+    tr = pd.concat(
+        [
+            (high - low),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    atr_s = tr.rolling(period).mean().replace(0, np.nan)
+    plus_di = 100 * (plus_dm.rolling(period).mean() / atr_s)
+    minus_di = 100 * (minus_dm.rolling(period).mean() / atr_s)
+    dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)) * 100
+    return dx.rolling(period).mean()
+
+
 def _flatten(df: pd.DataFrame) -> pd.DataFrame:
     if isinstance(df.columns, pd.MultiIndex):
         df = df.copy()
@@ -142,9 +189,9 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Build a feature matrix from an OHLCV DataFrame.
 
-    Columns (v3 — MODEL_VERSION = 3):
-      Price / EMA distances, RSI, MACD, VWAP, volume ratio,
-      ATR% (volatility), BB width (regime), high-low range%
+    Columns (v4 — MODEL_VERSION = 4):
+      Existing core set + ADX/trend-strength and candle-structure
+      features used by MeanRev/Momentum logic.
     """
     df = _flatten(df)
 
@@ -160,11 +207,18 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     macd_line, sig_line, hist = _macd(close)
     vwap   = _vwap(df)
     atr_v  = _atr(df)
+    adx14  = _adx(df)
 
     # Bollinger Band width as regime proxy
     bb_mid   = _ema(close, 20)
     bb_std   = close.rolling(20).std()
     bb_width = (2 * bb_std) / bb_mid.replace(0, np.nan) * 100
+    open_ = _col_series(df, "Open")
+    prev_close = close.shift(1)
+    bar_range = (high - low).replace(0, np.nan)
+    body = (close - open_).abs()
+    upper_wick = high - pd.concat([open_, close], axis=1).max(axis=1)
+    lower_wick = pd.concat([open_, close], axis=1).min(axis=1) - low
 
     features = pd.DataFrame({
         # Price / EMA distances (%)
@@ -187,6 +241,17 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         'atr_pct':           atr_v / close.replace(0, np.nan) * 100,
         'bb_width':          bb_width,
         'hl_range_pct':      (high - low) / close.replace(0, np.nan) * 100,
+        # Strategy-aligned structure/trend context
+        'adx14':             adx14,
+        'gap_pct':           (open_ - prev_close) / prev_close.replace(0, np.nan) * 100,
+        'candle_body_pct':   body / bar_range * 100,
+        'upper_wick_pct':    upper_wick / bar_range * 100,
+        'lower_wick_pct':    lower_wick / bar_range * 100,
+        'close_pos_in_bar':  (close - low) / bar_range,
+        'vwap_dev_abs':      ((close - vwap) / vwap.replace(0, np.nan) * 100).abs(),
+        # Short horizon returns to align directional momentum behavior.
+        'ret_1':             close.pct_change(1) * 100,
+        'ret_3':             close.pct_change(3) * 100,
     }, index=df.index)
 
     return features
@@ -218,36 +283,35 @@ def train_model(symbol: str, timeframe: str = "1d"):
     """
     Train a Random Forest classifier on market data for a specific timeframe.
 
-    - 1d: 5 years daily bars
-    - 15m: 60 days 15-minute bars (more detailed, closer to execution timeframe)
+    - 1d: 5 years daily bars (Capital.com provider)
+    - 4h: 12 months 4-hour bars (native 4h, no resampling)
+    - 15m: 90 days 15-minute bars
 
     Saves model + scaler to disk. Returns (model, scaler) or (None, None).
     """
     now = datetime.now(timezone.utc)
-    retry_at = _train_retry_after.get(symbol)
-    if retry_at and now < retry_at:
-        return None, None
-
     tf = str(timeframe or "1d").strip().lower()
     if tf in ("15m", "15min", "15"):
-        period, interval, label = "60d", "15m", "60d 15m"
+        period, interval, label = "90d", "15m", "90d 15m"
         tf = "15m"
+    elif tf in ("4h", "240m", "240min"):
+        period, interval, label = "12mo", "4h", "12mo 4h"
+        tf = "4h"
     else:
         period, interval, label = "5y", "1d", "5y daily"
         tf = "1d"
 
+    retry_key = f"{symbol.upper()}|{tf}"
+    retry_at = _train_retry_after.get(retry_key)
+    if retry_at and now < retry_at:
+        return None, None
+
     log.info("Training RF model for %s (%s)...", symbol, label)
-    df = yf.download(
-        symbol,
-        period=period,
-        interval=interval,
-        progress=False,
-        auto_adjust=True,
-    )
+    df = scan_market(symbol, period=period, interval=interval)
     bars = len(df) if df is not None else 0
     if df is None or bars < MIN_TRAIN_BARS:
         # Retry later instead of re-attempting every scan cycle.
-        _train_retry_after[symbol] = now + timedelta(hours=TRAIN_RETRY_HOURS)
+        _train_retry_after[retry_key] = now + timedelta(hours=TRAIN_RETRY_HOURS)
         log.warning(
             "Insufficient data for %s (%s, %s bars, need >= %s). Retry after %sh.",
             symbol, tf, bars, MIN_TRAIN_BARS, TRAIN_RETRY_HOURS
@@ -293,7 +357,7 @@ def load_or_train_model(symbol: str, timeframe: str = "1d"):
     """
     sym = str(symbol or "").strip().upper()
     tf = str(timeframe or "1d").strip().lower()
-    if tf not in ("1d", "15m"):
+    if tf not in ("1d", "4h", "15m"):
         tf = "1d"
 
     cache_key = f"{sym}|{tf}" if sym else tf
@@ -377,6 +441,7 @@ def validate_signal(
     timeframes: dict,
     *,
     min_probability: float | None = None,
+    ms_score: float | None = None,
 ) -> tuple:
     """
     AI Gatekeeper — the single mandatory checkpoint before every trade.
@@ -395,53 +460,59 @@ def validate_signal(
     (approved: bool, probability: float, regime: str)
       approved is True ONLY if probability >= AI_PROBABILITY_THRESHOLD.
     """
-    df_15m = timeframes.get('15m')
-    df_1d  = timeframes.get('1d')
+    df_15m = timeframes.get("15m")
+    df_4h = timeframes.get("4h")
+    df_1d = timeframes.get("1d")
 
-    # Avoid boolean evaluation on DataFrames (ambiguous truth value).
-    if df_15m is not None and not df_15m.empty:
-        df_primary = df_15m
-    elif df_1d is not None and not df_1d.empty:
-        df_primary = df_1d
-    else:
-        df_primary = None
-
-    if df_primary is None:
+    if not any(df is not None and not df.empty for df in (df_15m, df_4h, df_1d)):
         log.warning("[AI Gate %s] No data for validation — blocking", symbol)
         return False, 0.0, 'UNKNOWN'
 
-    df_primary = _flatten(df_primary)
+    # Regime from fastest available timeframe.
+    regime_df = df_15m if (df_15m is not None and not df_15m.empty) else (df_4h if (df_4h is not None and not df_4h.empty) else df_1d)
+    regime = detect_regime(_flatten(regime_df))
 
-    # Regime check
-    regime = detect_regime(df_primary)
+    # Probability blend by timeframe model to match strategy inputs.
+    probs: dict[str, float] = {}
+    weights = {"1d": 0.20, "4h": 0.35, "15m": 0.45}
+    for tf, df in (("1d", df_1d), ("4h", df_4h), ("15m", df_15m)):
+        if df is None or df.empty:
+            continue
+        frame = _flatten(df)
+        model, scaler = load_or_train_model(symbol, timeframe=tf)
+        if model and scaler:
+            probs[tf] = _direction_probability(frame, model, scaler, direction)
+        else:
+            probs[tf] = _rule_based_probability(frame, direction)
 
-    # Load model and compute direction probability
-    # Prefer the 15m-trained model when validating on intraday data.
-    model_tf = "15m" if (df_primary is df_15m) else "1d"
-    model, scaler = load_or_train_model(symbol, timeframe=model_tf)
+    if not probs:
+        return False, 0.0, regime["type"]
 
-    if model and scaler:
-        probability = _direction_probability(df_primary, model, scaler, direction)
-    else:
-        # Fallback: rule-based probability estimate
-        probability = _rule_based_probability(df_primary, direction)
+    weight_sum = sum(weights[tf] for tf in probs.keys())
+    probability = sum(probs[tf] * weights[tf] for tf in probs.keys()) / max(weight_sum, 1e-9)
+    probability = round(float(probability), 1)
+
+    # Optional market-structure context adjustment (soft, bounded).
+    if ENABLE_MS_SCORE_AI_INTEGRATION and ms_score is not None:
+        try:
+            ms_val = float(ms_score)
+            if np.isfinite(ms_val):
+                delta = (ms_val - float(MS_SCORE_AI_NEUTRAL)) * float(MS_SCORE_AI_SCALE)
+                cap = abs(float(MS_SCORE_AI_MAX_IMPACT))
+                delta = max(-cap, min(cap, delta))
+                probability = probability + delta
+        except Exception:
+            pass
 
     # Regime penalty: high volatility = uncertain environment
     if regime['type'] == 'VOLATILE':
-        probability = round(probability * 0.80, 1)   # stronger penalty
+        probability = round(probability * 0.90, 1)   # reduced penalty in volatile regimes
         log.info(
             "[AI Gate %s] VOLATILE regime penalty applied → probability=%.1f%%",
             symbol, probability,
         )
-
-        # Hard block in VOLATILE when probability is too low (safety brake).
-        if probability < 45.0:
-            min_prob = AI_PROBABILITY_THRESHOLD if min_probability is None else float(min_probability)
-            log.info(
-                "[AI Gate %s] VOLATILE hard block (prob=%.1f%% < 45.0%%) | min=%.1f%%",
-                symbol, probability, min_prob
-            )
-            return False, probability, regime['type']
+    else:
+        probability = round(float(probability), 1)
 
     min_prob = AI_PROBABILITY_THRESHOLD if min_probability is None else float(min_probability)
     approved = probability >= min_prob
@@ -535,6 +606,33 @@ def _predict(df: pd.DataFrame, model, scaler) -> tuple:
         return 'SELL', round(sell_prob * 100, 1)
 
 
+def _predict_deep(symbol: str, timeframe: str, df: pd.DataFrame) -> tuple[str | None, float]:
+    """
+    Optional deep inference path.
+    Returns (action, confidence) or (None, 0.0) when unavailable.
+    """
+    try:
+        from utils.ml_direction.infer import (
+            load_direction_bundle,
+            predict_direction_from_features,
+        )
+    except Exception:
+        return None, 0.0
+    if not symbol:
+        return None, 0.0
+    bundle = load_direction_bundle(
+        symbol=symbol,
+        timeframe=str(timeframe).lower(),
+        kind=DEEP_DIRECTION_INFERENCE_KIND,
+    )
+    if not bundle:
+        return None, 0.0
+    feats = build_features(df).dropna()
+    if feats.empty:
+        return None, 0.0
+    return predict_direction_from_features(feats, bundle)
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def analyze_multi_timeframe(timeframes: dict, symbol: str = None) -> tuple:
@@ -551,32 +649,59 @@ def analyze_multi_timeframe(timeframes: dict, symbol: str = None) -> tuple:
     validate_signal() before executing any trade.
     """
     try:
-        # Use timeframe-specific models:
-        # - 1d model for daily context
-        # - 15m model for intraday context (15m + 4h)
+        # Use native timeframe-specific models for full alignment with scanner/strategies.
+        # Inference order:
+        # - default: RF -> rule-based
+        # - when ENABLE_DEEP_DIRECTION_INFERENCE=true: Deep -> RF -> rule-based
         models: dict[str, tuple[Any, Any]] = {}
         if symbol:
             models["1d"] = load_or_train_model(symbol, timeframe="1d")
+            models["4h"] = load_or_train_model(symbol, timeframe="4h")
             models["15m"] = load_or_train_model(symbol, timeframe="15m")
 
         results = {}
-        for tf, df in timeframes.items():
+        path_info: dict[str, str] = {}
+        for tf in ("1d", "4h", "15m"):
+            df = timeframes.get(tf)
+            if df is None or df.empty:
+                continue
             df = _flatten(df)
-            use_tf = "15m" if str(tf).lower() in ("15m", "4h") else "1d"
-            model, scaler = models.get(use_tf, (None, None))
-            if model and scaler:
-                action, conf = _predict(df, model, scaler)
-                bullish = action == 'BUY'
-            else:
-                prob    = _rule_based_probability(df, 'BUY')
-                bullish = prob >= 50
-                action  = 'BUY' if bullish else 'SELL'
-                conf    = prob if bullish else round(100 - prob, 1)
-            results[tf] = {'action': action, 'confidence': conf, 'bullish': bullish}
+            use_tf = str(tf).lower()
+            action = None
+            conf = 0.0
+            source = "rule"
 
-        daily_bull = results['1d']['bullish']
-        h4_bull    = results['4h']['bullish']
-        m15_bull   = results['15m']['bullish']
+            if ENABLE_DEEP_DIRECTION_INFERENCE and symbol:
+                d_action, d_conf = _predict_deep(symbol=symbol, timeframe=use_tf, df=df)
+                if d_action in ("BUY", "SELL"):
+                    action, conf, source = d_action, float(d_conf), "deep"
+
+            if action is None:
+                model, scaler = models.get(use_tf, (None, None))
+                if model and scaler:
+                    rf_action, rf_conf = _predict(df, model, scaler)
+                    if rf_action in ("BUY", "SELL"):
+                        action, conf, source = rf_action, float(rf_conf), "rf"
+
+            if action is None:
+                prob = _rule_based_probability(df, 'BUY')
+                bullish = prob >= 50
+                action = 'BUY' if bullish else 'SELL'
+                conf = prob if bullish else round(100 - prob, 1)
+                source = "rule"
+
+            bullish = action == 'BUY'
+            results[tf] = {'action': action, 'confidence': conf, 'bullish': bullish}
+            path_info[tf] = source
+
+        # Require the core strategy timeframes to be present for strict alignment.
+        if any(tf not in results for tf in ("1d", "4h", "15m")):
+            present = ",".join(sorted(results.keys())) if results else "none"
+            return None, 0.0, f"Incomplete timeframe set for RF alignment ({present})"
+
+        daily_bull = results["1d"]["bullish"]
+        h4_bull = results["4h"]["bullish"]
+        m15_bull = results["15m"]["bullish"]
 
         all_bullish = daily_bull and h4_bull and m15_bull
         all_bearish = not daily_bull and not h4_bull and not m15_bull
@@ -592,19 +717,63 @@ def analyze_multi_timeframe(timeframes: dict, symbol: str = None) -> tuple:
 
         direction     = 'BUY' if all_bullish else 'SELL'
         combined_conf = round(
-            results['1d']['confidence']  * 0.40 +
+            results['1d']['confidence']  * 0.20 +
             results['4h']['confidence']  * 0.35 +
-            results['15m']['confidence'] * 0.25,
+            results['15m']['confidence'] * 0.45,
             1,
         )
         reason = (
-            f"RF aligned {'bullish' if all_bullish else 'bearish'}: "
+            f"Aligned {'bullish' if all_bullish else 'bearish'}: "
             f"1D={results['1d']['confidence']}% | "
             f"4H={results['4h']['confidence']}% | "
-            f"15M={results['15m']['confidence']}%"
+            f"15M={results['15m']['confidence']}% | "
+            f"path[1D={path_info.get('1d','?')},4H={path_info.get('4h','?')},15M={path_info.get('15m','?')}]"
         )
         return direction, combined_conf, reason
 
     except Exception as exc:
         log.error("analyze_multi_timeframe error: %s", exc)
         return None, 0.0, str(exc)
+
+
+def train_deep_direction_model(
+    symbol: str,
+    *,
+    timeframe: str = "15m",
+    model_kind: str = "lstm",
+    seq_len: int = 64,
+    label_horizon: int = 8,
+    label_threshold: float = 0.012,
+    epochs: int = 25,
+) -> dict:
+    """
+    Optional Phase 7 trainer bridge (LSTM/GRU/Transformer).
+    Keeps RF path fully backward-compatible.
+    """
+    try:
+        from utils.ml_direction.trainer import train_direction_for_symbol
+    except Exception as exc:
+        raise RuntimeError(
+            "Deep direction model training unavailable. Install torch to enable Phase 7."
+        ) from exc
+
+    res = train_direction_for_symbol(
+        symbol=symbol,
+        timeframe=timeframe,
+        model_kind=model_kind,
+        seq_len=seq_len,
+        label_horizon=label_horizon,
+        label_threshold=label_threshold,
+        epochs=epochs,
+    )
+    return {
+        "model_path": res.model_path,
+        "model_kind": res.model_kind,
+        "best_val_loss": res.best_val_loss,
+        "best_val_acc": res.best_val_acc,
+        "epochs": res.epochs,
+        "n_train": res.n_train,
+        "n_val": res.n_val,
+        "num_features": res.num_features,
+        "num_classes": res.num_classes,
+    }

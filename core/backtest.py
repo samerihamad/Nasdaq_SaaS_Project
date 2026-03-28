@@ -33,7 +33,7 @@ from typing import Literal
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
+from utils.market_scanner import scan_market
 
 log = logging.getLogger(__name__)
 
@@ -415,7 +415,7 @@ def run_backtest(
     ----------
     symbol          : ticker (e.g. 'AAPL')
     strategy        : 'meanrev' | 'momentum'
-    period          : yfinance period string ('1y', '2y', '5y', …)
+    period          : period string ('6mo', '1y', '2y', '5y', …)
     initial_balance : starting portfolio value in USD
 
     Returns
@@ -423,8 +423,7 @@ def run_backtest(
     BacktestResult — call .print_summary() for a formatted report.
     """
     log.info("Fetching %s data for %s backtest...", period, symbol)
-    df = yf.download(symbol, period=period, interval="1d",
-                     progress=False, auto_adjust=True)
+    df = scan_market(symbol, period=period, interval="1d")
 
     if df is None or len(df) < 60:
         log.error("Insufficient data for backtest (%s bars)", len(df) if df is not None else 0)
@@ -484,7 +483,7 @@ if __name__ == "__main__":
                         choices=["meanrev", "momentum", "all"],
                         help="Strategy to backtest (default: all)")
     parser.add_argument("--period",   type=str, default="2y",
-                        help="yfinance period string (default: 2y)")
+                        help="historical period string (default: 2y)")
     parser.add_argument("--balance",  type=float, default=INITIAL_BALANCE,
                         help=f"Starting balance USD (default: {INITIAL_BALANCE})")
     args = parser.parse_args()

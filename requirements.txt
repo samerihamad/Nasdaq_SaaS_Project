@@ -16,7 +16,6 @@ cryptography>=41.0.0
 # ── Trading stack (AI model, strategies, market data) ───────────────────────
 numpy>=1.24.0
 pandas>=2.0.0
-yfinance>=0.2.40
 scikit-learn>=1.3.0
 
 # ── Market hours & calendars ────────────────────────────────────────────────
@@ -38,3 +37,4 @@ google-auth-oauthlib>=1.0.0
 # ── Optional (install only if you use the feature) ───────────────────────────
 # Dropbox backup (BACKUP_PROVIDER=dropbox):  pip install "dropbox>=11.36"
 # WhatsApp alerts (TWILIO_* in .env):        pip install "twilio>=8.0"
+# Deep direction model (Phase 7, LSTM/GRU/Transformer): pip install torch

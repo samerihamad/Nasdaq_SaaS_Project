@@ -40,10 +40,26 @@ from utils.market_hours import get_market_status, STATUS_OPEN
 from bot.licensing import issue_license
 from bot.notifier import send_telegram_message
 from bot.i18n import t
-from config import LIMIT_ORDER_TTL_BARS, LIMIT_ORDER_BAR_MINUTES
+from config import (
+    LIMIT_ORDER_TTL_BARS,
+    LIMIT_ORDER_BAR_MINUTES,
+    SIGNAL_PROFILE,
+    SIGNAL_MIN_CONFIDENCE,
+    SIGNAL_MR_MIN_SCORE,
+    SIGNAL_MOM_MIN_SCORE,
+    ENABLE_DEEP_DIRECTION_MODEL,
+    ENABLE_DEEP_DIRECTION_INFERENCE,
+    DEEP_DIRECTION_MODEL_KIND,
+    DEEP_DIRECTION_INFERENCE_KIND,
+    DEEP_DIRECTION_TIMEFRAME,
+    ENABLE_MS_SCORE_AI_INTEGRATION,
+    MS_SCORE_AI_SCALE,
+    MS_SCORE_AI_MAX_IMPACT,
+)
 
 ADMIN_CHAT_ID = os.getenv('ADMIN_CHAT_ID', '')
 DB_PATH       = 'database/trading_saas.db'
+LOG_ROOT      = os.getenv("ENGINE_LOG_ROOT", "logs")
 
 
 def _is_admin(chat_id: str) -> bool:
@@ -216,6 +232,57 @@ def _build_monitor_panel(window_sec: int = 300) -> str:
     )
 
 
+def _read_last_log_line(path: str) -> str:
+    """Read last non-empty line from a text log file."""
+    try:
+        if not os.path.exists(path):
+            return ""
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = [ln.strip() for ln in f.readlines() if ln.strip()]
+        return lines[-1] if lines else ""
+    except Exception:
+        return ""
+
+
+def _build_ai_runtime_panel() -> str:
+    """
+    Build admin-facing AI runtime snapshot:
+    - active profile and thresholds
+    - deep inference state
+    - latest cycle/telemetry summary from daily logs
+    """
+    day_dir = os.path.join(LOG_ROOT, datetime.now().strftime("%Y-%m-%d"))
+    cycle_last = _read_last_log_line(os.path.join(day_dir, "engine_cycle.txt"))
+    ai_last = _read_last_log_line(os.path.join(day_dir, "ai_telemetry.txt"))
+    rej_last = _read_last_log_line(os.path.join(day_dir, "structural_rejections.txt"))
+
+    infer_mode = (
+        "Deep -> RF -> Rule"
+        if ENABLE_DEEP_DIRECTION_INFERENCE
+        else "RF -> Rule (default)"
+    )
+    deep_train = "enabled" if ENABLE_DEEP_DIRECTION_MODEL else "disabled"
+    deep_inf = "enabled" if ENABLE_DEEP_DIRECTION_INFERENCE else "disabled"
+    cycle_txt = cycle_last or "No cycle telemetry yet today."
+    ai_txt = ai_last or "No AI telemetry row yet today."
+    rej_txt = rej_last or "No structural rejection rows yet today."
+
+    return (
+        "*AI Runtime Status*\n\n"
+        f"Profile: *{SIGNAL_PROFILE}*\n"
+        f"Min Confidence: *{float(SIGNAL_MIN_CONFIDENCE):.1f}%*\n"
+        f"MR Min Score: *{int(SIGNAL_MR_MIN_SCORE)}* | MOM Min Score: *{int(SIGNAL_MOM_MIN_SCORE)}*\n\n"
+        f"Deep Training: *{deep_train}* ({DEEP_DIRECTION_MODEL_KIND}/{DEEP_DIRECTION_TIMEFRAME})\n"
+        f"Deep Inference: *{deep_inf}* ({DEEP_DIRECTION_INFERENCE_KIND})\n"
+        f"Inference Order: *{infer_mode}*\n\n"
+        f"MS->AI Integration: *{'enabled' if ENABLE_MS_SCORE_AI_INTEGRATION else 'disabled'}* "
+        f"(scale={float(MS_SCORE_AI_SCALE):.2f}, cap={float(MS_SCORE_AI_MAX_IMPACT):.1f})\n\n"
+        f"*Latest Cycle*\n`{cycle_txt}`\n\n"
+        f"*Latest AI Telemetry*\n`{ai_txt}`\n\n"
+        f"*Latest Structural Rejection*\n`{rej_txt}`"
+    )
+
+
 async def monitor_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin-only /monitor command (separate from user UI)."""
     uid = str(update.effective_chat.id)
@@ -271,6 +338,7 @@ async def admin_handler(update: Update, context):
             "`/admin riskset <chat_id> <min%> <max%>`\n"
             "`/admin broadcast <message>`\n"
             "`/admin monitor`\n"
+            "`/admin ai`\n"
             "`/admin subscribers`\n"
             "`/admin status`\n"
             "`/admin orphans`\n"
@@ -364,6 +432,10 @@ async def admin_handler(update: Update, context):
     elif cmd in ('monitor', 'panel', 'adminpanel'):
         text = _build_monitor_panel()
         await update.message.reply_text(text, parse_mode='Markdown')
+
+    # ── AI runtime status ─────────────────────────────────────────────────────
+    elif cmd in ('ai', 'aistatus', 'ai_status'):
+        await update.message.reply_text(_build_ai_runtime_panel(), parse_mode='Markdown')
 
     # ── DB vs Capital zombie audit ────────────────────────────────────────────
     elif cmd in ('audit_sync', 'auditsync'):

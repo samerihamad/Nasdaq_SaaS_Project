@@ -13,7 +13,7 @@ The stop only ever moves in the direction of the trade — never against it.
 import pandas as pd
 import numpy as np
 import sqlite3
-import yfinance as yf
+from utils.market_scanner import scan_market
 
 ATR_PERIOD     = 14
 ATR_MULTIPLIER = 2.0
@@ -22,15 +22,14 @@ DB_PATH        = 'database/trading_saas.db'
 
 # ── ATR calculation ───────────────────────────────────────────────────────────
 
-def calculate_atr(symbol, period=ATR_PERIOD):
+def calculate_atr(symbol, period=ATR_PERIOD, session_context: dict | None = None):
     """
-    Fetch 1-month of daily bars for `symbol` and return the latest ATR value.
+    Fetch recent daily bars for `symbol` and return the latest ATR value.
     Uses Wilder's smoothed ATR (rolling mean over True Range).
     Returns None on failure so the caller can fall back gracefully.
     """
     try:
-        df = yf.download(symbol, period="1mo", interval="1d",
-                         progress=False, auto_adjust=True)
+        df = scan_market(symbol, period="1mo", interval="1d", session_context=session_context)
         if df is None or len(df) < period + 1:
             return None
 

@@ -19,6 +19,8 @@ import sqlite3
 import threading
 import traceback
 from datetime import datetime, date, timezone
+from collections import Counter
+from typing import Optional
 
 from database.db_manager import create_db, is_maintenance_mode
 from utils.filters import get_nasdaq_tickers, level1_filter, level2_filter, level3_filter
@@ -44,6 +46,7 @@ from database.db_manager import set_trading_enabled
 from database.db_manager import touch_engine_activity
 from config import (
     MIN_CONFIDENCE,
+    SIGNAL_MIN_CONFIDENCE,
     CHECK_INTERVAL,
     MAX_WATCHLIST,
     HYBRID_SIGNAL_TTL,
@@ -108,6 +111,100 @@ _closed_notified    = False  # sent "market closed" msg this session
 _last_watchlist_refresh_at = None  # UTC datetime of last in-session refresh
 _unsupported_all_day: set[str] = set()  # symbols unsupported for all users today
 _last_structural_rejection_sent_at: dict[str, float] = {}
+_last_structural_suppression_notice_at: float = 0.0
+
+# Daily log folders (Phase 6 baseline).
+LOG_ROOT = os.getenv("ENGINE_LOG_ROOT", "logs")
+REJECTION_SUPPRESSION_NOTICE_COOLDOWN_SEC = int(
+    os.getenv("REJECTION_SUPPRESSION_NOTICE_COOLDOWN_SEC", "1800")
+)
+
+
+def _ensure_daily_log_dir() -> str:
+    """Create daily log directory and return its path."""
+    day_dir = os.path.join(LOG_ROOT, datetime.now().strftime("%Y-%m-%d"))
+    os.makedirs(day_dir, exist_ok=True)
+    return day_dir
+
+
+def _append_daily_log(filename: str, message: str):
+    """Append a timestamped line into a daily log file."""
+    try:
+        log_dir = _ensure_daily_log_dir()
+        path = os.path.join(log_dir, filename)
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {message}\n")
+    except Exception as exc:
+        print(f"[LOG] Failed writing {filename}: {exc}")
+
+
+def _log_structural_rejection(symbol: str, strategy: str, reason: str, notified: bool = False):
+    _append_daily_log(
+        "structural_rejections.txt",
+        f"symbol={symbol} strategy={strategy} notified={int(bool(notified))} reason={reason}",
+    )
+
+
+def _log_ai_gatekeeper(
+    symbol: str,
+    action: str,
+    strategy: str,
+    confidence: float,
+    ms_score: Optional[float],
+    probability: Optional[float],
+    approved: bool,
+    override: bool,
+    regime: Optional[str],
+):
+    prob_str = "n/a" if probability is None else f"{float(probability):.2f}"
+    _append_daily_log(
+        "ai_telemetry.txt",
+        (
+            f"symbol={symbol} action={action} strategy={strategy} conf={float(confidence):.2f} "
+            f"ms_score={('n/a' if ms_score is None else f'{float(ms_score):.1f}')} "
+            f"prob={prob_str} approved={int(bool(approved))} override={int(bool(override))} "
+            f"regime={regime or 'n/a'}"
+        ),
+    )
+
+
+def _log_execution_audit(
+    symbol: str,
+    action: str,
+    strategy: Optional[str],
+    attempted: int,
+    opened: int,
+    skipped: int,
+    failed: int,
+    status: str,
+):
+    _append_daily_log(
+        "execution_audit.txt",
+        (
+            f"status={status} symbol={symbol} action={action} strategy={strategy or 'n/a'} "
+            f"attempted={attempted} opened={opened} skipped={skipped} failed={failed}"
+        ),
+    )
+
+
+def _log_scan_cycle_summary(
+    scanned_symbols: int,
+    total_signals: int,
+    rejected_signals: int,
+    accepted_signals: int,
+    ai_blocked: int,
+):
+    acceptance_ratio = (accepted_signals / total_signals * 100.0) if total_signals else 0.0
+    rejection_ratio = (rejected_signals / total_signals * 100.0) if total_signals else 0.0
+    _append_daily_log(
+        "engine_cycle.txt",
+        (
+            f"scanned={scanned_symbols} candidates={total_signals} accepted={accepted_signals} "
+            f"rejected={rejected_signals} ai_blocked={ai_blocked} "
+            f"acceptance_ratio={acceptance_ratio:.2f}% rejection_ratio={rejection_ratio:.2f}%"
+        ),
+    )
 
 
 # ── Heartbeat & backup threads ────────────────────────────────────────────────
@@ -419,7 +516,8 @@ def send_premarket_alert(watchlist_count: int):
 # ── Signal dispatch ───────────────────────────────────────────────────────────
 
 def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
-                    timeframes: dict = None, stop_loss_pct: float = None, strategy_label: str = None):
+                    timeframes: dict = None, stop_loss_pct: float = None, strategy_label: str = None,
+                    ms_score: Optional[float] = None):
     """
     Multi-tenant signal dispatcher.
 
@@ -440,6 +538,9 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
     # - We rely on validate_signal(..., min_probability=...) to produce the boolean gate.
     # - We allow a soft override only for Momentum/MeanRev when confidence is high.
     ai_prob = None
+    ai_approved = True
+    ai_override = False
+    regime = "UNKNOWN"
     if timeframes:
         strategy_key = (strategy_label or "RF").strip()
         ai_min_by_strategy = {
@@ -449,7 +550,7 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
         }
         ai_min_prob = ai_min_by_strategy.get(strategy_key, AI_MIN_PROB_RF)
         ai_approved, ai_prob, regime = validate_signal(
-            symbol, action, timeframes, min_probability=ai_min_prob
+            symbol, action, timeframes, min_probability=ai_min_prob, ms_score=ms_score
         )
 
         # Soft override (Momentum/MeanRev): no VOLATILE block — see config AI_SOFT_OVERRIDE_*
@@ -469,6 +570,17 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
             f"approved={bool(ai_approved)} | override={bool(ai_override)} | "
             f"strategy={strategy_key} | regime={regime}"
         )
+        _log_ai_gatekeeper(
+            symbol=symbol,
+            action=action,
+            strategy=strategy_key,
+            confidence=float(confidence),
+            ms_score=ms_score,
+            probability=(float(ai_prob) if ai_prob is not None else None),
+            approved=bool(ai_approved),
+            override=bool(ai_override),
+            regime=regime,
+        )
 
         if not (ai_approved or ai_override):
             print(
@@ -476,7 +588,23 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
                 f"prob={float(ai_prob):.1f} < min={float(ai_min_prob):.1f} | "
                 f"conf={float(confidence):.1f} | strategy={strategy_key} | regime={regime}"
             )
-            return
+            _log_execution_audit(
+                symbol=symbol,
+                action=action,
+                strategy=strategy_label,
+                attempted=0,
+                opened=0,
+                skipped=0,
+                failed=0,
+                status="ai_blocked",
+            )
+            return {
+                "status": "ai_blocked",
+                "attempted": 0,
+                "opened": 0,
+                "skipped": 0,
+                "failed": 0,
+            }
 
         if ai_override:
             print(
@@ -495,10 +623,42 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
     subscribers = get_trading_subscribers()
     if not subscribers:
         print(f"   [DISPATCH] No subscribers with trading enabled — skipping signal.")
-        return
+        _log_execution_audit(
+            symbol=symbol,
+            action=action,
+            strategy=strategy_label,
+            attempted=0,
+            opened=0,
+            skipped=0,
+            failed=0,
+            status="no_subscribers",
+        )
+        return {
+            "status": "no_subscribers",
+            "attempted": 0,
+            "opened": 0,
+            "skipped": 0,
+            "failed": 0,
+        }
     if symbol in _unsupported_all_day:
         print(f"   [DISPATCH] {symbol} marked unsupported-for-all today — skipping.")
-        return
+        _log_execution_audit(
+            symbol=symbol,
+            action=action,
+            strategy=strategy_label,
+            attempted=0,
+            opened=0,
+            skipped=0,
+            failed=0,
+            status="unsupported_cached",
+        )
+        return {
+            "status": "unsupported_cached",
+            "attempted": 0,
+            "opened": 0,
+            "skipped": 0,
+            "failed": 0,
+        }
 
     attempted = 0
     opened = 0
@@ -566,10 +726,31 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
     if attempted > 0 and unsupported_for_all:
         _unsupported_all_day.add(symbol)
         print(f"   [WATCHLIST PRUNE] {symbol} marked unsupported for all users today.")
+    _log_execution_audit(
+        symbol=symbol,
+        action=action,
+        strategy=strategy_label,
+        attempted=attempted,
+        opened=opened,
+        skipped=skipped,
+        failed=failed,
+        status="executed",
+    )
+    return {
+        "status": "executed",
+        "attempted": attempted,
+        "opened": opened,
+        "skipped": skipped,
+        "failed": failed,
+        "ai_approved": bool(ai_approved),
+        "ai_override": bool(ai_override),
+        "ai_probability": ai_prob,
+    }
 
 
 def _notify_structural_rejection(symbol: str, strategy: str, reason: str) -> bool:
     if not ENABLE_STRUCTURAL_REJECTION_NOTIFY:
+        _log_structural_rejection(symbol, strategy, reason, notified=False)
         return False
     try:
         if ADMIN_CHAT_ID:
@@ -588,6 +769,7 @@ def _notify_structural_rejection(symbol: str, strategy: str, reason: str) -> boo
             now_ts = time.time()
             last_ts = _last_structural_rejection_sent_at.get(cooldown_key, 0.0)
             if (now_ts - last_ts) < float(STRUCTURAL_REJECTION_NOTIFY_COOLDOWN_SEC):
+                _log_structural_rejection(symbol, strategy, reason, notified=False)
                 return False
 
             ar_reason = reason
@@ -616,19 +798,23 @@ def _notify_structural_rejection(symbol: str, strategy: str, reason: str) -> boo
                 )
             send_telegram_message(ADMIN_CHAT_ID, msg)
             _last_structural_rejection_sent_at[cooldown_key] = now_ts
+            _log_structural_rejection(symbol, strategy, reason, notified=True)
             return True
     except Exception:
+        _log_structural_rejection(symbol, strategy, reason, notified=False)
         return False
+    _log_structural_rejection(symbol, strategy, reason, notified=False)
     return False
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def run_trading_bot():
-    global _watchlist, _last_scan_date, _prev_market_status, _closed_notified, _daily_report_sent, _last_watchlist_refresh_at, _unsupported_all_day
+    global _watchlist, _last_scan_date, _prev_market_status, _closed_notified, _daily_report_sent, _last_watchlist_refresh_at, _unsupported_all_day, _last_structural_suppression_notice_at
 
     print("🚀 NATB v2.0 — محرك التداول الذكي")
-    print(f"   الثقة الدنيا: {MIN_CONFIDENCE}% | فحص كل {CHECK_INTERVAL}s")
+    active_min_conf = float(SIGNAL_MIN_CONFIDENCE if SIGNAL_MIN_CONFIDENCE is not None else MIN_CONFIDENCE)
+    print(f"   الثقة الدنيا: {active_min_conf}% | فحص كل {CHECK_INTERVAL}s")
     print("-" * 55)
 
     # Telegram health ping (helps detect missing token / blocked bot early)
@@ -779,7 +965,7 @@ def run_trading_bot():
             # Returns best-per-symbol signals with timeframes attached (no execution).
             signals = scan_watchlist_parallel(
                 _watchlist,
-                min_confidence=MIN_CONFIDENCE,
+                min_confidence=active_min_conf,
                 max_workers=8,
             )
 
@@ -788,14 +974,25 @@ def run_trading_bot():
 
             if not signals:
                 print("   [SCAN] No signals found this cycle.")
+                _log_scan_cycle_summary(
+                    scanned_symbols=len(_watchlist),
+                    total_signals=0,
+                    rejected_signals=0,
+                    accepted_signals=0,
+                    ai_blocked=0,
+                )
             else:
                 rej_sent = 0
                 rej_suppressed = 0
+                rej_counter = Counter()
+                accepted_count = 0
+                ai_blocked_count = 0
                 for sig in sorted(signals, key=lambda r: float(r.get("confidence", 0)), reverse=True):
                     symbol = sig["symbol"]
                     if sig.get("rejected"):
                         rej_reason = str(sig.get("reason", "Rejected by market structure filter"))
                         rej_strategy = str(sig.get("strategy_label", "Unknown"))
+                        rej_counter[rej_reason] += 1
                         print(f"   [{symbol}] REJECTED | strategy={rej_strategy} | {rej_reason}")
                         if rej_sent < int(STRUCTURAL_REJECTION_NOTIFY_MAX_PER_CYCLE):
                             did_send = _notify_structural_rejection(symbol, rej_strategy, rej_reason)
@@ -812,6 +1009,7 @@ def run_trading_bot():
                     best_label = sig["strategy_label"]
                     best_reason = sig.get("reason", "")
                     best_sl_pct = sig.get("stop_loss_pct")
+                    best_ms_score = sig.get("ms_score")
                     timeframes = sig.get("timeframes")
 
                     print(
@@ -819,26 +1017,60 @@ def run_trading_bot():
                         f"strategy={best_label} | "
                         f"confidence={best_conf:.1f}% | {best_reason}"
                     )
-                    dispatch_signal(
+                    accepted_count += 1
+                    dispatch_result = dispatch_signal(
                         symbol, best_action, best_conf, best_reason,
                         timeframes=timeframes, stop_loss_pct=best_sl_pct,
-                        strategy_label=best_label,
+                        strategy_label=best_label, ms_score=best_ms_score,
                     )
+                    if isinstance(dispatch_result, dict) and dispatch_result.get("status") == "ai_blocked":
+                        ai_blocked_count += 1
+
+                total_candidates = len(signals)
+                rejected_count = total_candidates - accepted_count
+                acceptance_ratio = (accepted_count / total_candidates * 100.0) if total_candidates else 0.0
+                print(
+                    f"[SCAN METRICS] candidates={total_candidates} accepted={accepted_count} "
+                    f"rejected={rejected_count} ai_blocked={ai_blocked_count} "
+                    f"acceptance_ratio={acceptance_ratio:.1f}%"
+                )
+                _log_scan_cycle_summary(
+                    scanned_symbols=len(_watchlist),
+                    total_signals=total_candidates,
+                    rejected_signals=rejected_count,
+                    accepted_signals=accepted_count,
+                    ai_blocked=ai_blocked_count,
+                )
                 if rej_suppressed > 0 and ADMIN_CHAT_ID and ENABLE_STRUCTURAL_REJECTION_NOTIFY:
-                    try:
-                        lang = _get_user_lang(ADMIN_CHAT_ID)
-                        if lang == "ar":
-                            send_telegram_message(
-                                ADMIN_CHAT_ID,
-                                f"ℹ️ تم كتم {rej_suppressed} إشعار رفض هيكلي متكرر في هذه الدورة لتقليل الإزعاج.",
-                            )
-                        else:
-                            send_telegram_message(
-                                ADMIN_CHAT_ID,
-                                f"ℹ️ Suppressed {rej_suppressed} repeated structural rejection alerts in this cycle.",
-                            )
-                    except Exception:
-                        pass
+                    now_ts = time.time()
+                    if (
+                        now_ts - _last_structural_suppression_notice_at
+                        >= float(REJECTION_SUPPRESSION_NOTICE_COOLDOWN_SEC)
+                    ):
+                        try:
+                            lang = _get_user_lang(ADMIN_CHAT_ID)
+                            top_reason, top_count = ("N/A", 0)
+                            if rej_counter:
+                                top_reason, top_count = rej_counter.most_common(1)[0]
+                            if lang == "ar":
+                                send_telegram_message(
+                                    ADMIN_CHAT_ID,
+                                    (
+                                        f"ℹ️ تم كتم {rej_suppressed} إشعار رفض هيكلي متكرر "
+                                        f"(أكثر سبب: {top_reason} × {top_count})."
+                                    ),
+                                )
+                            else:
+                                send_telegram_message(
+                                    ADMIN_CHAT_ID,
+                                    (
+                                        f"ℹ️ Suppressed {rej_suppressed} repeated structural rejection alerts "
+                                        f"(top reason: {top_reason} x{top_count})."
+                                    ),
+                                )
+                            _last_structural_suppression_notice_at = now_ts
+                        except Exception:
+                            pass
 
         except Exception as e:
             print(f"❌ خطأ في المحرك الرئيسي: {e}")

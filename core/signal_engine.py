@@ -23,6 +23,7 @@ from typing import Any
 from config import (
     WATCHLIST,
     MIN_CONFIDENCE,
+    SIGNAL_MIN_CONFIDENCE,
     MAX_DAILY_TRADES,
     SCAN_INTERVAL_SEC,
 )
@@ -36,6 +37,7 @@ from utils.ai_model         import analyze_multi_timeframe
 DB_PATH = "database/trading_saas.db"
 
 log = logging.getLogger(__name__)
+ACTIVE_MIN_CONFIDENCE = float(SIGNAL_MIN_CONFIDENCE if SIGNAL_MIN_CONFIDENCE is not None else MIN_CONFIDENCE)
 
 
 # ── Subscriber helpers ────────────────────────────────────────────────────────
@@ -135,10 +137,10 @@ def _analyze_ticker(symbol: str) -> dict | None:
     # Pick the signal with the highest score; filter by confidence
     best = max(signals, key=lambda s: s["score"])
 
-    if best["confidence"] < MIN_CONFIDENCE:
+    if best["confidence"] < ACTIVE_MIN_CONFIDENCE:
         log.debug(
             "[%s] Best signal confidence %.1f%% below MIN_CONFIDENCE %.1f%% — discarded",
-            symbol, best["confidence"], MIN_CONFIDENCE,
+            symbol, best["confidence"], ACTIVE_MIN_CONFIDENCE,
         )
         return None
 
@@ -244,7 +246,7 @@ def run_scan() -> list[dict]:
 
     triggered = []
 
-    # Parallel ticker scanning — IO-bound (yfinance HTTP calls)
+    # Parallel ticker scanning — IO-bound (provider HTTP calls)
     with ThreadPoolExecutor(max_workers=min(8, len(WATCHLIST))) as pool:
         futures = {pool.submit(_analyze_ticker, sym): sym for sym in WATCHLIST}
         for future in as_completed(futures):
@@ -272,7 +274,7 @@ def run_scan() -> list[dict]:
 def scan_watchlist_parallel(
     watchlist: list[str],
     *,
-    min_confidence: float = MIN_CONFIDENCE,
+    min_confidence: float = ACTIVE_MIN_CONFIDENCE,
     max_workers: int = 8,
 ) -> list[dict[str, Any]]:
     """
@@ -291,7 +293,7 @@ def scan_watchlist_parallel(
         if not timeframes:
             return None
 
-        candidates: list[tuple[str, float, str, str, float | None]] = []
+        candidates: list[tuple[str, float, str, str, float | None, float | None]] = []
         raw_confs: list[float] = []
 
         # 1) RF multi-timeframe
@@ -302,7 +304,7 @@ def scan_watchlist_parallel(
             except Exception:
                 pass
             if action and conf >= float(min_confidence):
-                candidates.append((action, float(conf), "RF", str(reason), None))
+                candidates.append((action, float(conf), "RF", str(reason), None, None))
         except Exception:
             pass
 
@@ -320,6 +322,7 @@ def scan_watchlist_parallel(
                     str(mr.get("strategy", "MeanRev")),
                     str(mr.get("reason", "Rejected by market structure filter")),
                     None,
+                    None,
                 ))
             elif mr and float(mr.get("confidence", 0)) >= float(min_confidence):
                 candidates.append((
@@ -328,6 +331,7 @@ def scan_watchlist_parallel(
                     "MeanRev",
                     str(mr.get("reason", "")),
                     mr.get("stop_loss_pct"),
+                    (float(mr.get("ms_score")) if mr.get("ms_score") is not None else None),
                 ))
         except Exception:
             pass
@@ -346,6 +350,7 @@ def scan_watchlist_parallel(
                     str(mo.get("strategy", "Momentum")),
                     str(mo.get("reason", "Rejected by market structure filter")),
                     None,
+                    None,
                 ))
             elif mo and float(mo.get("confidence", 0)) >= float(min_confidence):
                 candidates.append((
@@ -354,6 +359,7 @@ def scan_watchlist_parallel(
                     "Momentum",
                     str(mo.get("reason", "")),
                     mo.get("stop_loss_pct"),
+                    (float(mo.get("ms_score")) if mo.get("ms_score") is not None else None),
                 ))
         except Exception:
             pass
@@ -365,7 +371,7 @@ def scan_watchlist_parallel(
 
         accepted = [c for c in candidates if c[0] != "__REJECTED__"]
         if not accepted:
-            _, _, rej_label, rej_reason, _ = candidates[0]
+            _, _, rej_label, rej_reason, _, _ = candidates[0]
             return {
                 "symbol": symbol,
                 "action": None,
@@ -373,11 +379,12 @@ def scan_watchlist_parallel(
                 "strategy_label": rej_label,
                 "reason": rej_reason,
                 "stop_loss_pct": None,
+                "ms_score": None,
                 "timeframes": timeframes,
                 "rejected": True,
             }
 
-        best_action, best_conf, best_label, best_reason, best_sl_pct = max(
+        best_action, best_conf, best_label, best_reason, best_sl_pct, best_ms_score = max(
             accepted, key=lambda x: x[1]
         )
         print(f"[CANDIDATES] {symbol} | count={len(candidates)} | best_conf={best_conf:.1f}")
@@ -389,6 +396,7 @@ def scan_watchlist_parallel(
             "strategy_label": best_label,
             "reason": best_reason,
             "stop_loss_pct": best_sl_pct,
+            "ms_score": best_ms_score,
             "timeframes": timeframes,
         }
 
@@ -396,7 +404,7 @@ def scan_watchlist_parallel(
     if not wl:
         return []
 
-    # IO-bound: yfinance; keep a conservative default worker count.
+    # IO-bound: provider calls; keep a conservative default worker count.
     workers = max(1, min(int(max_workers), len(wl)))
     results: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=workers) as pool:

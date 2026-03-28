@@ -99,6 +99,30 @@ BE_LOCK_BUFFER_PCT = 0.0005  # 0.05% beyond entry (per direction)
 # Signals with confidence below this are discarded before risk checks
 MIN_CONFIDENCE       = 67.0
 
+# ── Phase 8: Dual Signal Profiles (Fast vs Golden) ───────────────────────────
+# Backward compatibility:
+# - Existing MIN_CONFIDENCE / MR_MIN_SCORE / MOM_MIN_SCORE remain valid defaults.
+# - New SIGNAL_* values are selected by SIGNAL_PROFILE and can be adopted gradually.
+SIGNAL_PROFILE = os.getenv("SIGNAL_PROFILE", "FAST").strip().upper()  # FAST | GOLDEN
+
+FAST_MIN_CONFIDENCE = float(os.getenv("FAST_MIN_CONFIDENCE", str(MIN_CONFIDENCE)))
+GOLDEN_MIN_CONFIDENCE = float(os.getenv("GOLDEN_MIN_CONFIDENCE", "74.0"))
+
+FAST_MR_MIN_SCORE = int(os.getenv("FAST_MR_MIN_SCORE", str(MR_MIN_SCORE)))
+GOLDEN_MR_MIN_SCORE = int(os.getenv("GOLDEN_MR_MIN_SCORE", "74"))
+
+FAST_MOM_MIN_SCORE = int(os.getenv("FAST_MOM_MIN_SCORE", str(MOM_MIN_SCORE)))
+GOLDEN_MOM_MIN_SCORE = int(os.getenv("GOLDEN_MOM_MIN_SCORE", "78"))
+
+if SIGNAL_PROFILE == "GOLDEN":
+    SIGNAL_MIN_CONFIDENCE = GOLDEN_MIN_CONFIDENCE
+    SIGNAL_MR_MIN_SCORE = GOLDEN_MR_MIN_SCORE
+    SIGNAL_MOM_MIN_SCORE = GOLDEN_MOM_MIN_SCORE
+else:
+    SIGNAL_MIN_CONFIDENCE = FAST_MIN_CONFIDENCE
+    SIGNAL_MR_MIN_SCORE = FAST_MR_MIN_SCORE
+    SIGNAL_MOM_MIN_SCORE = FAST_MOM_MIN_SCORE
+
 # ── Sprint 1: Market Structure Foundation flags ───────────────────────────────
 # Toggle these filters without changing strategy code.
 ENABLE_MARKET_STRUCTURE_FILTERS = os.getenv("ENABLE_MARKET_STRUCTURE_FILTERS", "true").lower() == "true"
@@ -144,6 +168,13 @@ NEWS_API_KEY         = os.getenv("NEWS_API_KEY", "")
 NEWS_LOOKBACK_HOURS  = 12      # how far back to fetch headlines per ticker
 NEWS_QUALITY_SCORE   = 15      # bonus score when a high-quality news event exists
 
+# ── Earnings Calendar Provider (scanner filters) ──────────────────────────────
+# Primary: NASDAQ calendar endpoint (no key).
+# Fallback: FinancialModelingPrep if FMP_API_KEY is provided.
+EARNINGS_TIMEOUT_SEC = int(os.getenv("EARNINGS_TIMEOUT_SEC", "15"))
+EARNINGS_CACHE_TTL_SEC = int(os.getenv("EARNINGS_CACHE_TTL_SEC", "1800"))
+FMP_API_KEY = os.getenv("FMP_API_KEY", "").strip()
+
 # ── Scanning Scheduler ────────────────────────────────────────────────────────
 
 SCAN_INTERVAL_SEC    = 300     # run a full market scan every 5 minutes
@@ -175,16 +206,42 @@ PREMARKET_ALERT_WINDOW_MIN = 30
 #
 # Per-strategy minimum AI probability thresholds (%).
 # These apply in dispatch_signal() as an execution gate after strategy confidence.
-AI_MIN_PROB_RF = 62.0
-AI_MIN_PROB_MOMENTUM = 65.0
-AI_MIN_PROB_MEANREV = 64.0
+AI_MIN_PROB_RF = float(os.getenv("AI_MIN_PROB_RF", "62.0"))
+AI_MIN_PROB_MOMENTUM = float(os.getenv("AI_MIN_PROB_MOMENTUM", "65.0"))
+AI_MIN_PROB_MEANREV = float(os.getenv("AI_MIN_PROB_MEANREV", "64.0"))
 
 # Soft override:
 # Allow high-confidence Momentum/MeanRev signals to pass even if AI probability
 # is below the per-strategy threshold (override is intentionally harder to reach).
-AI_SOFT_OVERRIDE_CONFIDENCE = 63.0
-AI_SOFT_OVERRIDE_MIN_PROB = 40.0
+AI_SOFT_OVERRIDE_CONFIDENCE = float(os.getenv("AI_SOFT_OVERRIDE_CONFIDENCE", "63.0"))
+AI_SOFT_OVERRIDE_MIN_PROB = float(os.getenv("AI_SOFT_OVERRIDE_MIN_PROB", "40.0"))
 ENABLE_AI_SOFT_OVERRIDE = os.getenv("ENABLE_AI_SOFT_OVERRIDE", "false").lower() == "true"
+
+# Optional AI feature: market-structure score blending.
+# When enabled, validate_signal() adjusts blended probability by:
+#   (ms_score - MS_SCORE_AI_NEUTRAL) * MS_SCORE_AI_SCALE
+# and clamps final impact to +/- MS_SCORE_AI_MAX_IMPACT.
+ENABLE_MS_SCORE_AI_INTEGRATION = os.getenv("ENABLE_MS_SCORE_AI_INTEGRATION", "true").lower() == "true"
+MS_SCORE_AI_NEUTRAL = float(os.getenv("MS_SCORE_AI_NEUTRAL", "50.0"))
+MS_SCORE_AI_SCALE = float(os.getenv("MS_SCORE_AI_SCALE", "0.18"))
+MS_SCORE_AI_MAX_IMPACT = float(os.getenv("MS_SCORE_AI_MAX_IMPACT", "8.0"))
+
+# Anti-spam: minimum gap between repeated rejection notifications to the same user.
+EXECUTION_REJECTION_NOTIFY_COOLDOWN_SEC = int(os.getenv("EXECUTION_REJECTION_NOTIFY_COOLDOWN_SEC", "600"))
+
+# ── Phase 7: Deep Direction Model (optional) ─────────────────────────────────
+# RF pipeline remains default. These settings configure optional LSTM/GRU/Transformer training.
+ENABLE_DEEP_DIRECTION_MODEL = os.getenv("ENABLE_DEEP_DIRECTION_MODEL", "false").lower() == "true"
+DEEP_DIRECTION_MODEL_KIND = os.getenv("DEEP_DIRECTION_MODEL_KIND", "lstm").strip().lower()  # lstm|gru|transformer
+DEEP_DIRECTION_TIMEFRAME = os.getenv("DEEP_DIRECTION_TIMEFRAME", "15m").strip().lower()      # 1d|4h|15m
+DEEP_DIRECTION_SEQ_LEN = int(os.getenv("DEEP_DIRECTION_SEQ_LEN", "64"))
+DEEP_DIRECTION_LABEL_HORIZON = int(os.getenv("DEEP_DIRECTION_LABEL_HORIZON", "8"))
+DEEP_DIRECTION_LABEL_THRESHOLD = float(os.getenv("DEEP_DIRECTION_LABEL_THRESHOLD", "0.012"))
+# Inference path toggle:
+# false (default): RF -> rule-based
+# true: Deep -> RF -> rule-based
+ENABLE_DEEP_DIRECTION_INFERENCE = os.getenv("ENABLE_DEEP_DIRECTION_INFERENCE", "false").lower() == "true"
+DEEP_DIRECTION_INFERENCE_KIND = os.getenv("DEEP_DIRECTION_INFERENCE_KIND", DEEP_DIRECTION_MODEL_KIND).strip().lower()
 
 # Refresh watchlist while market is open (seconds)
 WATCHLIST_REFRESH_SECONDS = 3600
@@ -197,3 +254,10 @@ CAPITAL_API_KEY      = os.getenv("CAPITAL_API_KEY", "")
 CAPITAL_EMAIL        = os.getenv("CAPITAL_EMAIL", "")
 CAPITAL_PASSWORD     = os.getenv("CAPITAL_PASSWORD", "")
 CAPITAL_IS_DEMO      = os.getenv("CAPITAL_IS_DEMO", "true").lower() == "true"
+
+# Optional dedicated market-data identity (shared scanner service account).
+# If unset, scanner falls back to CAPITAL_* values above.
+MARKET_DATA_CAPITAL_API_KEY = os.getenv("MARKET_DATA_CAPITAL_API_KEY", "").strip()
+MARKET_DATA_CAPITAL_EMAIL = os.getenv("MARKET_DATA_CAPITAL_EMAIL", "").strip()
+MARKET_DATA_CAPITAL_PASSWORD = os.getenv("MARKET_DATA_CAPITAL_PASSWORD", "").strip()
+MARKET_DATA_CAPITAL_IS_DEMO = os.getenv("MARKET_DATA_CAPITAL_IS_DEMO", "").strip().lower()

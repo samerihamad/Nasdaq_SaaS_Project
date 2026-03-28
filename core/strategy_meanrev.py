@@ -33,6 +33,7 @@ from config import (
     MR_NEWS_TRAP_GAP_PCT,
     MR_SWEEP_LOOKBACK,
     MR_MIN_SCORE,
+    SIGNAL_MR_MIN_SCORE,
     ENABLE_MARKET_STRUCTURE_FILTERS,
     ENABLE_PREMIUM_DISCOUNT_FILTER,
     ENABLE_LIQUIDITY_MAP_FILTER,
@@ -46,6 +47,7 @@ from core.market_structure import (
     in_no_trade_zone,
     build_liquidity_map,
     liquidity_sweep_score,
+    apply_market_structure_policy,
 )
 
 log = logging.getLogger(__name__)
@@ -288,24 +290,25 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
         log.info("[MeanRev %s] %s", symbol, rej)
         return {"rejected": True, "strategy": "MeanRev", "reason": rej}
 
-    # ── Sprint 1: Market structure gates (feature-flagged) ──────────────────
+    # ── Market structure policy v2 (soft-scoring, no structural hard reject) ─
     htf = None
     liq = None
+    ms_ctx = None
     if ENABLE_MARKET_STRUCTURE_FILTERS:
-        htf = compute_htf_range(df_4h, close_val, lookback=MARKET_STRUCTURE_HTF_LOOKBACK)
-        if htf and in_no_trade_zone(close_val, htf, width_pct=MARKET_STRUCTURE_NO_TRADE_ZONE_PCT):
-            rej = f"Rejected: No-Trade Zone | zone={htf.zone} eq={htf.eq:.2f} close={close_val:.2f}"
-            log.info("[MeanRev %s] %s", symbol, rej)
-            return {"rejected": True, "strategy": "MeanRev", "reason": rej}
-
-        if ENABLE_PREMIUM_DISCOUNT_FILTER and not allow_direction_by_pd(direction, htf):
-            zone = htf.zone if htf else "unknown"
-            rej = f"Rejected: Price in {zone.title()} Zone for {direction}"
-            log.info("[MeanRev %s] %s", symbol, rej)
-            return {"rejected": True, "strategy": "MeanRev", "reason": rej}
-
-        if ENABLE_LIQUIDITY_MAP_FILTER:
-            liq = build_liquidity_map(df_1d, df_15m, opening_bars=LIQUIDITY_OPENING_RANGE_BARS)
+        ms_ctx = apply_market_structure_policy(
+            direction=direction,
+            close_price=close_val,
+            df_1d=df_1d,
+            df_4h=df_4h,
+            df_15m=df_15m,
+            htf_lookback=MARKET_STRUCTURE_HTF_LOOKBACK,
+            no_trade_zone_pct=MARKET_STRUCTURE_NO_TRADE_ZONE_PCT,
+            enable_pd_filter=ENABLE_PREMIUM_DISCOUNT_FILTER,
+            enable_liquidity_map_filter=ENABLE_LIQUIDITY_MAP_FILTER,
+            opening_bars=LIQUIDITY_OPENING_RANGE_BARS,
+        )
+        htf = ms_ctx.htf
+        liq = ms_ctx.liq
 
     # ── News Trap filter ──────────────────────────────────────────────────────
     if _news_trap(df_15m):
@@ -383,10 +386,23 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
             score += liq_pts
             reasons.append(f"LiqMap (+{liq_pts})")
 
+    # 8. Market-structure policy modifier (soft override path)
+    if ENABLE_MARKET_STRUCTURE_FILTERS and ms_ctx is not None:
+        # Convert 0..100 ms_score into approximately [-10..+10] modifier.
+        ms_mod = int(round((float(ms_ctx.ms_score) - 50.0) / 5.0))
+        score += ms_mod
+        reasons.append(
+            f"MS_score={int(ms_ctx.ms_score)} ({'+' if ms_mod >= 0 else ''}{ms_mod})"
+        )
+
     if ENABLE_MARKET_STRUCTURE_FILTERS and htf is not None:
         reasons.append(
             f"MS zone={htf.zone} range=[{htf.low:.2f}-{htf.high:.2f}] eq={htf.eq:.2f}"
         )
+        if ms_ctx is not None:
+            reasons.append(
+                f"MS regime={ms_ctx.regime} bias={ms_ctx.htf_bias} ntz={int(ms_ctx.in_no_trade_zone)} sweep={int(ms_ctx.sweep_detected)}"
+            )
         if ENABLE_LIQUIDITY_MAP_FILTER and liq is not None:
             reasons.append(
                 "LiqLvls "
@@ -401,13 +417,14 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
         symbol, direction, score, " | ".join(reasons),
     )
 
-    if score < MR_MIN_SCORE:
-        rej = f"Rejected: Low Confidence (Score {int(score)} < {int(MR_MIN_SCORE)})"
+    active_min_score = int(SIGNAL_MR_MIN_SCORE or MR_MIN_SCORE)
+    if score < active_min_score:
+        rej = f"Rejected: Low Confidence (Score {int(score)} < {int(active_min_score)})"
         log.info("[MeanRev %s] %s", symbol, rej)
         return {"rejected": True, "strategy": "MeanRev", "reason": rej}
 
     # Map score (55–100) to confidence (65–95 %)
-    confidence = round(65.0 + (score - MR_MIN_SCORE) / (100 - MR_MIN_SCORE) * 30.0, 1)
+    confidence = round(65.0 + (score - active_min_score) / max(1, (100 - active_min_score)) * 30.0, 1)
     confidence = min(95.0, confidence)
 
     # ATR-based stop distance as a % of entry price (used by calculate_position_size)
@@ -423,5 +440,6 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
         "score":        score,
         "strategy":     "MeanReversion",
         "stop_loss_pct": stop_pct,
+        "ms_score":     (int(ms_ctx.ms_score) if ms_ctx is not None else None),
         "reason":       " | ".join(reasons),
     }

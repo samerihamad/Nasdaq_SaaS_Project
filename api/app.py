@@ -25,7 +25,7 @@ Install:
 
 import os
 import sqlite3
-from datetime import date
+from datetime import date, datetime
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -37,6 +37,7 @@ load_dotenv()
 
 DB_PATH        = "database/trading_saas.db"
 ADMIN_API_KEY  = os.getenv("ADMIN_API_SECRET", "")
+LOG_ROOT       = os.getenv("ENGINE_LOG_ROOT", "logs")
 
 app = FastAPI(
     title       = "NATB Trading Platform API",
@@ -83,6 +84,61 @@ def _set_setting(key: str, value: str):
         )
 
 
+def _today_log_dir() -> str:
+    return os.path.join(LOG_ROOT, datetime.now().strftime("%Y-%m-%d"))
+
+
+def _read_last_nonempty_line(path: str) -> str:
+    try:
+        if not os.path.exists(path):
+            return ""
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = [ln.strip() for ln in f.readlines() if ln.strip()]
+        return lines[-1] if lines else ""
+    except Exception:
+        return ""
+
+
+def _parse_kv_line(line: str) -> dict:
+    """
+    Parse simple key=value fragments from a log line.
+    """
+    out: dict[str, str] = {}
+    if not line:
+        return out
+    # remove leading timestamp block: [....] ...
+    body = line
+    if "] " in body:
+        body = body.split("] ", 1)[1]
+    for tok in body.split():
+        if "=" not in tok:
+            continue
+        k, v = tok.split("=", 1)
+        out[str(k).strip()] = str(v).strip()
+    return out
+
+
+def _top_rejection_reasons(limit: int = 5) -> list[dict]:
+    """
+    Aggregate recent rejection reasons from DB audit table.
+    """
+    conn = _conn()
+    c = conn.cursor()
+    try:
+        c.execute(
+            "SELECT reason, COUNT(*) AS n FROM trade_rejections "
+            "WHERE created_at >= datetime('now', '-1 day') "
+            "GROUP BY reason ORDER BY n DESC LIMIT ?",
+            (int(limit),),
+        )
+        rows = c.fetchall() or []
+    except Exception:
+        rows = []
+    finally:
+        conn.close()
+    return [{"reason": str(r[0] or ""), "count": int(r[1] or 0)} for r in rows]
+
+
 # ── Pydantic models ───────────────────────────────────────────────────────────
 
 class RiskSettings(BaseModel):
@@ -122,6 +178,12 @@ def system_status():
     pending_sigs = c.fetchone()[0]
     conn.close()
 
+    day_dir = _today_log_dir()
+    cycle_line = _read_last_nonempty_line(os.path.join(day_dir, "engine_cycle.txt"))
+    ai_line = _read_last_nonempty_line(os.path.join(day_dir, "ai_telemetry.txt"))
+    rej_line = _read_last_nonempty_line(os.path.join(day_dir, "structural_rejections.txt"))
+    cycle_kv = _parse_kv_line(cycle_line)
+
     return {
         "maintenance_mode":   _setting("MAINTENANCE_MODE")   == "true",
         "master_kill_switch": _setting("MASTER_KILL_SWITCH") == "true",
@@ -129,6 +191,44 @@ def system_status():
         "open_trades":        open_trades,
         "closed_trades":      closed_trades,
         "pending_signals":    pending_sigs,
+        "acceptance_ratio_pct": float(str(cycle_kv.get("acceptance_ratio", "0")).replace("%", "") or 0),
+        "rejection_ratio_pct": float(str(cycle_kv.get("rejection_ratio", "0")).replace("%", "") or 0),
+        "latest_cycle_log": cycle_line,
+        "latest_ai_log": ai_line,
+        "latest_structural_rejection_log": rej_line,
+        "top_rejection_reasons_24h": _top_rejection_reasons(limit=5),
+    }
+
+
+@app.get("/admin/ai-runtime", tags=["Admin"], dependencies=[Depends(_require_admin)])
+def ai_runtime_status():
+    """
+    AI/runtime telemetry endpoint for dashboards and ops tooling.
+    Includes:
+    - active signal/deep settings from environment
+    - latest daily telemetry lines
+    - top rejection reasons from DB audit table
+    """
+    day_dir = _today_log_dir()
+    cycle_line = _read_last_nonempty_line(os.path.join(day_dir, "engine_cycle.txt"))
+    ai_line = _read_last_nonempty_line(os.path.join(day_dir, "ai_telemetry.txt"))
+    rej_line = _read_last_nonempty_line(os.path.join(day_dir, "structural_rejections.txt"))
+    cycle_kv = _parse_kv_line(cycle_line)
+    return {
+        "signal_profile": os.getenv("SIGNAL_PROFILE", "FAST").strip().upper(),
+        "enable_deep_direction_model": os.getenv("ENABLE_DEEP_DIRECTION_MODEL", "false").strip().lower() == "true",
+        "enable_deep_direction_inference": os.getenv("ENABLE_DEEP_DIRECTION_INFERENCE", "false").strip().lower() == "true",
+        "deep_direction_model_kind": os.getenv("DEEP_DIRECTION_MODEL_KIND", "lstm").strip().lower(),
+        "deep_direction_inference_kind": os.getenv("DEEP_DIRECTION_INFERENCE_KIND", "lstm").strip().lower(),
+        "enable_ms_score_ai_integration": os.getenv("ENABLE_MS_SCORE_AI_INTEGRATION", "true").strip().lower() == "true",
+        "ms_score_ai_scale": float(os.getenv("MS_SCORE_AI_SCALE", "0.18")),
+        "ms_score_ai_max_impact": float(os.getenv("MS_SCORE_AI_MAX_IMPACT", "8.0")),
+        "acceptance_ratio_pct": float(str(cycle_kv.get("acceptance_ratio", "0")).replace("%", "") or 0),
+        "rejection_ratio_pct": float(str(cycle_kv.get("rejection_ratio", "0")).replace("%", "") or 0),
+        "latest_cycle_log": cycle_line,
+        "latest_ai_log": ai_line,
+        "latest_structural_rejection_log": rej_line,
+        "top_rejection_reasons_24h": _top_rejection_reasons(limit=8),
     }
 
 
