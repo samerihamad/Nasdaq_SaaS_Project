@@ -166,6 +166,11 @@ def train_direction_for_symbol(
         seq_len=int(seq_len),
         label_horizon=int(label_horizon),
         label_threshold=float(label_threshold),
+        cache_key=(
+            f"{str(symbol).upper()}|{tf}|seq={int(seq_len)}|"
+            f"h={int(label_horizon)}|thr={float(label_threshold):.6f}"
+        ),
+        use_cache=True,
     )
     model, hist = train_direction_model(
         bundle.X_train,

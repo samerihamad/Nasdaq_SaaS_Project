@@ -269,10 +269,6 @@ def _make_labels(df: pd.DataFrame) -> pd.Series:
 
 # ── Model persistence ─────────────────────────────────────────────────────────
 
-def _model_path(symbol: str) -> str:
-    safe = symbol.replace("/", "-").replace("=", "").replace("^", "")
-    return os.path.join(MODEL_DIR, f"{safe}_v{MODEL_VERSION}.pkl")
-
 def _model_path_tf(symbol: str, tf: str) -> str:
     safe = symbol.replace("/", "-").replace("=", "").replace("^", "")
     tf_safe = str(tf or "").strip().lower().replace("/", "-")
