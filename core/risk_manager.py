@@ -12,6 +12,7 @@ Open positions are NEVER touched during a Circuit Breaker or Hard Block.
 They stay active until they hit TP or SL.
 """
 
+import os
 import sqlite3
 from datetime import date
 from bot.notifier import send_telegram_message
@@ -36,6 +37,8 @@ MIN_RISK, MAX_RISK = 1.0,  2.0
 # Institutional risk controls
 DAILY_DRAWDOWN_LIMIT = 5.0   # % drawdown from session start → hard stop
 MIN_RR_RATIO         = 2.0   # minimum reward:risk required (1:2)
+MAX_SYMBOL_EXPOSURE_FRACTION = float(os.getenv("MAX_SYMBOL_EXPOSURE_FRACTION", "0.35"))
+MAX_TOTAL_EXPOSURE_MULT = float(os.getenv("MAX_TOTAL_EXPOSURE_MULT", "1.00"))
 
 def get_user_max_leverage(chat_id: str) -> int:
     """Return the maximum leverage allowed (single-plan system)."""
@@ -428,3 +431,96 @@ def check_rr_ratio(entry: float, stop: float, direction: str,
     if not achievable:
         return False, rr_ratio, "target_beyond_atr_limit"
     return True, rr_ratio, "ok"
+
+
+def validate_pre_trade(
+    symbol,
+    entry_price,
+    stop_loss,
+    leverage,
+    account_balance,
+    free_margin,
+    *,
+    confidence: float = 75.0,
+    chat_id: str | None = None,
+    current_symbol_exposure: float = 0.0,
+    current_total_exposure: float = 0.0,
+) -> tuple[bool, str, dict]:
+    """
+    Mandatory pre-trade validation.
+
+    Returns:
+      (approved, reason, details)
+    """
+    try:
+        entry = float(entry_price)
+        stop = float(stop_loss)
+        lev = float(leverage)
+        bal = float(account_balance)
+        margin_free = float(free_margin)
+    except Exception:
+        return False, "Trade rejected: invalid numeric pre-trade inputs", {}
+
+    if entry <= 0 or not (entry == entry):
+        return False, "Trade rejected: invalid entry price", {}
+    if lev <= 0 or not (lev == lev):
+        return False, "Trade rejected: invalid leverage", {}
+    if bal <= 0 or not (bal == bal):
+        return False, "Trade rejected: invalid account balance", {}
+    if margin_free < 0 or not (margin_free == margin_free):
+        return False, "Trade rejected: invalid free margin", {}
+
+    stop_dist = abs(entry - stop)
+    if stop_dist <= 0:
+        return False, "Trade rejected: invalid stop-loss distance", {}
+
+    stop_loss_pct = stop_dist / entry
+    if stop_loss_pct <= 0 or stop_loss_pct >= 0.5:
+        return False, "Trade rejected: invalid stop-loss ratio", {}
+
+    proposed_size = float(
+        calculate_position_size(
+            balance=bal,
+            confidence=float(confidence),
+            entry_price=entry,
+            stop_loss_pct=stop_loss_pct,
+            chat_id=chat_id,
+        )
+    )
+    if proposed_size < 1.0 or not (proposed_size == proposed_size):
+        return False, "Trade rejected: invalid position size", {}
+
+    required_margin = (entry * proposed_size) / lev
+    if required_margin > margin_free:
+        return False, "Trade rejected: insufficient free margin", {
+            "required_margin": round(required_margin, 4),
+            "free_margin": round(margin_free, 4),
+            "position_size": round(proposed_size, 4),
+        }
+
+    # Exposure caps: projected notional must stay under symbol/portfolio limits.
+    total_limit = max(0.0, bal * lev * float(MAX_TOTAL_EXPOSURE_MULT))
+    symbol_limit = max(0.0, total_limit * float(MAX_SYMBOL_EXPOSURE_FRACTION))
+    projected_notional = entry * proposed_size
+    projected_symbol = float(current_symbol_exposure) + projected_notional
+    projected_total = float(current_total_exposure) + projected_notional
+
+    if symbol_limit > 0 and projected_symbol > symbol_limit:
+        return False, "Trade rejected: max exposure per symbol exceeded", {
+            "projected_symbol_exposure": round(projected_symbol, 4),
+            "symbol_limit": round(symbol_limit, 4),
+        }
+    if total_limit > 0 and projected_total > total_limit:
+        return False, "Trade rejected: max total exposure exceeded", {
+            "projected_total_exposure": round(projected_total, 4),
+            "total_limit": round(total_limit, 4),
+        }
+
+    return True, "approved", {
+        "position_size": round(proposed_size, 4),
+        "required_margin": round(required_margin, 4),
+        "stop_distance": round(stop_dist, 6),
+        "stop_loss_pct": round(stop_loss_pct, 8),
+        "projected_symbol_exposure": round(projected_symbol, 4),
+        "projected_total_exposure": round(projected_total, 4),
+    }

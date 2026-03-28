@@ -29,6 +29,7 @@ from core.risk_manager import (
     can_open_trade,
     calculate_position_size, STATE_MANUAL_OVERRIDE,
     check_daily_drawdown, check_rr_ratio,
+    get_effective_leverage, validate_pre_trade,
 )
 from core.trade_session_finalize import after_trade_leg_closed
 from core.trailing_stop import (
@@ -564,6 +565,76 @@ def _get_balance(base_url, headers):
     except Exception:
         pass
     return 1000.0
+
+
+def _get_balance_and_free_margin(base_url, headers) -> tuple[float, float]:
+    """
+    Return (balance, free_margin) with robust fallback across Capital payload shapes.
+    """
+    try:
+        res = requests.get(f"{base_url}/accounts", headers=headers, timeout=20)
+        if res.status_code != 200:
+            bal = _get_balance(base_url, headers)
+            return float(bal), float(bal)
+        data = res.json() or {}
+        accs = data.get("accounts", []) or []
+        if not accs:
+            bal = _get_balance(base_url, headers)
+            return float(bal), float(bal)
+        acc = accs[0] or {}
+        b = acc.get("balance", {}) or {}
+        balance = (
+            b.get("balance")
+            if b.get("balance") is not None
+            else acc.get("balance")
+        )
+        free_margin = (
+            b.get("available")
+            if b.get("available") is not None
+            else b.get("availableFunds")
+        )
+        if free_margin is None:
+            # Conservative fallback if broker payload omits a dedicated free-margin field.
+            free_margin = balance
+        return float(balance or 0.0), float(free_margin or 0.0)
+    except Exception:
+        bal = _get_balance(base_url, headers)
+        return float(bal), float(bal)
+
+
+def _current_exposure_notional(base_url, headers, symbol: str, order_epic: str) -> tuple[float, float]:
+    """
+    Return (symbol_exposure_notional, total_exposure_notional) from open positions.
+    """
+    sym_token = str(symbol or "").upper().strip()
+    epic_u = str(order_epic or "").upper().strip()
+    sym_exposure = 0.0
+    total_exposure = 0.0
+    try:
+        res = requests.get(f"{base_url}/positions", headers=headers, timeout=20)
+        if res.status_code != 200:
+            return 0.0, 0.0
+        for p in (res.json() or {}).get("positions", []):
+            m = p.get("market", {}) or {}
+            pos = p.get("position", {}) or {}
+            row_epic = str(m.get("epic") or "").upper()
+            row_name = str(m.get("instrumentName") or "").upper()
+            try:
+                level = float(pos.get("level") or 0.0)
+                size = abs(float(pos.get("size") or 0.0))
+            except Exception:
+                continue
+            notional = level * size
+            if notional <= 0:
+                continue
+            total_exposure += notional
+            if epic_u and row_epic == epic_u:
+                sym_exposure += notional
+            elif sym_token and sym_token in row_name:
+                sym_exposure += notional
+    except Exception:
+        return 0.0, 0.0
+    return float(sym_exposure), float(total_exposure)
 
 
 def _get_current_price(base_url, headers, epic):
@@ -1709,7 +1780,7 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
         return msg
 
     # ── Daily drawdown gate ───────────────────────────────────────────────────
-    balance = _get_balance(base_url, headers)
+    balance, free_margin = _get_balance_and_free_margin(base_url, headers)
     within_dd, dd_pct = check_daily_drawdown(chat_id, balance)
     if not within_dd:
         msg = f"🔴 Daily drawdown limit reached ({dd_pct:.1f}%) — no new entries today."
@@ -1826,6 +1897,57 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             else entry_price * (1 + effective_sl_pct)
         )
 
+    # ── Mandatory pre-trade validation (margin + size + exposure) ────────────
+    lev = get_effective_leverage(str(chat_id))
+    sym_exposure, total_exposure = _current_exposure_notional(
+        base_url=base_url,
+        headers=headers,
+        symbol=str(symbol),
+        order_epic=str(order_epic),
+    )
+    approved_pre, pre_reason, pre_details = validate_pre_trade(
+        symbol=str(symbol),
+        entry_price=float(entry_price),
+        stop_loss=float(stop_price),
+        leverage=float(lev),
+        account_balance=float(balance),
+        free_margin=float(free_margin),
+        confidence=float(confidence),
+        chat_id=str(chat_id),
+        current_symbol_exposure=float(sym_exposure),
+        current_total_exposure=float(total_exposure),
+    )
+    if not approved_pre:
+        msg = str(pre_reason or "Trade rejected: pre-trade validation failed")
+        print(msg)
+        detail_required = pre_details.get("required_margin")
+        detail_free = pre_details.get("free_margin")
+        detail_size = pre_details.get("position_size")
+        _log_trade_rejection(
+            chat_id,
+            symbol,
+            action,
+            "pre_trade_validation",
+            msg,
+            (
+                f"required_margin={detail_required} free_margin={detail_free} "
+                f"size={detail_size} leverage={lev}"
+            ),
+        )
+        _audit_exec_event(
+            stage="pre_trade_validation_reject",
+            chat_id=str(chat_id),
+            symbol=str(symbol),
+            action=str(action),
+            details=(
+                f"{msg} | required_margin={detail_required} "
+                f"free_margin={detail_free} size={detail_size} leverage={lev}"
+            ),
+        )
+        _maybe_notify_rejection(chat_id, msg, symbol=symbol, action=action, stage="pre_trade_validation")
+        return msg
+    pretrade_size = float(pre_details.get("position_size") or 0.0)
+
     # ── Sprint 2: limit-first entry policy ───────────────────────────────────
     if ENABLE_LIMIT_ORDER_MODE and not force_market:
         limit_px = _calculate_limit_price(
@@ -1869,7 +1991,9 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
         return f"🧾 Limit placed ({symbol} {action}) @ {float(limit_px):.4f}"
 
     # ── Position size (1–2% risk, confidence-scaled) ──────────────────────────
-    size = calculate_position_size(balance, confidence, entry_price, effective_sl_pct, chat_id)
+    size = pretrade_size if pretrade_size >= 1.0 else calculate_position_size(
+        balance, confidence, entry_price, effective_sl_pct, chat_id
+    )
     # Protection levels used BOTH for broker order and Telegram report.
     # If the strategy provided stop_loss_pct, use it directly.
     # Otherwise fall back to ATR candidate (legacy behavior).

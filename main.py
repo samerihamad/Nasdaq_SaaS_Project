@@ -738,6 +738,10 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
                     opened += 1
                     unsupported_for_all = False
                     print(f"[TRADE OPENED] {symbol} {action}")
+                elif isinstance(result, str) and result.startswith("Trade rejected:"):
+                    skipped += 1
+                    unsupported_for_all = False
+                    print(f"[PRETRADE BLOCK] {result}")
                 elif isinstance(result, str) and result.startswith("⏭️"):
                     skipped += 1
                     if "symbol not available on broker" not in result:
