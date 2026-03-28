@@ -293,7 +293,7 @@ def scan_watchlist_parallel(
         if not timeframes:
             return None
 
-        candidates: list[tuple[str, float, str, str, float | None, float | None]] = []
+        candidates: list[tuple[str, float, str, str, float | None, float | None, float | None]] = []
         raw_confs: list[float] = []
 
         # 1) RF multi-timeframe
@@ -304,7 +304,7 @@ def scan_watchlist_parallel(
             except Exception:
                 pass
             if action and conf >= float(min_confidence):
-                candidates.append((action, float(conf), "RF", str(reason), None, None))
+                candidates.append((action, float(conf), "RF", str(reason), None, None, None))
         except Exception:
             pass
 
@@ -323,6 +323,7 @@ def scan_watchlist_parallel(
                     str(mr.get("reason", "Rejected by market structure filter")),
                     None,
                     None,
+                    None,
                 ))
             elif mr and float(mr.get("confidence", 0)) >= float(min_confidence):
                 candidates.append((
@@ -332,6 +333,7 @@ def scan_watchlist_parallel(
                     str(mr.get("reason", "")),
                     mr.get("stop_loss_pct"),
                     (float(mr.get("ms_score")) if mr.get("ms_score") is not None else None),
+                    (float(mr.get("score")) if mr.get("score") is not None else None),
                 ))
         except Exception:
             pass
@@ -351,6 +353,7 @@ def scan_watchlist_parallel(
                     str(mo.get("reason", "Rejected by market structure filter")),
                     None,
                     None,
+                    None,
                 ))
             elif mo and float(mo.get("confidence", 0)) >= float(min_confidence):
                 candidates.append((
@@ -360,6 +363,7 @@ def scan_watchlist_parallel(
                     str(mo.get("reason", "")),
                     mo.get("stop_loss_pct"),
                     (float(mo.get("ms_score")) if mo.get("ms_score") is not None else None),
+                    (float(mo.get("score")) if mo.get("score") is not None else None),
                 ))
         except Exception:
             pass
@@ -371,7 +375,7 @@ def scan_watchlist_parallel(
 
         accepted = [c for c in candidates if c[0] != "__REJECTED__"]
         if not accepted:
-            _, _, rej_label, rej_reason, _, _ = candidates[0]
+            _, _, rej_label, rej_reason, _, _, _ = candidates[0]
             return {
                 "symbol": symbol,
                 "action": None,
@@ -380,11 +384,12 @@ def scan_watchlist_parallel(
                 "reason": rej_reason,
                 "stop_loss_pct": None,
                 "ms_score": None,
+                "score": None,
                 "timeframes": timeframes,
                 "rejected": True,
             }
 
-        best_action, best_conf, best_label, best_reason, best_sl_pct, best_ms_score = max(
+        best_action, best_conf, best_label, best_reason, best_sl_pct, best_ms_score, best_score = max(
             accepted, key=lambda x: x[1]
         )
         print(f"[CANDIDATES] {symbol} | count={len(candidates)} | best_conf={best_conf:.1f}")
@@ -397,6 +402,7 @@ def scan_watchlist_parallel(
             "reason": best_reason,
             "stop_loss_pct": best_sl_pct,
             "ms_score": best_ms_score,
+            "score": best_score,
             "timeframes": timeframes,
         }
 

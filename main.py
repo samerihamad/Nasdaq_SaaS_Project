@@ -44,9 +44,16 @@ from bot.dashboard import post_pending_signal, get_signal_status
 from bot.i18n import t
 from database.db_manager import set_trading_enabled
 from database.db_manager import touch_engine_activity
+from database.db_manager import get_user_signal_profile
 from config import (
     MIN_CONFIDENCE,
     SIGNAL_MIN_CONFIDENCE,
+    FAST_MIN_CONFIDENCE,
+    GOLDEN_MIN_CONFIDENCE,
+    FAST_MR_MIN_SCORE,
+    GOLDEN_MR_MIN_SCORE,
+    FAST_MOM_MIN_SCORE,
+    GOLDEN_MOM_MIN_SCORE,
     CHECK_INTERVAL,
     MAX_WATCHLIST,
     HYBRID_SIGNAL_TTL,
@@ -385,6 +392,34 @@ def _get_user_mode(chat_id: str) -> str:
     return row[0] if row and row[0] else 'AUTO'
 
 
+def _profile_thresholds(profile: str) -> tuple[float, int, int]:
+    """Resolve confidence/score thresholds for FAST vs GOLDEN profile."""
+    p = str(profile or "FAST").strip().upper()
+    if p == "GOLDEN":
+        return float(GOLDEN_MIN_CONFIDENCE), int(GOLDEN_MR_MIN_SCORE), int(GOLDEN_MOM_MIN_SCORE)
+    return float(FAST_MIN_CONFIDENCE), int(FAST_MR_MIN_SCORE), int(FAST_MOM_MIN_SCORE)
+
+
+def _passes_profile_gate(
+    *,
+    profile: str,
+    strategy_label: str | None,
+    confidence: float,
+    signal_score: float | None,
+) -> tuple[bool, str]:
+    """Per-user profile gate used before AUTO/HYBRID dispatch."""
+    min_conf, mr_min, mom_min = _profile_thresholds(profile)
+    if float(confidence) < float(min_conf):
+        return False, f"confidence {float(confidence):.1f} < {float(min_conf):.1f}"
+
+    label = str(strategy_label or "").strip().lower()
+    if label == "meanrev" and signal_score is not None and float(signal_score) < float(mr_min):
+        return False, f"meanrev score {float(signal_score):.1f} < {float(mr_min):.1f}"
+    if label == "momentum" and signal_score is not None and float(signal_score) < float(mom_min):
+        return False, f"momentum score {float(signal_score):.1f} < {float(mom_min):.1f}"
+    return True, "ok"
+
+
 def _is_license_valid_for_user(chat_id: str) -> bool:
     """Lightweight license check for engine auto-enable decisions."""
     conn = sqlite3.connect('database/trading_saas.db')
@@ -517,7 +552,7 @@ def send_premarket_alert(watchlist_count: int):
 
 def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
                     timeframes: dict = None, stop_loss_pct: float = None, strategy_label: str = None,
-                    ms_score: Optional[float] = None):
+                    ms_score: Optional[float] = None, signal_score: Optional[float] = None):
     """
     Multi-tenant signal dispatcher.
 
@@ -669,6 +704,21 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
         chat_id = str(row[0])
         try:
             mode = _get_user_mode(chat_id)
+            profile = get_user_signal_profile(chat_id)
+            allowed, why_not = _passes_profile_gate(
+                profile=profile,
+                strategy_label=strategy_label,
+                confidence=float(confidence),
+                signal_score=(float(signal_score) if signal_score is not None else None),
+            )
+            if not allowed:
+                skipped += 1
+                unsupported_for_all = False
+                print(
+                    f"   [PROFILE SKIP {chat_id}] profile={profile} "
+                    f"{symbol} {action} | {why_not}"
+                )
+                continue
 
             if mode == 'AUTO':
                 attempted += 1
@@ -1010,6 +1060,7 @@ def run_trading_bot():
                     best_reason = sig.get("reason", "")
                     best_sl_pct = sig.get("stop_loss_pct")
                     best_ms_score = sig.get("ms_score")
+                    best_score = sig.get("score")
                     timeframes = sig.get("timeframes")
 
                     print(
@@ -1022,6 +1073,7 @@ def run_trading_bot():
                         symbol, best_action, best_conf, best_reason,
                         timeframes=timeframes, stop_loss_pct=best_sl_pct,
                         strategy_label=best_label, ms_score=best_ms_score,
+                        signal_score=best_score,
                     )
                     if isinstance(dispatch_result, dict) and dispatch_result.get("status") == "ai_blocked":
                         ai_blocked_count += 1

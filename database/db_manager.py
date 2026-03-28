@@ -25,6 +25,7 @@ _SUBSCRIBERS_CANONICAL_COLUMNS = [
     # profile / UX
     ("lang", "TEXT DEFAULT 'ar'"),
     ("mode", "TEXT DEFAULT 'AUTO'"),
+    ("signal_profile", "TEXT DEFAULT 'FAST'"),
     ("first_name", "TEXT"),
     ("last_name", "TEXT"),
     ("phone", "TEXT"),
@@ -90,6 +91,7 @@ def create_db():
                   license_key      TEXT,
                   lang             TEXT    DEFAULT 'ar',
                   mode             TEXT    DEFAULT 'AUTO',
+                  signal_profile   TEXT    DEFAULT 'FAST',
                   first_name       TEXT,
                   last_name        TEXT,
                   phone            TEXT,
@@ -109,6 +111,7 @@ def create_db():
         ('trading_enabled',  'INTEGER DEFAULT 0'),
         ('subscription_started_at', "TEXT"),
         ('preferred_leverage', 'INTEGER'),
+        ('signal_profile', "TEXT DEFAULT 'FAST'"),
         ('last_bot_activity_at', "TEXT"),
         ('last_engine_activity_at', "TEXT"),
     ]:
@@ -121,6 +124,13 @@ def create_db():
     # Ensure legacy rows remain valid under the single-plan framework.
     try:
         c.execute("UPDATE subscribers SET is_active=1 WHERE is_active IS NULL")
+    except Exception:
+        pass
+    try:
+        c.execute(
+            "UPDATE subscribers SET signal_profile='FAST' "
+            "WHERE signal_profile IS NULL OR TRIM(signal_profile)=''"
+        )
     except Exception:
         pass
 
@@ -436,6 +446,31 @@ def set_trading_enabled(chat_id: str, enabled: bool):
     conn.execute(
         "UPDATE subscribers SET trading_enabled=? WHERE chat_id=?",
         (1 if enabled else 0, str(chat_id))
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_user_signal_profile(chat_id: str) -> str:
+    """Return per-user signal profile: FAST or GOLDEN."""
+    conn = sqlite3.connect(DB_PATH)
+    c    = conn.cursor()
+    c.execute("SELECT signal_profile FROM subscribers WHERE chat_id=?", (str(chat_id),))
+    row  = c.fetchone()
+    conn.close()
+    profile = str(row[0]).strip().upper() if row and row[0] else "FAST"
+    return "GOLDEN" if profile == "GOLDEN" else "FAST"
+
+
+def set_user_signal_profile(chat_id: str, profile: str):
+    """Persist per-user signal profile with FAST fallback."""
+    val = str(profile or "FAST").strip().upper()
+    if val not in ("FAST", "GOLDEN"):
+        val = "FAST"
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE subscribers SET signal_profile=? WHERE chat_id=?",
+        (val, str(chat_id)),
     )
     conn.commit()
     conn.close()

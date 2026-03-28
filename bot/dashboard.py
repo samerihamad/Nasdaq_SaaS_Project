@@ -54,6 +54,7 @@ from database.db_manager import (
     get_trading_enabled, set_trading_enabled,
     apply_subscription_cancellation, get_preferred_leverage,
     set_preferred_leverage, infer_subscription_start, is_maintenance_mode,
+    get_user_signal_profile, set_user_signal_profile,
     touch_bot_activity,
 )
 from utils.market_hours import (
@@ -552,6 +553,10 @@ def _can_cancel_subscription(chat_id: str) -> bool:
 
 def _settings_menu_keyboard(lang: str, chat_id: str):
     rows = []
+    current_profile = get_user_signal_profile(chat_id)
+    rows.append([InlineKeyboardButton(
+        t('btn_signal_profile', lang, profile=_profile_label(current_profile, lang)),
+        callback_data='settings_signal_profile')])
     if _can_cancel_subscription(chat_id):
         rows.append([InlineKeyboardButton(
             t('btn_cancel_subscription', lang), callback_data='settings_cancel_warn')])
@@ -589,6 +594,22 @@ def _contact_support_keyboard(lang: str):
     return InlineKeyboardMarkup([[
         InlineKeyboardButton(t('btn_contact_support', lang), url=SUPPORT_URL),
     ]])
+
+
+def _profile_label(profile: str, lang: str) -> str:
+    p = str(profile or "FAST").strip().upper()
+    return t('profile_golden', lang) if p == 'GOLDEN' else t('profile_fast', lang)
+
+
+def _signal_profile_keyboard(lang: str, chat_id: str):
+    current = get_user_signal_profile(chat_id)
+    fast_label = f"✅ {t('profile_fast', lang)}" if current == "FAST" else t('profile_fast', lang)
+    golden_label = f"✅ {t('profile_golden', lang)}" if current == "GOLDEN" else t('profile_golden', lang)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(fast_label, callback_data='settings_profile_fast')],
+        [InlineKeyboardButton(golden_label, callback_data='settings_profile_golden')],
+        [InlineKeyboardButton(t('btn_back', lang), callback_data='settings')],
+    ])
 
 
 # ── Bank details helper ────────────────────────────────────────────────────────
@@ -1738,6 +1759,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             t('settings_menu_intro', lang),
             reply_markup=_settings_menu_keyboard(lang, chat_id),
+            parse_mode='Markdown',
+        )
+
+    elif data == 'settings_signal_profile':
+        current = get_user_signal_profile(chat_id)
+        await query.edit_message_text(
+            t('signal_profile_menu_title', lang, profile=_profile_label(current, lang)),
+            reply_markup=_signal_profile_keyboard(lang, chat_id),
+            parse_mode='Markdown',
+        )
+
+    elif data in ('settings_profile_fast', 'settings_profile_golden'):
+        selected = 'GOLDEN' if data == 'settings_profile_golden' else 'FAST'
+        set_user_signal_profile(chat_id, selected)
+        await query.edit_message_text(
+            t('signal_profile_saved', lang, profile=_profile_label(selected, lang)),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(t('btn_back', lang), callback_data='settings'),
+            ]]),
             parse_mode='Markdown',
         )
 

@@ -356,6 +356,30 @@ STRINGS = {
         'ar': '🛑 حجب التداول ليوم كامل',
         'en': '🛑 Block trading for the rest of today',
     },
+    'btn_signal_profile': {
+        'ar': '⚡ نوع الإشارات: {profile}',
+        'en': '⚡ Signal Profile: {profile}',
+    },
+    'profile_fast': {'ar': 'سريع (FAST)', 'en': 'Fast (FAST)'},
+    'profile_golden': {'ar': 'ذهبي (GOLDEN)', 'en': 'Golden (GOLDEN)'},
+    'signal_profile_menu_title': {
+        'ar': (
+            '⚡ *اختيار نوع الإشارات*\n\n'
+            'الملف الحالي: *{profile}*\n'
+            '• FAST: إشارات أكثر وسرعة أعلى\n'
+            '• GOLDEN: إشارات أقل لكن انتقائية أعلى'
+        ),
+        'en': (
+            '⚡ *Choose Signal Profile*\n\n'
+            'Current profile: *{profile}*\n'
+            '• FAST: more frequent signals\n'
+            '• GOLDEN: stricter, higher-selectivity signals'
+        ),
+    },
+    'signal_profile_saved': {
+        'ar': '✅ تم حفظ نوع الإشارات: *{profile}*',
+        'en': '✅ Signal profile saved: *{profile}*',
+    },
     'btn_resume_day_trading': {
         'ar': '▶ استئناف التداول (إلغاء الحجب)',
         'en': '▶ Resume trading (lift block)',
