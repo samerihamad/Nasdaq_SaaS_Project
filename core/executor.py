@@ -29,7 +29,7 @@ from core.risk_manager import (
     can_open_trade,
     calculate_position_size, STATE_MANUAL_OVERRIDE,
     check_daily_drawdown, check_rr_ratio,
-    get_effective_leverage, validate_pre_trade,
+    get_effective_leverage, validate_pre_trade, generate_institutional_stop_loss,
 )
 from core.trade_session_finalize import after_trade_leg_closed
 from core.trailing_stop import (
@@ -602,7 +602,7 @@ def _get_balance_and_free_margin(base_url, headers) -> tuple[float, float]:
         return float(bal), float(bal)
 
 
-def _current_exposure_notional(base_url, headers, symbol: str, order_epic: str) -> tuple[float, float]:
+def _current_exposure_notional(base_url, headers, symbol: str, order_epic: str) -> tuple[float, float, dict]:
     """
     Return (symbol_exposure_notional, total_exposure_notional) from open positions.
     """
@@ -610,10 +610,11 @@ def _current_exposure_notional(base_url, headers, symbol: str, order_epic: str) 
     epic_u = str(order_epic or "").upper().strip()
     sym_exposure = 0.0
     total_exposure = 0.0
+    by_symbol: dict[str, float] = {}
     try:
         res = requests.get(f"{base_url}/positions", headers=headers, timeout=20)
         if res.status_code != 200:
-            return 0.0, 0.0
+            return 0.0, 0.0, {}
         for p in (res.json() or {}).get("positions", []):
             m = p.get("market", {}) or {}
             pos = p.get("position", {}) or {}
@@ -628,13 +629,20 @@ def _current_exposure_notional(base_url, headers, symbol: str, order_epic: str) 
             if notional <= 0:
                 continue
             total_exposure += notional
+            token = ""
+            if row_epic:
+                token = row_epic.split(".")[-1].split(":")[-1]
+            if not token and row_name:
+                token = row_name.split()[0]
+            if token:
+                by_symbol[token] = float(by_symbol.get(token, 0.0) + notional)
             if epic_u and row_epic == epic_u:
                 sym_exposure += notional
             elif sym_token and sym_token in row_name:
                 sym_exposure += notional
     except Exception:
-        return 0.0, 0.0
-    return float(sym_exposure), float(total_exposure)
+        return 0.0, 0.0, {}
+    return float(sym_exposure), float(total_exposure), by_symbol
 
 
 def _get_current_price(base_url, headers, epic):
@@ -1835,71 +1843,88 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             return f"⏭️ Trade skipped: Market Closed for {symbol} ({m_status})"
         return f"⏭️ تم التخطي: السوق مغلق لـ {symbol} ({m_status})"
 
-    # ── R:R ratio gate ────────────────────────────────────────────────────────
-    if atr and entry_price > 0:
-        # Compute stop price from stop_loss_pct (strategy-supplied) or ATR fallback
-        effective_sl_pct = (
-            stop_loss_pct
-            if stop_loss_pct is not None
-            else (atr * 2.0 / entry_price)
-        )
-        try:
-            effective_sl_pct = float(effective_sl_pct)
-        except Exception:
-            effective_sl_pct = 0.0
-        if (not math.isfinite(effective_sl_pct)) or effective_sl_pct <= 0 or effective_sl_pct >= 0.50:
-            msg = f"❌ Order failed ({symbol} {action}): invalid stop-loss ratio"
-            _log_trade_rejection(
-                chat_id,
-                symbol,
-                action,
-                "rr_gate",
-                msg,
-                f"effective_sl_pct={effective_sl_pct}",
+    # ── Institutional stop-loss generation (ATR + volatility + structure + liquidity) ─
+    effective_sl_pct = stop_loss_pct if stop_loss_pct is not None else (
+        (atr * 2.0 / entry_price) if (atr and entry_price > 0) else 0.01
+    )
+    try:
+        effective_sl_pct = float(effective_sl_pct)
+    except Exception:
+        effective_sl_pct = 0.01
+    if (not math.isfinite(effective_sl_pct)) or effective_sl_pct <= 0:
+        effective_sl_pct = 0.01
+    base_stop_price = (
+        entry_price * (1 - effective_sl_pct) if action == 'BUY'
+        else entry_price * (1 + effective_sl_pct)
+    )
+    min_dist = _get_min_stop_profit_distance(base_url, headers, order_epic)
+    max_dist = _get_max_stop_profit_distance(base_url, headers, order_epic)
+
+    liq_levels = None
+    try:
+        tf = scan_multi_timeframe(str(symbol), session_context=scanner_ctx) or {}
+        df_15m_sl = tf.get("15m")
+        if df_15m_sl is not None and len(df_15m_sl) > 0:
+            from core.market_structure import build_liquidity_map
+            liq = build_liquidity_map(df_15m_sl)
+            liq_levels = {
+                "pdh": getattr(liq, "pdh", None),
+                "pdl": getattr(liq, "pdl", None),
+                "orh": getattr(liq, "orh", None),
+                "orl": getattr(liq, "orl", None),
+            }
+            stop_price, stop_reason, stop_meta = generate_institutional_stop_loss(
+                direction=str(action),
+                entry_price=float(entry_price),
+                df_15m=df_15m_sl,
+                liquidity_levels=liq_levels,
+                atr_value=float(atr) if atr is not None else None,
+                min_stop_distance=min_dist,
+                max_stop_distance=max_dist,
             )
-            return msg
-        stop_price = (
-            entry_price * (1 - effective_sl_pct) if action == 'BUY'
-            else entry_price * (1 + effective_sl_pct)
+        else:
+            stop_price, stop_reason, stop_meta = base_stop_price, "fallback_base_stop", {}
+    except Exception:
+        stop_price, stop_reason, stop_meta = base_stop_price, "fallback_base_stop_exception", {}
+
+    # ── R:R ratio gate ────────────────────────────────────────────────────────
+    rr_ok, rr_ratio, rr_reason = check_rr_ratio(
+        float(entry_price),
+        float(stop_price),
+        str(action),
+        float(atr) if (atr is not None and math.isfinite(float(atr))) else 0.0,
+    )
+    if isinstance(rr_ratio, float) and (math.isnan(rr_ratio) or math.isinf(rr_ratio)):
+        rr_ok = False
+        rr_reason = "invalid_rr_nan"
+    if not rr_ok:
+        if rr_reason == "target_beyond_atr_limit":
+            msg = (
+                f"❌ R:R {rr_ratio:.1f}:1 rejected — target not achievable "
+                f"within ATR limit ({symbol} {action})"
+            )
+        elif rr_reason == "invalid_rr_nan":
+            msg = f"❌ R:R nan:1 does not meet minimum 1:2 — setup discarded ({symbol} {action})"
+        else:
+            msg = (
+                f"❌ R:R {rr_ratio:.1f}:1 does not meet minimum 1:2 — "
+                f"setup discarded ({symbol} {action})"
+            )
+        _log_trade_rejection(
+            chat_id,
+            symbol,
+            action,
+            "rr_gate",
+            msg,
+            f"{rr_reason or ''} stop_reason={stop_reason} stop_meta={stop_meta}",
         )
-        rr_ok, rr_ratio, rr_reason = check_rr_ratio(entry_price, stop_price, action, atr)
-        if isinstance(rr_ratio, float) and (math.isnan(rr_ratio) or math.isinf(rr_ratio)):
-            rr_ok = False
-            rr_reason = "invalid_rr_nan"
-        if not rr_ok:
-            if rr_reason == "target_beyond_atr_limit":
-                msg = (
-                    f"❌ R:R {rr_ratio:.1f}:1 rejected — target not achievable "
-                    f"within ATR limit ({symbol} {action})"
-                )
-            elif rr_reason == "invalid_rr_nan":
-                msg = f"❌ R:R nan:1 does not meet minimum 1:2 — setup discarded ({symbol} {action})"
-            else:
-                msg = (
-                    f"❌ R:R {rr_ratio:.1f}:1 does not meet minimum 1:2 — "
-                    f"setup discarded ({symbol} {action})"
-                )
-            _log_trade_rejection(chat_id, symbol, action, "rr_gate", msg, rr_reason or "")
-            if not SUPPRESS_EXPECTED_REJECTION_TELEGRAM:
-                _maybe_notify_rejection(chat_id, msg, symbol=symbol, action=action, stage="rr_gate")
-            return msg
-    else:
-        effective_sl_pct = stop_loss_pct if stop_loss_pct is not None else 0.01
-        try:
-            effective_sl_pct = float(effective_sl_pct)
-        except Exception:
-            effective_sl_pct = 0.01
-        if (not math.isfinite(effective_sl_pct)) or effective_sl_pct <= 0:
-            effective_sl_pct = 0.01
-        rr_ratio = 0.0
-        stop_price = (
-            entry_price * (1 - effective_sl_pct) if action == 'BUY'
-            else entry_price * (1 + effective_sl_pct)
-        )
+        if not SUPPRESS_EXPECTED_REJECTION_TELEGRAM:
+            _maybe_notify_rejection(chat_id, msg, symbol=symbol, action=action, stage="rr_gate")
+        return msg
 
     # ── Mandatory pre-trade validation (margin + size + exposure) ────────────
     lev = get_effective_leverage(str(chat_id))
-    sym_exposure, total_exposure = _current_exposure_notional(
+    sym_exposure, total_exposure, exposure_by_symbol = _current_exposure_notional(
         base_url=base_url,
         headers=headers,
         symbol=str(symbol),
@@ -1916,6 +1941,7 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
         chat_id=str(chat_id),
         current_symbol_exposure=float(sym_exposure),
         current_total_exposure=float(total_exposure),
+        exposure_by_symbol=exposure_by_symbol,
     )
     if not approved_pre:
         msg = str(pre_reason or "Trade rejected: pre-trade validation failed")
@@ -1995,14 +2021,8 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
         balance, confidence, entry_price, effective_sl_pct, chat_id
     )
     # Protection levels used BOTH for broker order and Telegram report.
-    # If the strategy provided stop_loss_pct, use it directly.
-    # Otherwise fall back to ATR candidate (legacy behavior).
-    if stop_loss_pct is not None:
-        initial_stop = stop_price
-    elif atr and entry_price > 0:
-        initial_stop = compute_stop_candidate(action, entry_price, atr)
-    else:
-        initial_stop = stop_price
+    # Stop comes from institutional SL synthesis done pre-trade.
+    initial_stop = stop_price
 
     stop_level = initial_stop if initial_stop is not None else stop_price
 

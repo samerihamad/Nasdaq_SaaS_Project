@@ -14,6 +14,7 @@ They stay active until they hit TP or SL.
 
 import os
 import sqlite3
+import math
 from datetime import date
 from bot.notifier import send_telegram_message
 from database.db_manager import (
@@ -36,9 +37,20 @@ MIN_RISK, MAX_RISK = 1.0,  2.0
 
 # Institutional risk controls
 DAILY_DRAWDOWN_LIMIT = 5.0   # % drawdown from session start → hard stop
+WEEKLY_DRAWDOWN_LIMIT = float(os.getenv("WEEKLY_DRAWDOWN_LIMIT", "10.0"))
 MIN_RR_RATIO         = 2.0   # minimum reward:risk required (1:2)
 MAX_SYMBOL_EXPOSURE_FRACTION = float(os.getenv("MAX_SYMBOL_EXPOSURE_FRACTION", "0.35"))
+MAX_SECTOR_EXPOSURE_FRACTION = float(os.getenv("MAX_SECTOR_EXPOSURE_FRACTION", "0.55"))
 MAX_TOTAL_EXPOSURE_MULT = float(os.getenv("MAX_TOTAL_EXPOSURE_MULT", "1.00"))
+MAX_TRADES_PER_SYMBOL_DAY = int(os.getenv("MAX_TRADES_PER_SYMBOL_DAY", "2"))
+MAX_TRADES_PER_DAY_RISK = int(os.getenv("MAX_TRADES_PER_DAY_RISK", "5"))
+MARGIN_CALL_BUFFER_PCT = float(os.getenv("MARGIN_CALL_BUFFER_PCT", "0.15"))
+MAX_STOP_LOSS_PCT = float(os.getenv("MAX_STOP_LOSS_PCT", "0.06"))
+ATR_SL_MULT_LOW_VOL = float(os.getenv("ATR_SL_MULT_LOW_VOL", "2.2"))
+ATR_SL_MULT_HIGH_VOL = float(os.getenv("ATR_SL_MULT_HIGH_VOL", "1.4"))
+VOL_BAND_MULT = float(os.getenv("VOL_BAND_MULT", "2.2"))
+LIQUIDITY_SL_BUFFER_ATR = float(os.getenv("LIQUIDITY_SL_BUFFER_ATR", "0.35"))
+SWING_LOOKBACK_BARS = int(os.getenv("SWING_LOOKBACK_BARS", "20"))
 
 def get_user_max_leverage(chat_id: str) -> int:
     """Return the maximum leverage allowed (single-plan system)."""
@@ -433,6 +445,182 @@ def check_rr_ratio(entry: float, stop: float, direction: str,
     return True, rr_ratio, "ok"
 
 
+def _daily_symbol_trade_count(chat_id: str, symbol: str) -> int:
+    try:
+        today = str(date.today())
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            "SELECT COUNT(*) FROM trades WHERE chat_id=? AND symbol=? AND DATE(opened_at)=?",
+            (str(chat_id), str(symbol), today),
+        )
+        row = c.fetchone()
+        conn.close()
+        return int(row[0] or 0) if row else 0
+    except Exception:
+        return 0
+
+
+def _weekly_pnl(chat_id: str) -> float:
+    """
+    Last 7 calendar days closed PnL.
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            "SELECT COALESCE(SUM(pnl), 0) FROM trades "
+            "WHERE chat_id=? AND status='CLOSED' "
+            "AND DATE(closed_at) >= DATE('now', '-6 day')",
+            (str(chat_id),),
+        )
+        row = c.fetchone()
+        conn.close()
+        return float(row[0] or 0.0) if row else 0.0
+    except Exception:
+        return 0.0
+
+
+def _sector_for_symbol(symbol: str) -> str:
+    s = str(symbol or "").upper().strip()
+    groups = {
+        "TECH": {"AAPL", "MSFT", "NVDA", "AMD", "AVGO", "QCOM", "ORCL", "INTC", "SMCI", "ARM", "META", "GOOGL", "NFLX"},
+        "FIN": {"JPM", "BAC", "GS", "MS", "V", "MA", "XLF"},
+        "ENERGY": {"XOM", "CVX", "USO"},
+        "HEALTH": {"JNJ", "PFE"},
+        "CONSUMER": {"AMZN", "WMT", "COST", "HD", "RBLX", "UBER"},
+        "CRYPTO_BETA": {"COIN", "MSTR"},
+        "INDEX": {"SPY", "QQQ", "IWM", "XLK"},
+        "METALS": {"GLD", "SLV"},
+    }
+    for sector, names in groups.items():
+        if s in names:
+            return sector
+    return "OTHER"
+
+
+def generate_institutional_stop_loss(
+    *,
+    direction: str,
+    entry_price: float,
+    df_15m,
+    liquidity_levels: dict | None = None,
+    atr_value: float | None = None,
+    min_stop_distance: float | None = None,
+    max_stop_distance: float | None = None,
+) -> tuple[float, str, dict]:
+    """
+    Compute institutional SL candidates and choose the safest one:
+      - ATR-based
+      - volatility-band based (stdev)
+      - structure-based (swing)
+      - liquidity-based (nearest pool beyond price)
+    Enforces min/max distance and returns final stop + reason + details.
+    """
+    entry = float(entry_price)
+    if entry <= 0:
+        return entry, "invalid_entry", {}
+
+    atr = float(atr_value or 0.0)
+    high_vol = bool(atr > 0 and (atr / entry) >= 0.02)
+    atr_mult = ATR_SL_MULT_HIGH_VOL if high_vol else ATR_SL_MULT_LOW_VOL
+    atr_dist = atr * atr_mult if atr > 0 else 0.0
+    if atr_dist <= 0:
+        atr_dist = entry * 0.01
+
+    if direction == "BUY":
+        stop_atr = entry - atr_dist
+    else:
+        stop_atr = entry + atr_dist
+
+    # Volatility band candidate from rolling return std.
+    stop_vol = stop_atr
+    try:
+        close = df_15m["Close"].astype(float)
+        vol = float(close.pct_change().rolling(14).std().iloc[-1])
+        if math.isfinite(vol) and vol > 0:
+            vol_dist = max(entry * vol * VOL_BAND_MULT, entry * 0.0035)
+            stop_vol = (entry - vol_dist) if direction == "BUY" else (entry + vol_dist)
+    except Exception:
+        pass
+
+    # Structure candidate: previous swing low/high
+    stop_structure = stop_atr
+    try:
+        h = df_15m["High"].astype(float)
+        l = df_15m["Low"].astype(float)
+        look = max(5, int(SWING_LOOKBACK_BARS))
+        if direction == "BUY":
+            swing = float(l.tail(look).min())
+            buf = max(entry * 0.0015, atr * 0.15 if atr > 0 else entry * 0.0015)
+            stop_structure = swing - buf
+        else:
+            swing = float(h.tail(look).max())
+            buf = max(entry * 0.0015, atr * 0.15 if atr > 0 else entry * 0.0015)
+            stop_structure = swing + buf
+    except Exception:
+        pass
+
+    # Liquidity candidate: beyond nearest liquidity pool with ATR buffer.
+    stop_liquidity = stop_atr
+    if isinstance(liquidity_levels, dict):
+        lvls = []
+        for k in ("pdh", "pdl", "orh", "orl"):
+            try:
+                v = liquidity_levels.get(k)
+                if v is not None:
+                    fv = float(v)
+                    if math.isfinite(fv):
+                        lvls.append(fv)
+            except Exception:
+                continue
+        if lvls:
+            if direction == "BUY":
+                downside = [x for x in lvls if x < entry]
+                if downside:
+                    nearest = max(downside)
+                    stop_liquidity = nearest - max(entry * 0.001, atr * LIQUIDITY_SL_BUFFER_ATR if atr > 0 else entry * 0.001)
+            else:
+                upside = [x for x in lvls if x > entry]
+                if upside:
+                    nearest = min(upside)
+                    stop_liquidity = nearest + max(entry * 0.001, atr * LIQUIDITY_SL_BUFFER_ATR if atr > 0 else entry * 0.001)
+
+    candidates = {
+        "atr": float(stop_atr),
+        "volatility_band": float(stop_vol),
+        "structure_swing": float(stop_structure),
+        "liquidity": float(stop_liquidity),
+    }
+    # "Safest": most protective against stop hunts (furthest valid stop).
+    if direction == "BUY":
+        selected_reason, selected_stop = min(candidates.items(), key=lambda x: x[1])
+    else:
+        selected_reason, selected_stop = max(candidates.items(), key=lambda x: x[1])
+
+    raw_dist = abs(entry - selected_stop)
+    # Enforce distance floors/ceilings.
+    if min_stop_distance is not None and min_stop_distance > 0 and raw_dist < float(min_stop_distance):
+        selected_stop = (entry - float(min_stop_distance)) if direction == "BUY" else (entry + float(min_stop_distance))
+        selected_reason = f"{selected_reason}+min_distance"
+    if max_stop_distance is not None and max_stop_distance > 0:
+        if abs(entry - selected_stop) > float(max_stop_distance):
+            selected_stop = (entry - float(max_stop_distance)) if direction == "BUY" else (entry + float(max_stop_distance))
+            selected_reason = f"{selected_reason}+max_distance"
+
+    # Risk hard cap by pct (institutional sanity).
+    cap_dist = entry * float(MAX_STOP_LOSS_PCT)
+    if abs(entry - selected_stop) > cap_dist:
+        selected_stop = (entry - cap_dist) if direction == "BUY" else (entry + cap_dist)
+        selected_reason = f"{selected_reason}+risk_cap"
+
+    return float(selected_stop), selected_reason, {
+        "selected_reason": selected_reason,
+        "high_volatility": int(high_vol),
+        "candidates": {k: round(v, 6) for k, v in candidates.items()},
+    }
+
+
 def validate_pre_trade(
     symbol,
     entry_price,
@@ -445,6 +633,7 @@ def validate_pre_trade(
     chat_id: str | None = None,
     current_symbol_exposure: float = 0.0,
     current_total_exposure: float = 0.0,
+    exposure_by_symbol: dict | None = None,
 ) -> tuple[bool, str, dict]:
     """
     Mandatory pre-trade validation.
@@ -477,6 +666,35 @@ def validate_pre_trade(
     stop_loss_pct = stop_dist / entry
     if stop_loss_pct <= 0 or stop_loss_pct >= 0.5:
         return False, "Trade rejected: invalid stop-loss ratio", {}
+    if (stop_loss_pct - float(MAX_STOP_LOSS_PCT)) > 1e-9:
+        return False, "Trade rejected: stop-loss exceeds max risk distance", {
+            "stop_loss_pct": round(stop_loss_pct, 8),
+            "max_stop_loss_pct": float(MAX_STOP_LOSS_PCT),
+        }
+
+    # Trade count constraints
+    if chat_id:
+        trades_today = _get_daily_trade_count(str(chat_id))
+        if trades_today >= int(MAX_TRADES_PER_DAY_RISK):
+            return False, "Trade rejected: max trades per day exceeded", {
+                "max_trades_per_day": int(MAX_TRADES_PER_DAY_RISK),
+                "trades_today": int(trades_today),
+            }
+        sym_trades_today = _daily_symbol_trade_count(str(chat_id), str(symbol))
+        if sym_trades_today >= int(MAX_TRADES_PER_SYMBOL_DAY):
+            return False, "Trade rejected: max trades per symbol exceeded", {
+                "max_trades_per_symbol_day": int(MAX_TRADES_PER_SYMBOL_DAY),
+                "symbol_trades_today": int(sym_trades_today),
+            }
+
+        weekly_pnl = _weekly_pnl(str(chat_id))
+        weekly_dd_pct = (weekly_pnl / bal) * 100.0 if bal > 0 else 0.0
+        if weekly_dd_pct <= -float(WEEKLY_DRAWDOWN_LIMIT):
+            return False, "Trade rejected: max weekly loss exceeded", {
+                "weekly_pnl": round(weekly_pnl, 4),
+                "weekly_drawdown_pct": round(weekly_dd_pct, 4),
+                "weekly_limit_pct": float(WEEKLY_DRAWDOWN_LIMIT),
+            }
 
     proposed_size = float(
         calculate_position_size(
@@ -497,10 +715,18 @@ def validate_pre_trade(
             "free_margin": round(margin_free, 4),
             "position_size": round(proposed_size, 4),
         }
+    remaining_free_margin = margin_free - required_margin
+    min_free_buffer = bal * float(MARGIN_CALL_BUFFER_PCT)
+    if remaining_free_margin < min_free_buffer:
+        return False, "Trade rejected: margin call protection buffer breached", {
+            "remaining_free_margin": round(remaining_free_margin, 4),
+            "min_required_buffer": round(min_free_buffer, 4),
+        }
 
     # Exposure caps: projected notional must stay under symbol/portfolio limits.
     total_limit = max(0.0, bal * lev * float(MAX_TOTAL_EXPOSURE_MULT))
     symbol_limit = max(0.0, total_limit * float(MAX_SYMBOL_EXPOSURE_FRACTION))
+    sector_limit = max(0.0, total_limit * float(MAX_SECTOR_EXPOSURE_FRACTION))
     projected_notional = entry * proposed_size
     projected_symbol = float(current_symbol_exposure) + projected_notional
     projected_total = float(current_total_exposure) + projected_notional
@@ -516,6 +742,24 @@ def validate_pre_trade(
             "total_limit": round(total_limit, 4),
         }
 
+    # Correlated/cluster exposure: sector bucket limit.
+    ex_map = dict(exposure_by_symbol or {})
+    curr_sector = _sector_for_symbol(str(symbol))
+    sector_exposure = 0.0
+    for sym, notion in ex_map.items():
+        try:
+            if _sector_for_symbol(str(sym)) == curr_sector:
+                sector_exposure += float(notion or 0.0)
+        except Exception:
+            continue
+    projected_sector = sector_exposure + projected_notional
+    if sector_limit > 0 and projected_sector > sector_limit:
+        return False, "Trade rejected: correlated exposure limit exceeded", {
+            "sector": curr_sector,
+            "projected_sector_exposure": round(projected_sector, 4),
+            "sector_limit": round(sector_limit, 4),
+        }
+
     return True, "approved", {
         "position_size": round(proposed_size, 4),
         "required_margin": round(required_margin, 4),
@@ -523,4 +767,7 @@ def validate_pre_trade(
         "stop_loss_pct": round(stop_loss_pct, 8),
         "projected_symbol_exposure": round(projected_symbol, 4),
         "projected_total_exposure": round(projected_total, 4),
+        "remaining_free_margin": round(remaining_free_margin, 4),
+        "sector": curr_sector,
+        "projected_sector_exposure": round(projected_sector, 4),
     }
