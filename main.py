@@ -118,6 +118,12 @@ create_db()
 # --- Configuration ---
 ADMIN_CHAT_ID      = os.getenv("ADMIN_CHAT_ID", "")   # admin-only notifications
 
+# Daily log folders (Phase 6 baseline).
+LOG_ROOT = os.getenv("ENGINE_LOG_ROOT", "logs")
+REJECTION_SUPPRESSION_NOTICE_COOLDOWN_SEC = int(
+    os.getenv("REJECTION_SUPPRESSION_NOTICE_COOLDOWN_SEC", "1800")
+)
+
 # --- State ---
 _watchlist          = []
 _last_scan_date     = None
@@ -131,13 +137,9 @@ _last_structural_rejection_sent_at: dict[str, float] = {}
 _last_structural_suppression_notice_at: float = 0.0
 _autotrain_manager: Optional[AutonomousTrainingManager] = None
 _market_open_last_alert_date: str | None = None
-_market_open_state_file = os.path.join(LOG_ROOT, "market_open_state.json")
 
-# Daily log folders (Phase 6 baseline).
-LOG_ROOT = os.getenv("ENGINE_LOG_ROOT", "logs")
-REJECTION_SUPPRESSION_NOTICE_COOLDOWN_SEC = int(
-    os.getenv("REJECTION_SUPPRESSION_NOTICE_COOLDOWN_SEC", "1800")
-)
+# File paths
+_market_open_state_file = os.path.join(LOG_ROOT, "market_open_state.json")
 
 
 def _ensure_daily_log_dir() -> str:
