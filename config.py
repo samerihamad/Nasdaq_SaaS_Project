@@ -31,11 +31,11 @@ WATCHLIST = [
 # ── Mean Reversion Parameters ─────────────────────────────────────────────────
 
 # RSI thresholds for oversold / overbought detection
-MR_RSI_OVERSOLD      = 30      # institutional strict: deeper oversold
-MR_RSI_OVERBOUGHT    = 70      # institutional strict: deeper overbought
+MR_RSI_OVERSOLD      = 35      # institutional strict: deeper oversold
+MR_RSI_OVERBOUGHT    = 65      # institutional strict: deeper overbought
 
 # Required % deviation from VWAP to confirm price is stretched
-MR_VWAP_DEV_PCT      = 2.2
+MR_VWAP_DEV_PCT      = 1.2
 
 # A gap larger than this % on the entry bar flags a "News Trap" → signal skipped
 MR_NEWS_TRAP_GAP_PCT = 2.0
@@ -49,12 +49,12 @@ MR_MIN_SCORE         = 65
 # ── Momentum Parameters ───────────────────────────────────────────────────────
 
 # ADX minimum for a trending market; signals below this are noise
-MOM_ADX_THRESHOLD    = 28
+MOM_ADX_THRESHOLD    = 22
 # ADX above this is considered a very strong trend (boosts score)
 MOM_ADX_STRONG       = 45
 
 # Current bar volume must be ≥ this multiple of the 20-bar average
-MOM_VOL_RATIO        = 2.0
+MOM_VOL_RATIO        = 1.3
 
 # Minimum gap-up or gap-down % to count as a momentum gap signal
 MOM_GAP_PCT          = 1.5
@@ -105,14 +105,14 @@ MIN_CONFIDENCE       = 67.0
 # - New SIGNAL_* values are selected by SIGNAL_PROFILE and can be adopted gradually.
 SIGNAL_PROFILE = os.getenv("SIGNAL_PROFILE", "FAST").strip().upper()  # FAST | GOLDEN
 
-FAST_MIN_CONFIDENCE = float(os.getenv("FAST_MIN_CONFIDENCE", "62.0"))
-GOLDEN_MIN_CONFIDENCE = float(os.getenv("GOLDEN_MIN_CONFIDENCE", "70.0"))
+FAST_MIN_CONFIDENCE = float(os.getenv("FAST_MIN_CONFIDENCE", "55.0"))
+GOLDEN_MIN_CONFIDENCE = float(os.getenv("GOLDEN_MIN_CONFIDENCE", "65.0"))
 
-FAST_MR_MIN_SCORE = int(os.getenv("FAST_MR_MIN_SCORE", "58"))
-GOLDEN_MR_MIN_SCORE = int(os.getenv("GOLDEN_MR_MIN_SCORE", "68"))
+FAST_MR_MIN_SCORE = int(os.getenv("FAST_MR_MIN_SCORE", "52"))
+GOLDEN_MR_MIN_SCORE = int(os.getenv("GOLDEN_MR_MIN_SCORE", "62"))
 
-FAST_MOM_MIN_SCORE = int(os.getenv("FAST_MOM_MIN_SCORE", "62"))
-GOLDEN_MOM_MIN_SCORE = int(os.getenv("GOLDEN_MOM_MIN_SCORE", "72"))
+FAST_MOM_MIN_SCORE = int(os.getenv("FAST_MOM_MIN_SCORE", "55"))
+GOLDEN_MOM_MIN_SCORE = int(os.getenv("GOLDEN_MOM_MIN_SCORE", "65"))
 
 if SIGNAL_PROFILE == "GOLDEN":
     SIGNAL_MIN_CONFIDENCE = GOLDEN_MIN_CONFIDENCE
@@ -160,7 +160,11 @@ LIMIT_ORDER_MEANREV_ATR_OFFSET = float(os.getenv("LIMIT_ORDER_MEANREV_ATR_OFFSET
 LIMIT_ORDER_ALLOW_MARKET_FALLBACK = os.getenv("LIMIT_ORDER_ALLOW_MARKET_FALLBACK", "false").lower() == "true"
 
 # Hard cap on new positions per user per day (independent of circuit breaker)
-MAX_DAILY_TRADES     = 5
+MAX_TRADES_PER_DAY_PER_USER = int(os.getenv("MAX_TRADES_PER_DAY_PER_USER", "15"))
+MAX_DAILY_TRADES = MAX_TRADES_PER_DAY_PER_USER
+
+# Global cap on concurrent open trades.
+GLOBAL_MAX_OPEN_TRADES = int(os.getenv("GLOBAL_MAX_OPEN_TRADES", "10"))
 
 # ── News API (optional — NewsAPI.org) ─────────────────────────────────────────
 
