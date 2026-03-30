@@ -209,11 +209,15 @@ def capital_deal_still_open(
         if res2.status_code == 404 and len(positions) == 0:
             return False
         if res2.status_code == 404 and len(positions) > 0:
+            # If no id/symbol/direction/size match was found in /positions, a 404 on
+            # /positions/{deal_id} is strong evidence this exact deal is no longer open.
+            # Other open rows may exist for different instruments/users, so keep them
+            # untouched while allowing this deal to reconcile to CLOSED.
             print(
-                f"[Capital sync] CONSERVATIVE: detail 404 for deal_id={deal_id} but list non-empty earlier — OPEN",
+                f"[Capital sync] detail 404 with non-matching open list for deal_id={deal_id} — CLOSED",
                 flush=True,
             )
-            return True
+            return False
     except Exception:
         return True
     return False
@@ -268,6 +272,13 @@ def capital_verify_deal_closed_after_close_request(
 
 def _send_pending_close_notice(chat_id, symbol, direction, trade_id):
     try:
+        # Last chance before sending placeholder text: force one quick broker sync.
+        emergency = try_sync_final_for_trade_id(int(trade_id), attempts=1, delay_sec=0.0)
+        if emergency is not None:
+            from core.trade_close_messages import send_bot_automated_close_from_db
+            send_bot_automated_close_from_db(int(trade_id))
+            return
+
         from bot.notifier import send_telegram_message
         lang = get_subscriber_lang(chat_id)
         msg = (
@@ -386,18 +397,56 @@ def fetch_closed_deal_final_data(
         except Exception:
             return None
 
-    def _parse_pnl(tx: dict) -> float | None:
+    def _parse_commission_total(tx: dict) -> float:
+        """
+        Sum known cost fields when provided by broker payload.
+        Returned value is positive (absolute cost in account currency units).
+        """
+        total = 0.0
         for k in (
+            "commission",
+            "commissions",
+            "fee",
+            "fees",
+            "charge",
+            "charges",
+            "spreadCost",
+            "financing",
+            "financingCharge",
+            "rollover",
+            "swap",
+        ):
+            if k in tx and tx.get(k) is not None:
+                v = _parse_float(tx.get(k))
+                if v is not None:
+                    total += abs(float(v))
+        return float(total)
+
+    def _parse_pnl(tx: dict) -> float | None:
+        # Prefer net/realized fields first (already include broker costs).
+        for k in (
+            "netProfitAndLoss",
+            "netPnl",
+            "realisedPnl",
+            "realizedPnl",
             "profitAndLoss",
             "profitAndLossValue",
             "pnl",
-            "realisedPnl",
-            "realizedPnl",
         ):
             if k in tx and tx.get(k) is not None:
                 p = _parse_float(tx.get(k))
                 if p is not None:
-                    return p
+                    return float(p)
+        # Fallback: gross PnL minus explicit costs when present.
+        for k in (
+            "grossProfitAndLoss",
+            "grossPnl",
+            "profitAndLossBeforeCharges",
+        ):
+            if k in tx and tx.get(k) is not None:
+                gross = _parse_float(tx.get(k))
+                if gross is not None:
+                    return float(gross) - _parse_commission_total(tx)
         return None
 
     def _parse_exit_price(tx: dict) -> float | None:
@@ -514,6 +563,141 @@ def fetch_closed_deal_final_data(
     print("Error: Could not sync final data from Capital.com", flush=True)
     print(f"[Capital Sync] transaction not found yet ids={ids}", flush=True)
     return None
+
+
+def try_sync_final_for_trade_id(
+    trade_id: int,
+    *,
+    attempts: int = 3,
+    delay_sec: float = 2.0,
+) -> dict | None:
+    """
+    Emergency one-trade sync:
+    - Build a broker session from subscriber creds
+    - Query Capital history for realized close data
+    - Persist pnl/actual_pnl/exit_price before user-facing notifications
+    """
+    try:
+        tid = int(trade_id)
+    except Exception:
+        return None
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    row = c.execute(
+        "SELECT chat_id, deal_id, COALESCE(deal_reference,''), symbol, direction, "
+        "entry_price, size FROM trades WHERE trade_id=?",
+        (tid,),
+    ).fetchone()
+    if not row:
+        conn.close()
+        return None
+    chat_id, deal_id, deal_reference, symbol, direction, entry_price, size = row
+    if not deal_id:
+        conn.close()
+        return None
+
+    creds = c.execute(
+        "SELECT api_key, api_password, is_demo, email FROM subscribers WHERE chat_id=?",
+        (str(chat_id),),
+    ).fetchone()
+    conn.close()
+    if not creds:
+        return None
+
+    try:
+        from bot.licensing import safe_decrypt
+
+        api_key = str(safe_decrypt(creds[0] or "")).strip()
+        password = str(safe_decrypt(creds[1] or "")).strip()
+        is_demo = bool(creds[2])
+        email = str(safe_decrypt(creds[3] or "")).strip()
+    except Exception:
+        return None
+    if not api_key or not password or not email:
+        return None
+
+    base_url = (
+        "https://demo-api-capital.backend-capital.com/api/v1"
+        if is_demo else
+        "https://api-capital.backend-capital.com/api/v1"
+    )
+    headers = {
+        "X-CAP-API-KEY": api_key,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    try:
+        auth_res = requests.post(
+            f"{base_url}/session",
+            json={"identifier": email, "password": password},
+            headers=headers,
+            timeout=20,
+        )
+        if auth_res.status_code != 200:
+            return None
+        session_headers = {
+            **headers,
+            "CST": auth_res.headers.get("CST"),
+            "X-SECURITY-TOKEN": auth_res.headers.get("X-SECURITY-TOKEN"),
+        }
+    except Exception:
+        return None
+
+    final = None
+    tries = max(1, int(attempts))
+    for idx in range(tries):
+        final = fetch_closed_deal_final_data(
+            base_url,
+            session_headers,
+            str(deal_id),
+            wait_for_realized=False,
+            identifiers=[str(deal_reference).strip()] if str(deal_reference or "").strip() else None,
+        )
+        if final is not None:
+            break
+        if idx < tries - 1:
+            time.sleep(max(0.0, float(delay_sec)))
+    if not final:
+        return None
+
+    pnl_val = float(final.get("actual_pnl", 0.0))
+    exit_price = final.get("exit_price")
+    try:
+        ep = float(entry_price or 0.0)
+        qty = float(size or 0.0)
+        side = 1.0 if str(direction).upper() == "BUY" else -1.0
+    except Exception:
+        ep = 0.0
+        qty = 0.0
+        side = 1.0
+
+    # Fallback calculation when broker returned exit but pnl is still missing/zero.
+    if float(pnl_val) == 0.0 and exit_price is not None and ep > 0 and qty > 0:
+        pnl_val = (float(exit_price) - ep) * qty * side
+
+    conn2 = sqlite3.connect(DB_PATH)
+    conn2.execute(
+        "UPDATE trades SET status='CLOSED', pnl=?, actual_pnl=?, exit_price=COALESCE(?, exit_price), "
+        "sync_status=?, close_sync_last_error=NULL, closed_at=COALESCE(closed_at, ?) "
+        "WHERE trade_id=?",
+        (
+            float(pnl_val),
+            float(pnl_val),
+            float(exit_price) if exit_price is not None else None,
+            SYNCED,
+            _now_utc().isoformat(),
+            int(tid),
+        ),
+    )
+    conn2.commit()
+    conn2.close()
+    print(
+        f"[PROFIT_FIX] Trade {int(tid)} closed at "
+        f"{('n/a' if exit_price is None else float(exit_price))}. Realized PnL: {float(pnl_val):.2f}",
+        flush=True,
+    )
+    return {"actual_pnl": float(pnl_val), "exit_price": exit_price}
 
 
 def reconcile(chat_id, base_url, headers, *, notify: bool = True):

@@ -55,6 +55,39 @@ LOG_ROOT = os.getenv("ENGINE_LOG_ROOT", "logs")
 _REJECTION_NOTIFY_CACHE: dict[str, float] = {}
 
 
+def _fetch_final_close_with_retry(
+    base_url: str,
+    headers: dict,
+    deal_id: str,
+    *,
+    identifiers: list[str] | None = None,
+    attempts: int = 3,
+    delay_sec: float = 2.0,
+) -> dict | None:
+    """
+    Small post-close retry loop for broker history.
+    Keeps notifier DB-first by waiting for closePrice/realizedPnl before messaging.
+    """
+    tries = max(1, int(attempts))
+    for idx in range(tries):
+        final = fetch_closed_deal_final_data(
+            base_url,
+            headers,
+            str(deal_id),
+            wait_for_realized=False,
+            identifiers=identifiers,
+        )
+        if final is not None:
+            exit_price = final.get("exit_price")
+            pnl_val = float(final.get("actual_pnl", 0.0))
+            # Accept immediately when either exit or non-zero pnl is present.
+            if exit_price is not None or pnl_val != 0.0 or idx == tries - 1:
+                return final
+        if idx < tries - 1:
+            time.sleep(max(0.0, float(delay_sec)))
+    return None
+
+
 def _append_daily_exec_log(filename: str, message: str):
     """Write execution-layer events into daily logs/<date>/ files."""
     try:
@@ -1663,12 +1696,13 @@ def monitor_and_close(chat_id):
                     continue
 
                 # Broker-truth sync (realized PnL + exit price) only after verified absence from /positions.
-                final = fetch_closed_deal_final_data(
+                final = _fetch_final_close_with_retry(
                     base_url,
                     headers,
                     str(deal_id),
-                    wait_for_realized=True,
                     identifiers=[str(deal_ref)] if deal_ref else None,
+                    attempts=3,
+                    delay_sec=2.0,
                 )
                 if not final:
                     # History miss: never mark CLOSED if GET /positions still shows this leg.
@@ -1723,6 +1757,20 @@ def monitor_and_close(chat_id):
                     target_reached=target_label,
                     close_reason=stop_label,
                     sync_status="SYNCED",
+                )
+                print(
+                    f"[PROFIT_FIX] Trade {int(trade_id)} closed at "
+                    f"{('n/a' if exit_price is None else float(exit_price))}. "
+                    f"Realized PnL: {float(actual_pnl):.2f}",
+                    flush=True,
+                )
+                _append_daily_exec_log(
+                    "execution_events.txt",
+                    (
+                        f"[PROFIT_FIX] trade_id={int(trade_id)} symbol={symbol} "
+                        f"exit_price={('n/a' if exit_price is None else float(exit_price))} "
+                        f"realized_pnl={float(actual_pnl):.2f}"
+                    ),
                 )
                 after_trade_leg_closed(chat_id, parent_session, actual_pnl)
 

@@ -14,6 +14,61 @@ from database.db_manager import get_subscriber_lang
 DB_PATH = "database/trading_saas.db"
 
 
+def _emergency_refresh_final_close(
+    *,
+    trade_id: int,
+    entry_price: float,
+    exit_price: float | None,
+    size: float,
+    direction: str,
+    pnl: float | None,
+) -> tuple[float | None, float]:
+    """
+    Last-chance refresh before Telegram close message:
+    1) Ask sync layer for broker-final data.
+    2) If still missing, compute fallback pnl from exit-entry.
+    """
+    need_refresh = (
+        exit_price is None
+        or pnl is None
+        or float(pnl) == 0.0
+    )
+    if need_refresh:
+        try:
+            from core.sync import try_sync_final_for_trade_id
+            try_sync_final_for_trade_id(int(trade_id), attempts=1, delay_sec=0.0)
+        except Exception:
+            pass
+
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT exit_price, pnl FROM trades WHERE trade_id=?",
+        (int(trade_id),),
+    ).fetchone()
+    if row:
+        exit_price = float(row[0]) if row[0] is not None else exit_price
+        pnl = float(row[1]) if row[1] is not None else pnl
+
+    # Final fallback formula requested by ops when broker pnl still not present.
+    if (pnl is None or float(pnl) == 0.0) and exit_price is not None and entry_price > 0 and size > 0:
+        side = 1.0 if str(direction).upper() == "BUY" else -1.0
+        pnl_calc = (float(exit_price) - float(entry_price)) * float(size) * side
+        conn.execute(
+            "UPDATE trades SET pnl=?, actual_pnl=COALESCE(actual_pnl, ?), "
+            "exit_price=COALESCE(exit_price, ?) WHERE trade_id=?",
+            (float(pnl_calc), float(pnl_calc), float(exit_price), int(trade_id)),
+        )
+        conn.commit()
+        print(
+            f"[PROFIT_FIX] Trade {int(trade_id)} closed at {float(exit_price)}. "
+            f"Realized PnL: {float(pnl_calc):.2f}",
+            flush=True,
+        )
+        pnl = float(pnl_calc)
+    conn.close()
+    return exit_price, float(pnl or 0.0)
+
+
 def _resolve_stop_distance(
     stop_distance: float | None,
     entry_price: float | None,
@@ -382,15 +437,24 @@ def send_bot_automated_close_from_db(trade_id: int) -> bool:
             )
             > 0
         )
+    exit_price_v, pnl_v = _emergency_refresh_final_close(
+        trade_id=tid,
+        entry_price=float(entry_price or 0.0),
+        exit_price=float(exit_price) if exit_price is not None else None,
+        size=float(size or 0.0),
+        direction=str(direction),
+        pnl=float(pnl) if pnl is not None else None,
+    )
+
     send_bot_automated_close(
         str(chat_id),
         trade_id=tid,
         symbol=str(symbol),
         direction=str(direction),
         entry_price=float(entry_price or 0),
-        exit_price=float(exit_price) if exit_price is not None else None,
+        exit_price=float(exit_price_v) if exit_price_v is not None else None,
         size=float(size or 0),
-        pnl=float(pnl or 0),
+        pnl=float(pnl_v or 0),
         stop_distance=float(stop_distance) if stop_distance is not None else None,
         trailing_stop=float(trailing_stop) if trailing_stop is not None else None,
         stop_label=str(close_reason or "—"),
