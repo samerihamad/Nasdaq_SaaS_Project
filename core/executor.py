@@ -391,7 +391,7 @@ def process_pending_limit_orders():
         creds = get_user_credentials(str(chat_id))
         if not creds:
             continue
-        base_url, headers = get_session(creds)
+        base_url, headers = get_session(creds, chat_id=str(chat_id))
         if not headers:
             continue
         order_epic = resolve_epic_for_user(str(chat_id), str(symbol), base_url=base_url, headers=headers, is_demo=bool(creds[2]))
@@ -471,7 +471,7 @@ def get_user_credentials(chat_id):
     return (safe_decrypt(data[0]), safe_decrypt(data[1]), data[2], safe_decrypt(data[3]))
 
 
-def get_session(creds):
+def get_session(creds, chat_id: str | None = None):
     api_key, password, is_demo, user_email = (
         str(creds[0]).strip(), str(creds[1]).strip(), creds[2], str(creds[3]).strip()
     )
@@ -536,7 +536,7 @@ def get_session(creds):
     )
     _audit_exec_event(
         stage="capital_auth_failed",
-        chat_id=None,
+        chat_id=(str(chat_id).strip() if chat_id is not None else None),
         symbol=None,
         action=None,
         details=f"status={status} is_demo={is_demo} response={err_text[:180]}",
@@ -1015,7 +1015,7 @@ def resolve_epic_for_user(chat_id, symbol, base_url=None, headers=None, is_demo=
         if not creds:
             return None
         is_demo = bool(creds[2])
-        base_url, headers = get_session(creds)
+        base_url, headers = get_session(creds, chat_id=str(chat_id))
         if not headers:
             return None
         local_session = True
@@ -1432,7 +1432,7 @@ def monitor_and_close(chat_id):
     creds = get_user_credentials(chat_id)
     if not creds:
         return False
-    base_url, headers = get_session(creds)
+    base_url, headers = get_session(creds, chat_id=str(chat_id))
     if not headers:
         return False
 
@@ -1781,7 +1781,7 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
         msg = "❌ User not registered"
         _maybe_notify_rejection(chat_id, msg, symbol=symbol, action=action, stage="user_not_registered")
         return msg
-    base_url, headers = get_session(creds)
+    base_url, headers = get_session(creds, chat_id=str(chat_id))
     if not headers:
         msg = "❌ Capital.com authentication failed"
         _maybe_notify_rejection(chat_id, msg, symbol=symbol, action=action, stage="capital_auth_failed")
