@@ -199,6 +199,25 @@ def _log_structural_rejection(symbol: str, strategy: str, reason: str, notified:
         "structural_rejections.txt",
         f"symbol={symbol} strategy={strategy} notified={int(bool(notified))} reason={reason}",
     )
+    # Keep structural rejections auditable in DB without Telegram noise.
+    try:
+        conn = sqlite3.connect("database/trading_saas.db")
+        conn.execute(
+            "INSERT INTO trade_rejections (created_at, chat_id, symbol, action, stage, reason, details) "
+            "VALUES (datetime('now'), ?, ?, ?, ?, ?, ?)",
+            (
+                str(ADMIN_CHAT_ID or "n/a"),
+                str(symbol or ""),
+                "",
+                "structural_filter",
+                str(reason or ""),
+                f"strategy={strategy} notified={int(bool(notified))}",
+            ),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
 
 def _log_ai_gatekeeper(
@@ -1338,36 +1357,14 @@ def run_trading_bot():
                     accepted_signals=accepted_count,
                     ai_blocked=ai_blocked_count,
                 )
-                if rej_suppressed > 0 and ADMIN_CHAT_ID and ENABLE_STRUCTURAL_REJECTION_NOTIFY:
-                    now_ts = time.time()
-                    if (
-                        now_ts - _last_structural_suppression_notice_at
-                        >= float(REJECTION_SUPPRESSION_NOTICE_COOLDOWN_SEC)
-                    ):
-                        try:
-                            lang = _get_user_lang(ADMIN_CHAT_ID)
-                            top_reason, top_count = ("N/A", 0)
-                            if rej_counter:
-                                top_reason, top_count = rej_counter.most_common(1)[0]
-                            if lang == "ar":
-                                send_telegram_message(
-                                    ADMIN_CHAT_ID,
-                                    (
-                                        f"ℹ️ تم كتم {rej_suppressed} إشعار رفض هيكلي متكرر "
-                                        f"(أكثر سبب: {top_reason} × {top_count})."
-                                    ),
-                                )
-                            else:
-                                send_telegram_message(
-                                    ADMIN_CHAT_ID,
-                                    (
-                                        f"ℹ️ Suppressed {rej_suppressed} repeated structural rejection alerts "
-                                        f"(top reason: {top_reason} x{top_count})."
-                                    ),
-                                )
-                            _last_structural_suppression_notice_at = now_ts
-                        except Exception:
-                            pass
+                if rej_suppressed > 0:
+                    top_reason, top_count = ("N/A", 0)
+                    if rej_counter:
+                        top_reason, top_count = rej_counter.most_common(1)[0]
+                    print(
+                        f"[STRUCTURAL] muted_notifications={rej_suppressed} "
+                        f"top_reason={top_reason} x{top_count}"
+                    )
 
         except Exception as e:
             print(f"❌ خطأ في المحرك الرئيسي: {e}")

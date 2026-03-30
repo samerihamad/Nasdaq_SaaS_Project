@@ -127,11 +127,12 @@ def _analyze_ticker(symbol: str) -> dict | None:
     if not signals:
         if structural_rejections:
             best_rej = structural_rejections[0]
-            log.info(
+            log.debug(
                 "[%s] %s rejected by structure: %s",
                 symbol, best_rej["strategy"], best_rej["reason"],
             )
-            return best_rej
+            # Keep structural rejections as internal logs only in this path.
+            return None
         return None
 
     # Pick the signal with the highest score; filter by confidence
