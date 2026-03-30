@@ -15,8 +15,11 @@ They stay active until they hit TP or SL.
 import os
 import sqlite3
 import math
+import requests
 from bot.notifier import send_telegram_message
+from bot.licensing import safe_decrypt
 from utils.market_hours import utc_today
+from config import MAX_DAILY_TRADES, GLOBAL_MAX_OPEN_TRADES, MAX_DAILY_LOSS_PCT
 from database.db_manager import (
     is_master_kill_switch, get_user_kill_switch, get_user_risk_params,
     get_preferred_leverage, set_trading_enabled,
@@ -36,14 +39,14 @@ MIN_CONF, MAX_CONF = 70.0, 100.0
 MIN_RISK, MAX_RISK = 1.0,  2.0
 
 # Institutional risk controls
-DAILY_DRAWDOWN_LIMIT = 5.0   # % drawdown from session start → hard stop
+DAILY_DRAWDOWN_LIMIT = float(MAX_DAILY_LOSS_PCT)   # % drawdown from session start → hard stop
 WEEKLY_DRAWDOWN_LIMIT = float(os.getenv("WEEKLY_DRAWDOWN_LIMIT", "10.0"))
 MIN_RR_RATIO         = 2.0   # minimum reward:risk required (1:2)
 MAX_SYMBOL_EXPOSURE_FRACTION = float(os.getenv("MAX_SYMBOL_EXPOSURE_FRACTION", "0.35"))
 MAX_SECTOR_EXPOSURE_FRACTION = float(os.getenv("MAX_SECTOR_EXPOSURE_FRACTION", "0.55"))
 MAX_TOTAL_EXPOSURE_MULT = float(os.getenv("MAX_TOTAL_EXPOSURE_MULT", "1.00"))
 MAX_TRADES_PER_SYMBOL_DAY = int(os.getenv("MAX_TRADES_PER_SYMBOL_DAY", "2"))
-MAX_TRADES_PER_DAY_RISK = int(os.getenv("MAX_TRADES_PER_DAY_RISK", "5"))
+MAX_TRADES_PER_DAY_RISK = int(os.getenv("MAX_TRADES_PER_DAY_RISK", str(MAX_DAILY_TRADES)))
 MARGIN_CALL_BUFFER_PCT = float(os.getenv("MARGIN_CALL_BUFFER_PCT", "0.15"))
 MAX_STOP_LOSS_PCT = float(os.getenv("MAX_STOP_LOSS_PCT", "0.06"))
 ATR_SL_MULT_LOW_VOL = float(os.getenv("ATR_SL_MULT_LOW_VOL", "2.2"))
@@ -127,6 +130,83 @@ def _get_daily_trade_count(chat_id: str) -> int:
     return row[0] if row else 0
 
 
+def _get_global_open_trades_count() -> int:
+    """Count currently open positions across all users."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM trades WHERE status='OPEN'")
+    row = c.fetchone()
+    conn.close()
+    return int(row[0] or 0) if row else 0
+
+
+def _get_live_balance(chat_id: str) -> float | None:
+    """
+    Fetch live account equity/balance from Capital.com for daily loss guard.
+    Returns None when balance cannot be resolved.
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            "SELECT api_key, api_password, is_demo, email FROM subscribers WHERE chat_id=?",
+            (str(chat_id),),
+        )
+        row = c.fetchone()
+        conn.close()
+        if not row:
+            return None
+
+        api_key = safe_decrypt(row[0] or "")
+        password = safe_decrypt(row[1] or "")
+        is_demo = bool(row[2])
+        email = safe_decrypt(row[3] or "")
+        if not api_key or not password or not email:
+            return None
+
+        base_url = (
+            "https://demo-api-capital.backend-capital.com/api/v1"
+            if is_demo else
+            "https://api-capital.backend-capital.com/api/v1"
+        )
+        headers = {
+            "X-CAP-API-KEY": str(api_key).strip(),
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        auth = requests.post(
+            f"{base_url}/session",
+            json={"identifier": str(email).strip(), "password": str(password).strip()},
+            headers=headers,
+            timeout=20,
+        )
+        if auth.status_code != 200:
+            return None
+
+        session_headers = {
+            **headers,
+            "CST": auth.headers.get("CST"),
+            "X-SECURITY-TOKEN": auth.headers.get("X-SECURITY-TOKEN"),
+        }
+        acc_res = requests.get(f"{base_url}/accounts", headers=session_headers, timeout=20)
+        if acc_res.status_code != 200:
+            return None
+        accounts = (acc_res.json() or {}).get("accounts", []) or []
+        if not accounts:
+            return None
+        acc = accounts[0] or {}
+        bal = acc.get("balance", {}) or {}
+        equity = bal.get("equity", acc.get("equity"))
+        if isinstance(equity, (int, float)) and equity > 0:
+            return float(equity)
+        balance = bal.get("balance", acc.get("balance"))
+        if isinstance(balance, (int, float)) and balance > 0:
+            return float(balance)
+        return None
+    except Exception:
+        return None
+
+
 def can_open_trade(chat_id):
     """
     Returns (allowed: bool, reason: str).
@@ -146,15 +226,40 @@ def can_open_trade(chat_id):
 
     # ── 3. Circuit Breaker / Hard Block ───────────────────────────────────────
     state = get_risk_state(chat_id)
-    if state in (STATE_NORMAL, STATE_MANUAL_OVERRIDE):
-        return True, state
     if state == STATE_USER_DAY_HALT:
         return False, "Full-day halt active — resume from dashboard to trade again"
     if state == STATE_CIRCUIT_BREAKER:
         return False, "Circuit Breaker active — awaiting your Telegram approval"
     if state == STATE_HARD_BLOCK:
         return False, "Hard Block active — lifts automatically at next trading day open"
-    return False, "Unknown risk state"
+    if state not in (STATE_NORMAL, STATE_MANUAL_OVERRIDE):
+        return False, "Unknown risk state"
+
+    # ── 4. Per-user max daily trade count ─────────────────────────────────────
+    trades_today = _get_daily_trade_count(str(chat_id))
+    if trades_today >= int(MAX_DAILY_TRADES):
+        return False, f"Max daily trades reached ({trades_today}/{int(MAX_DAILY_TRADES)})"
+
+    # ── 5. Global max open positions ──────────────────────────────────────────
+    open_positions = _get_global_open_trades_count()
+    if open_positions >= int(GLOBAL_MAX_OPEN_TRADES):
+        return False, (
+            f"Global max open trades reached "
+            f"({open_positions}/{int(GLOBAL_MAX_OPEN_TRADES)})"
+        )
+
+    # ── 6. Daily realized loss % guard ────────────────────────────────────────
+    live_balance = _get_live_balance(str(chat_id))
+    if live_balance and live_balance > 0:
+        daily_pnl = get_daily_pnl(str(chat_id))
+        daily_loss_pct = abs(float(daily_pnl)) / float(live_balance) * 100 if daily_pnl < 0 else 0.0
+        if daily_loss_pct >= float(MAX_DAILY_LOSS_PCT):
+            return False, (
+                f"Max daily loss reached ({daily_loss_pct:.2f}% / "
+                f"{float(MAX_DAILY_LOSS_PCT):.2f}%)"
+            )
+
+    return True, state
 
 
 # ── Trade outcome recording ───────────────────────────────────────────────────

@@ -94,6 +94,9 @@ TP2_MIN_DISTANCE_BUFFER_MULT = 1.05
 # reduce the chance of an exact-entry stop due to rounding/ticks.
 BE_LOCK_BUFFER_PCT = 0.0005  # 0.05% beyond entry (per direction)
 
+# Default risk budget per trade in percent (used by high-level risk policies).
+RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "0.5"))
+
 # ── Signal Quality Gate ───────────────────────────────────────────────────────
 
 # Signals with confidence below this are discarded before risk checks
@@ -164,7 +167,10 @@ MAX_TRADES_PER_DAY_PER_USER = int(os.getenv("MAX_TRADES_PER_DAY_PER_USER", "15")
 MAX_DAILY_TRADES = MAX_TRADES_PER_DAY_PER_USER
 
 # Global cap on concurrent open trades.
-GLOBAL_MAX_OPEN_TRADES = int(os.getenv("GLOBAL_MAX_OPEN_TRADES", "10"))
+GLOBAL_MAX_OPEN_TRADES = int(os.getenv("GLOBAL_MAX_OPEN_TRADES", "7"))
+
+# Hard stop: if realized daily loss exceeds this % of live equity, block entries.
+MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "3.0"))
 
 # ── News API (optional — NewsAPI.org) ─────────────────────────────────────────
 
