@@ -10,7 +10,7 @@ from config import EARNINGS_TIMEOUT_SEC, EARNINGS_CACHE_TTL_SEC, FMP_API_KEY
 log = logging.getLogger(__name__)
 
 # --- Thresholds ---
-MIN_AVG_VOLUME       = 1_000_000      # 1M shares/day
+MIN_AVG_VOLUME       = 600_000        # 600k shares/day (40% lower to admit more mid-caps)
 MIN_MARKET_CAP       = 300_000_000    # $300M
 MAX_GAP_PCT          = 0.02           # 2% max gap
 EARNINGS_BUFFER_DAYS = 2              # exclude if earnings within 2 days
@@ -18,10 +18,9 @@ EARNINGS_BUFFER_DAYS = 2              # exclude if earnings within 2 days
 # ── Level 3 — Price / Daily Range filter ─────────────────────────────────
 # Goal: prefer "cheap" tickers with controlled intraday movement.
 # We estimate daily movement using (High - Low) / Close.
-MIN_PRICE            = 0.50          # $0.50 minimum
-MAX_PRICE            = 30.0          # $30 maximum (tune as needed)
-MIN_DAILY_RANGE_PCT = 0.50          # 0.5%
-MAX_DAILY_RANGE_PCT = 2.00          # 2.0%
+MIN_PRICE            = 5.00          # $5 minimum
+MIN_DAILY_RANGE_PCT = 0.20          # 0.2%
+MAX_DAILY_RANGE_PCT = 5.00          # 5.0%
 DAILY_RANGE_LOOKBACK_DAYS = 3         # average over last N sessions
 
 # Module-level cache: populated by get_nasdaq_tickers() when screener API works.
@@ -507,7 +506,7 @@ def level3_filter(tickers: list[str]) -> list[str]:
     Level 3 — Price & Daily Range filter.
 
     Keeps tickers where:
-      - Last close price within [MIN_PRICE, MAX_PRICE]
+      - Last close price >= MIN_PRICE (no upper cap)
       - Average daily range (High-Low)/Close over last N days in
         [MIN_DAILY_RANGE_PCT, MAX_DAILY_RANGE_PCT]
       - Last day's daily range is also within the same band
@@ -515,7 +514,7 @@ def level3_filter(tickers: list[str]) -> list[str]:
     This aims to select stocks that are liquid yet not extremely volatile,
     so targets/SL distances behave more predictably.
     """
-    print(f"📊 المستوى 3: تصفية {len(tickers)} سهم (سعر رخيص + حركة يومية 0.5%-2%)...")
+    print(f"📊 المستوى 3: تصفية {len(tickers)} سهم (نطاق حركة 0.2%-5%)...")
     if not tickers:
         return []
 
@@ -536,7 +535,7 @@ def level3_filter(tickers: list[str]) -> list[str]:
             close_last = float(last["Close"]) if last["Close"] is not None else 0.0
             if close_last <= 0:
                 return False
-            if not (MIN_PRICE <= close_last <= MAX_PRICE):
+            if close_last < MIN_PRICE:
                 return False
 
             tail = hist.tail(DAILY_RANGE_LOOKBACK_DAYS)
