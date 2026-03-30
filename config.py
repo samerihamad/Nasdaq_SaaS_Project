@@ -261,3 +261,34 @@ MARKET_DATA_CAPITAL_API_KEY = os.getenv("MARKET_DATA_CAPITAL_API_KEY", "").strip
 MARKET_DATA_CAPITAL_EMAIL = os.getenv("MARKET_DATA_CAPITAL_EMAIL", "").strip()
 MARKET_DATA_CAPITAL_PASSWORD = os.getenv("MARKET_DATA_CAPITAL_PASSWORD", "").strip()
 MARKET_DATA_CAPITAL_IS_DEMO = os.getenv("MARKET_DATA_CAPITAL_IS_DEMO", "").strip().lower()
+
+# ── Autonomous AI training (Phase AUTONOMY) ───────────────────────────────────
+# Master switch: keeps current production behavior unchanged unless enabled.
+ENABLE_AUTONOMOUS_TRAINING = os.getenv("ENABLE_AUTONOMOUS_TRAINING", "false").lower() == "true"
+
+# Scheduler settings (UTC): daily + weekly cron-like triggers.
+ENABLE_AUTONOMOUS_SCHEDULED_TRAINING = (
+    os.getenv("ENABLE_AUTONOMOUS_SCHEDULED_TRAINING", "true").lower() == "true"
+)
+AUTOTRAIN_SCHEDULER_POLL_SEC = int(os.getenv("AUTOTRAIN_SCHEDULER_POLL_SEC", "60"))
+AUTOTRAIN_DAILY_UTC_HOUR = int(os.getenv("AUTOTRAIN_DAILY_UTC_HOUR", "2"))
+AUTOTRAIN_DAILY_UTC_MINUTE = int(os.getenv("AUTOTRAIN_DAILY_UTC_MINUTE", "15"))
+AUTOTRAIN_WEEKLY_DAY = os.getenv("AUTOTRAIN_WEEKLY_DAY", "sun").strip().lower()  # mon..sun
+AUTOTRAIN_WEEKLY_UTC_HOUR = int(os.getenv("AUTOTRAIN_WEEKLY_UTC_HOUR", "3"))
+AUTOTRAIN_WEEKLY_UTC_MINUTE = int(os.getenv("AUTOTRAIN_WEEKLY_UTC_MINUTE", "30"))
+
+# Job sizing / cadence.
+AUTOTRAIN_MAX_SYMBOLS_PER_RUN = int(os.getenv("AUTOTRAIN_MAX_SYMBOLS_PER_RUN", "20"))
+AUTOTRAIN_EPOCHS = int(os.getenv("AUTOTRAIN_EPOCHS", "20"))
+AUTOTRAIN_AUTO_MAX_MODEL_AGE_HOURS = float(os.getenv("AUTOTRAIN_AUTO_MAX_MODEL_AGE_HOURS", "168"))
+
+# Self-learning loop from closed trade outcomes.
+ENABLE_AUTONOMOUS_SELF_LEARNING = os.getenv("ENABLE_AUTONOMOUS_SELF_LEARNING", "true").lower() == "true"
+AUTOTRAIN_SELF_LEARNING_INTERVAL_SEC = int(os.getenv("AUTOTRAIN_SELF_LEARNING_INTERVAL_SEC", "21600"))
+AUTOTRAIN_SELF_LEARNING_MIN_SAMPLES = int(os.getenv("AUTOTRAIN_SELF_LEARNING_MIN_SAMPLES", "25"))
+AUTOTRAIN_SELF_LEARNING_SYMBOLS_PER_RUN = int(os.getenv("AUTOTRAIN_SELF_LEARNING_SYMBOLS_PER_RUN", "6"))
+AUTOTRAIN_SELF_LEARNING_EPOCHS = int(os.getenv("AUTOTRAIN_SELF_LEARNING_EPOCHS", "10"))
+
+# Observability.
+AUTOTRAIN_NOTIFY_ADMIN = os.getenv("AUTOTRAIN_NOTIFY_ADMIN", "true").lower() == "true"
+AUTOTRAIN_LOG_ROOT = os.getenv("AUTOTRAIN_LOG_ROOT", "logs/ai_training")

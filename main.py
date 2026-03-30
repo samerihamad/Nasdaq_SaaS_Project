@@ -31,6 +31,7 @@ from utils.ai_model import (
     validate_signal,
     AI_PROBABILITY_THRESHOLD,
 )
+from utils.autonomous_training import AutonomousTrainingManager
 from utils.market_hours import get_market_status, minutes_to_open, STATUS_OPEN, STATUS_CLOSED
 from utils.daily_report import send_daily_reports
 from core.executor import place_trade_for_user, monitor_and_close, process_pending_limit_orders
@@ -71,6 +72,7 @@ from config import (
     ENABLE_STRUCTURAL_REJECTION_NOTIFY,
     STRUCTURAL_REJECTION_NOTIFY_COOLDOWN_SEC,
     STRUCTURAL_REJECTION_NOTIFY_MAX_PER_CYCLE,
+    ENABLE_AUTONOMOUS_TRAINING,
 )
 
 # ── Single-instance lock ──────────────────────────────────────────────────────
@@ -119,6 +121,7 @@ _last_watchlist_refresh_at = None  # UTC datetime of last in-session refresh
 _unsupported_all_day: set[str] = set()  # symbols unsupported for all users today
 _last_structural_rejection_sent_at: dict[str, float] = {}
 _last_structural_suppression_notice_at: float = 0.0
+_autotrain_manager: Optional[AutonomousTrainingManager] = None
 
 # Daily log folders (Phase 6 baseline).
 LOG_ROOT = os.getenv("ENGINE_LOG_ROOT", "logs")
@@ -361,6 +364,7 @@ def _limit_order_worker_loop():
 
 
 def _start_background_threads():
+    global _autotrain_manager
     for target, name in [
         (_heartbeat_loop,       "heartbeat"),
         (_backup_loop,          "backup"),
@@ -370,6 +374,14 @@ def _start_background_threads():
         t = threading.Thread(target=target, name=name, daemon=True)
         t.start()
         print(f"   Thread '{name}' started.")
+    if _autotrain_manager is None:
+        _autotrain_manager = AutonomousTrainingManager(
+            admin_chat_id=ADMIN_CHAT_ID,
+            watchlist_provider=lambda: list(_watchlist),
+        )
+        _autotrain_manager.start()
+        if ENABLE_AUTONOMOUS_TRAINING:
+            print("   Thread 'autonomous-training-scheduler' started.")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -511,10 +523,21 @@ def run_daily_scan():
 
 
 def pretrain_models(watchlist):
+    global _autotrain_manager
     print(f"\n🤖 تجهيز نماذج RF لـ {len(watchlist)} سهم...")
+    if _autotrain_manager is not None:
+        try:
+            _autotrain_manager.update_watchlist(list(watchlist or []))
+        except Exception:
+            pass
     for i, symbol in enumerate(watchlist, 1):
         print(f"   [{i}/{len(watchlist)}] {symbol}", end="\r")
-        load_or_train_model(symbol)
+        # Warm all inference timeframes to avoid first-signal latency spikes.
+        for tf in ("1d", "4h", "15m"):
+            try:
+                load_or_train_model(symbol, timeframe=tf)
+            except Exception:
+                pass
     print(f"\n✅ جميع النماذج جاهزة.")
     print("=" * 55)
 

@@ -32,6 +32,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from utils.autonomous_training import load_autonomous_training_status
 
 load_dotenv()
 
@@ -229,6 +230,7 @@ def ai_runtime_status():
         "latest_ai_log": ai_line,
         "latest_structural_rejection_log": rej_line,
         "top_rejection_reasons_24h": _top_rejection_reasons(limit=8),
+        "autonomous_training": load_autonomous_training_status(),
     }
 
 
