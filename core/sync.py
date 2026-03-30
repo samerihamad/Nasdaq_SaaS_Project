@@ -355,7 +355,8 @@ def mark_trade_closed_pending(
     if changed:
         conn.commit()
     conn.close()
-    if changed and notify:
+    # User-facing "pending sync" close notices are optional and disabled by default.
+    if changed and notify and ENABLE_CLOSE_PENDING_NOTIFY:
         _send_pending_close_notice(chat_id, symbol, direction, trade_id)
     return changed
 
