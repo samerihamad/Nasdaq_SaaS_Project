@@ -215,7 +215,7 @@ AI_MIN_PROB_MEANREV = float(os.getenv("AI_MIN_PROB_MEANREV", "64.0"))
 # is below the per-strategy threshold (override is intentionally harder to reach).
 AI_SOFT_OVERRIDE_CONFIDENCE = float(os.getenv("AI_SOFT_OVERRIDE_CONFIDENCE", "63.0"))
 AI_SOFT_OVERRIDE_MIN_PROB = float(os.getenv("AI_SOFT_OVERRIDE_MIN_PROB", "40.0"))
-ENABLE_AI_SOFT_OVERRIDE = os.getenv("ENABLE_AI_SOFT_OVERRIDE", "false").lower() == "true"
+ENABLE_AI_SOFT_OVERRIDE = os.getenv("ENABLE_AI_SOFT_OVERRIDE", "true").lower() == "true"
 
 # Optional AI feature: market-structure score blending.
 # When enabled, validate_signal() adjusts blended probability by:
