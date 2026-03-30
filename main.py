@@ -24,7 +24,7 @@ from typing import Optional
 
 from database.db_manager import create_db, is_maintenance_mode
 from utils.filters import get_nasdaq_tickers, level1_filter, level2_filter, level3_filter
-from utils.market_scanner import scan_multi_timeframe
+from utils.market_scanner import scan_multi_timeframe, scan_market
 from utils.ai_model import (
     analyze_multi_timeframe,
     load_or_train_model,
@@ -412,6 +412,64 @@ def _market_open_alert_loop():
     Checks every 30 seconds and enforces one alert per New York trading date.
     """
     global _market_open_last_alert_date
+
+    def _fmt_float(v: float | None, digits: int = 2) -> str:
+        if v is None:
+            return "N/A"
+        try:
+            return f"{float(v):.{int(digits)}f}"
+        except Exception:
+            return "N/A"
+
+    def _compute_open_snapshot(now_utc: datetime) -> dict:
+        out = {
+            "spy_open": None,
+            "gap_pct": None,
+            "gap_dir_en": "Flat",
+            "gap_dir_ar": "محايد",
+            "premarket_summary_en": "N/A",
+            "premarket_summary_ar": "غير متاح",
+        }
+        try:
+            d1 = scan_market("SPY", period="5d", interval="1d")
+            if d1 is not None and len(d1) >= 2:
+                prev_close = float(d1["Close"].iloc[-2])
+                curr_open = float(d1["Open"].iloc[-1])
+                out["spy_open"] = curr_open
+                if prev_close > 0:
+                    gp = ((curr_open - prev_close) / prev_close) * 100.0
+                    out["gap_pct"] = gp
+                    if gp > 0.02:
+                        out["gap_dir_en"] = "Up"
+                        out["gap_dir_ar"] = "صاعد"
+                    elif gp < -0.02:
+                        out["gap_dir_en"] = "Down"
+                        out["gap_dir_ar"] = "هابط"
+
+            m15 = scan_market("SPY", period="1d", interval="15m")
+            if m15 is not None and not m15.empty:
+                w = m15.copy()
+                idx = w.index
+                if getattr(idx, "tz", None) is None:
+                    idx = idx.tz_localize(timezone.utc)
+                else:
+                    idx = idx.tz_convert(timezone.utc)
+                w.index = idx.tz_convert(ET)
+                pm = w.between_time("09:00", "09:29")
+                if not pm.empty:
+                    pm_h = float(pm["High"].max())
+                    pm_l = float(pm["Low"].min())
+                    pm_v = float(pm["Volume"].sum())
+                    out["premarket_summary_en"] = (
+                        f"Range {pm_l:.2f}-{pm_h:.2f} | Vol {pm_v:,.0f}"
+                    )
+                    out["premarket_summary_ar"] = (
+                        f"المدى {pm_l:.2f}-{pm_h:.2f} | الحجم {pm_v:,.0f}"
+                    )
+        except Exception as exc:
+            _append_market_open_log(f"snapshot_error={exc}")
+        return out
+
     if _market_open_last_alert_date is None:
         _market_open_last_alert_date = _load_market_open_last_alert_date()
     while True:
@@ -425,16 +483,66 @@ def _market_open_alert_loop():
                 and 0 <= now_ny.second < 60
             )
             if is_open_tick and _market_open_last_alert_date != ny_date:
-                msg = "🚀 Market Open — NYSE/NASDAQ just opened."
+                tz_map = get_current_timezones(now_utc)
+                snapshot = _compute_open_snapshot(now_utc)
+                ny_clock = now_utc.astimezone(ET).strftime("%Y-%m-%d %H:%M:%S ET")
+                dubai_clock = tz_map.get("dubai", "")
+                watchlist_size = len(_watchlist)
+                spy_open_txt = _fmt_float(snapshot.get("spy_open"), 2)
+                gap_pct_val = snapshot.get("gap_pct")
+                gap_pct_txt = _fmt_float(gap_pct_val, 2)
+                lang = os.getenv("ADMIN_LANG", "ar").strip().lower()
+
+                english_template = (
+                    "🚀 Market Open — NYSE/NASDAQ just opened.\n"
+                    "🕘 New York time: {ny_time}\n"
+                    "🕓 Dubai time: {dubai_time}\n"
+                    "📈 SPY price at open: {spy_open}\n"
+                    "📊 Gap: {gap_dir} ({gap_pct}%)\n"
+                    "🧾 Watchlist size: {watchlist_size}\n"
+                    "🌅 Pre-market summary: {premarket_summary}\n"
+                    "— NATB v2.0"
+                )
+                arabic_template = (
+                    "🚀 افتتاح السوق — NYSE/NASDAQ بدأ الآن.\n"
+                    "🕘 توقيت نيويورك: {ny_time}\n"
+                    "🕓 توقيت دبي: {dubai_time}\n"
+                    "📈 سعر SPY عند الافتتاح: {spy_open}\n"
+                    "📊 الفجوة: {gap_dir} ({gap_pct}%)\n"
+                    "🧾 حجم قائمة المراقبة: {watchlist_size}\n"
+                    "🌅 ملخص ما قبل الافتتاح: {premarket_summary}\n"
+                    "— NATB v2.0"
+                )
+
+                if lang == "en":
+                    msg = english_template.format(
+                        ny_time=ny_clock,
+                        dubai_time=dubai_clock,
+                        spy_open=spy_open_txt,
+                        gap_dir=snapshot.get("gap_dir_en", "Flat"),
+                        gap_pct=gap_pct_txt,
+                        watchlist_size=watchlist_size,
+                        premarket_summary=snapshot.get("premarket_summary_en", "N/A"),
+                    )
+                else:
+                    msg = arabic_template.format(
+                        ny_time=ny_clock,
+                        dubai_time=dubai_clock,
+                        spy_open=spy_open_txt,
+                        gap_dir=snapshot.get("gap_dir_ar", "محايد"),
+                        gap_pct=gap_pct_txt,
+                        watchlist_size=watchlist_size,
+                        premarket_summary=snapshot.get("premarket_summary_ar", "غير متاح"),
+                    )
                 if ADMIN_CHAT_ID:
                     try:
                         send_telegram_message(ADMIN_CHAT_ID, msg)
                     except Exception as exc:
                         _append_market_open_log(f"notify_error={exc}")
-                tz_map = get_current_timezones(now_utc)
                 _append_market_open_log(
-                    f"alert_sent=1 ny_date={ny_date} utc={tz_map.get('utc')} "
-                    f"new_york={tz_map.get('new_york')} dubai={tz_map.get('dubai')}"
+                    f"alert_sent=1 ny_date={ny_date} lang={('en' if lang == 'en' else 'ar')} "
+                    f"utc={tz_map.get('utc')} new_york={tz_map.get('new_york')} dubai={tz_map.get('dubai')}\n"
+                    f"{msg}"
                 )
                 _market_open_last_alert_date = ny_date
                 _save_market_open_last_alert_date(ny_date)
