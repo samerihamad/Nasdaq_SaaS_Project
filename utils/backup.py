@@ -55,7 +55,18 @@ def _load_project_env() -> None:
         from dotenv import load_dotenv
     except ImportError:
         return
-    load_dotenv(PROJECT_ROOT / '.env')
+    # Keep explicit shell overrides (e.g., GDRIVE_OAUTH_CONSOLE=1 command prefix)
+    # while still normalizing the rest from project .env.
+    preserve_keys = (
+        "GDRIVE_OAUTH_CONSOLE",
+        "GDRIVE_OAUTH_CLIENT_JSON",
+        "GDRIVE_OAUTH_TOKEN_JSON",
+        "GDRIVE_AUTH",
+    )
+    preserved = {k: os.environ.get(k) for k in preserve_keys if os.environ.get(k) is not None}
+    load_dotenv(PROJECT_ROOT / '.env', override=True)
+    for k, v in preserved.items():
+        os.environ[k] = v
 
 
 def _gdrive_oauth_use_console() -> bool:
