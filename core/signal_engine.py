@@ -17,9 +17,9 @@ Never places a trade without passing can_open_trade().
 import logging
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date
 from typing import Any
 
+from utils.market_hours import utc_today
 from config import (
     WATCHLIST,
     MIN_CONFIDENCE,
@@ -62,7 +62,7 @@ def _get_active_subscribers() -> list[str]:
 def _daily_trade_count(chat_id: str) -> int:
     """Count positions opened today for this user."""
     try:
-        today = str(date.today())
+        today = str(utc_today())
         conn  = sqlite3.connect(DB_PATH)
         c     = conn.cursor()
         c.execute(

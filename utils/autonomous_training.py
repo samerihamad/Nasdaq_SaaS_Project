@@ -58,6 +58,18 @@ def _utc_iso(ts: Optional[datetime] = None) -> str:
     return t.replace(microsecond=0).isoformat()
 
 
+def _parse_iso_utc(ts: str | None) -> datetime | None:
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(ts))
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def _safe_float(value, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -436,7 +448,9 @@ class AutonomousTrainingManager:
         due = True
         if last_ts:
             try:
-                last_dt = datetime.fromisoformat(last_ts)
+                last_dt = _parse_iso_utc(last_ts)
+                if last_dt is None:
+                    raise ValueError("invalid last_finetune_at")
                 due = (_utc_now() - last_dt).total_seconds() >= int(AUTOTRAIN_SELF_LEARNING_INTERVAL_SEC)
             except Exception:
                 due = True
@@ -494,7 +508,10 @@ class AutonomousTrainingManager:
                 oldest_hours = float(AUTOTRAIN_AUTO_MAX_MODEL_AGE_HOURS) + 1.0
                 break
             try:
-                age_h = (now - datetime.fromisoformat(ts)).total_seconds() / 3600.0
+                dt = _parse_iso_utc(ts)
+                if dt is None:
+                    raise ValueError("invalid promoted_at")
+                age_h = (now - dt).total_seconds() / 3600.0
                 oldest_hours = max(oldest_hours, age_h)
             except Exception:
                 oldest_hours = float(AUTOTRAIN_AUTO_MAX_MODEL_AGE_HOURS) + 1.0

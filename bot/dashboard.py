@@ -61,7 +61,7 @@ from utils.market_hours import (
     get_market_status,
     STATUS_OPEN, STATUS_PRE_MARKET, STATUS_AFTER_HRS,
     market_open_in_uae, market_close_in_uae, next_market_open_in_uae,
-    uae_offset_hours,
+    uae_offset_hours, utc_today,
 )
 
 load_dotenv()
@@ -548,7 +548,7 @@ def _can_cancel_subscription(chat_id: str) -> bool:
     start = infer_subscription_start(chat_id)
     if not start:
         return False
-    return (date.today() - start).days <= 30
+    return (utc_today() - start).days <= 30
 
 
 def _settings_menu_keyboard(lang: str, chat_id: str):
@@ -1178,7 +1178,8 @@ async def _handle_approve_payment(query, chat_id: str, user_chat_id: str):
     days = int(SUBSCRIPTION_DAYS)
 
     license_key = generate_license_key()
-    expiry = str(date.today() + timedelta(days=days))
+    today_utc = utc_today()
+    expiry = str(today_utc + timedelta(days=days))
 
     conn = _db()
     conn.execute(
@@ -1186,7 +1187,7 @@ async def _handle_approve_payment(query, chat_id: str, user_chat_id: str):
            SET license_key=?, expiry_date=?, payment_status='APPROVED',
                subscription_started_at=?
            WHERE chat_id=?""",
-        (license_key, expiry, str(date.today()), user_chat_id)
+        (license_key, expiry, str(today_utc), user_chat_id)
     )
     conn.commit()
     conn.close()

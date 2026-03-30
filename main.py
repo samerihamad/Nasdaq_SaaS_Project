@@ -18,7 +18,7 @@ import time
 import sqlite3
 import threading
 import traceback
-from datetime import datetime, date, timezone
+from datetime import datetime, timezone
 from collections import Counter
 from typing import Optional
 
@@ -32,7 +32,14 @@ from utils.ai_model import (
     AI_PROBABILITY_THRESHOLD,
 )
 from utils.autonomous_training import AutonomousTrainingManager
-from utils.market_hours import get_market_status, minutes_to_open, STATUS_OPEN, STATUS_CLOSED
+from utils.market_hours import (
+    get_market_status,
+    minutes_to_open,
+    STATUS_OPEN,
+    STATUS_CLOSED,
+    utc_today,
+    get_current_timezones,
+)
 from utils.daily_report import send_daily_reports
 from core.executor import place_trade_for_user, monitor_and_close, process_pending_limit_orders
 from core.watcher import run_watcher, get_all_active_subscribers, get_trading_subscribers
@@ -132,7 +139,7 @@ REJECTION_SUPPRESSION_NOTICE_COOLDOWN_SEC = int(
 
 def _ensure_daily_log_dir() -> str:
     """Create daily log directory and return its path."""
-    day_dir = os.path.join(LOG_ROOT, datetime.now().strftime("%Y-%m-%d"))
+    day_dir = os.path.join(LOG_ROOT, datetime.now(timezone.utc).strftime("%Y-%m-%d"))
     os.makedirs(day_dir, exist_ok=True)
     return day_dir
 
@@ -224,7 +231,7 @@ def _heartbeat_loop():
     while True:
         try:
             with open(HEARTBEAT_FILE, 'w') as f:
-                json.dump({'timestamp': datetime.now().isoformat()}, f)
+                json.dump({'timestamp': datetime.now(timezone.utc).isoformat()}, f)
         except Exception as e:
             print(f"[HEARTBEAT] write error: {e}")
         time.sleep(HEARTBEAT_INTERVAL)
@@ -448,7 +455,7 @@ def _is_license_valid_for_user(chat_id: str) -> bool:
     if payment_status != 'APPROVED' or not expiry_date:
         return False
     try:
-        return date.fromisoformat(expiry_date) >= date.today()
+        return datetime.fromisoformat(f"{expiry_date}T00:00:00+00:00").date() >= utc_today()
     except Exception:
         return False
 
@@ -485,7 +492,7 @@ def _auto_resume_trading_at_open():
 
 def run_daily_scan():
     print("=" * 55)
-    print(f"🌅 المسح اليومي الشامل — {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"🌅 المسح اليومي الشامل — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 
     tickers = get_nasdaq_tickers()
     if not tickers:
@@ -567,7 +574,7 @@ def send_premarket_alert(watchlist_count: int):
         except Exception:
             pass
 
-    _premarket_sent = date.today()
+    _premarket_sent = utc_today()
     print("Pre-market alert sent to all subscribers (localized).")
 
 
@@ -894,6 +901,19 @@ def run_trading_bot():
     print(f"   الثقة الدنيا: {active_min_conf}% | فحص كل {CHECK_INTERVAL}s")
     print("-" * 55)
 
+    # Timezone snapshot for runtime auditability.
+    try:
+        tz_map = get_current_timezones()
+        _append_daily_log(
+            "timezone_snapshot.txt",
+            (
+                f"utc={tz_map.get('utc')} dubai={tz_map.get('dubai')} "
+                f"new_york={tz_map.get('new_york')} ny_dst={int(bool(tz_map.get('new_york_is_dst')))}"
+            ),
+        )
+    except Exception:
+        pass
+
     # Telegram health ping (helps detect missing token / blocked bot early)
     try:
         if not ADMIN_CHAT_ID:
@@ -912,8 +932,22 @@ def run_trading_bot():
     while True:
         try:
             now_utc       = datetime.now(timezone.utc)
-            today         = date.today()
+            today         = utc_today()
             market_status = get_market_status()
+
+            if _prev_market_status is not None and _prev_market_status != market_status:
+                try:
+                    tz_map = get_current_timezones(now_utc)
+                    _append_daily_log(
+                        "timezone_snapshot.txt",
+                        (
+                            f"event=market_status_change from={_prev_market_status} to={market_status} "
+                            f"utc={tz_map.get('utc')} dubai={tz_map.get('dubai')} "
+                            f"new_york={tz_map.get('new_york')} ny_dst={int(bool(tz_map.get('new_york_is_dst')))}"
+                        ),
+                    )
+                except Exception:
+                    pass
 
             # ── Detect OPEN → CLOSED transition → send daily report ───────────
             if _prev_market_status == STATUS_OPEN and market_status != STATUS_OPEN:

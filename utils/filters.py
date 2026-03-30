@@ -2,7 +2,7 @@ import logging
 import requests
 import pandas as pd
 from io import StringIO
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from utils.market_scanner import scan_market
 from config import EARNINGS_TIMEOUT_SEC, EARNINGS_CACHE_TTL_SEC, FMP_API_KEY
@@ -161,7 +161,7 @@ def _get_near_earnings_symbols(today, earnings_cutoff) -> set[str]:
     Cached list of symbols reporting earnings in [today, cutoff].
     """
     cache_key = f"{today.isoformat()}::{earnings_cutoff.isoformat()}"
-    now_ts = datetime.utcnow().timestamp()
+    now_ts = datetime.now(timezone.utc).timestamp()
     cached = _earnings_cache.get(cache_key)
     if cached and float(cached.get("expires_at", 0.0)) > now_ts:
         return set(cached.get("symbols") or set())
@@ -467,7 +467,7 @@ def level2_filter(tickers: list[str]) -> list[str]:
     On provider failure, it safely degrades to pass-through.
     """
     print(f"📊 المستوى 2: تصفية {len(tickers)} سهم (أخبار وفجوات)...")
-    today           = datetime.now().date()
+    today           = datetime.now(timezone.utc).date()
     earnings_cutoff = today + timedelta(days=EARNINGS_BUFFER_DAYS)
 
     # ── Step 1: gap check via provider daily bars ─────────────────────────────

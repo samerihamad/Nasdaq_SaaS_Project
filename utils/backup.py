@@ -176,7 +176,7 @@ def create_encrypted_snapshot() -> Path:
             f"Database not found: {DB_PATH} (run the app once from project root or run create_db())"
         )
 
-    timestamp   = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    timestamp   = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d_%H%M%S')
     raw_path    = BACKUP_DIR / f"natb_{timestamp}.db"
     enc_path    = BACKUP_DIR / f"natb_{timestamp}.db.enc"
 
@@ -483,7 +483,7 @@ def run_backup() -> bool:
 
     admin_id = os.getenv('ADMIN_CHAT_ID', '')
     provider = _resolve_backup_provider()
-    now_str  = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
+    now_str  = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
 
     # Skip if not configured rather than crash
     if not os.getenv('ENCRYPTION_KEY'):

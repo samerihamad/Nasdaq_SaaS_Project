@@ -15,8 +15,8 @@ They stay active until they hit TP or SL.
 import os
 import sqlite3
 import math
-from datetime import date
 from bot.notifier import send_telegram_message
+from utils.market_hours import utc_today
 from database.db_manager import (
     is_master_kill_switch, get_user_kill_switch, get_user_risk_params,
     get_preferred_leverage, set_trading_enabled,
@@ -82,7 +82,7 @@ def _get_or_reset_state(cursor, chat_id):
     Return today's state row for chat_id.
     Automatically resets to NORMAL at the start of each new trading day.
     """
-    today = str(date.today())
+    today = str(utc_today())
     cursor.execute(
         "SELECT date, consecutive_losses, state FROM daily_risk_state WHERE chat_id=?",
         (chat_id,)
@@ -115,7 +115,7 @@ def get_risk_state(chat_id):
 
 def _get_daily_trade_count(chat_id: str) -> int:
     """Count trades opened today for this user."""
-    today = str(date.today())
+    today = str(utc_today())
     conn  = sqlite3.connect(DB_PATH)
     c     = conn.cursor()
     c.execute(
@@ -355,7 +355,7 @@ def calculate_position_size(balance: float, confidence: float,
 def get_daily_pnl(chat_id: str) -> float:
     """Sum of today's closed P&L in dollar terms."""
     try:
-        today = str(date.today())
+        today = str(utc_today())
         conn  = sqlite3.connect(DB_PATH)
         c     = conn.cursor()
         c.execute(
@@ -447,7 +447,7 @@ def check_rr_ratio(entry: float, stop: float, direction: str,
 
 def _daily_symbol_trade_count(chat_id: str, symbol: str) -> int:
     try:
-        today = str(date.today())
+        today = str(utc_today())
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute(

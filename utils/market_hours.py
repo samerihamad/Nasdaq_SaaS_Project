@@ -40,7 +40,7 @@ UAE = pytz.timezone('Asia/Dubai')         # GST = UTC+4, no DST ever
 
 MARKET_OPEN   = time(9,  30)   # 09:30 ET
 MARKET_CLOSE  = time(16,  0)   # 16:00 ET
-PRE_MKT_OPEN  = time(4,   0)   # 04:00 ET
+PRE_MKT_OPEN  = time(9,   0)   # 09:00 ET
 AH_CLOSE      = time(20,  0)   # 20:00 ET
 
 # ── Status constants ──────────────────────────────────────────────────────────
@@ -70,9 +70,43 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def utc_today() -> datetime.date:
+    """Current UTC calendar date."""
+    return utc_now().date()
+
+
 def now_uae() -> datetime:
     """Current wall-clock time in Dubai (GST, UTC+4)."""
     return datetime.now(UAE)
+
+
+def _to_aware_utc(dt: datetime | None) -> datetime:
+    if dt is None:
+        return utc_now()
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def get_current_timezones(now: datetime | None = None) -> dict:
+    """
+    Return current time snapshot in UTC, Dubai, and New York.
+    Includes NY DST status and UTC offsets.
+    """
+    base_utc = _to_aware_utc(now)
+    now_ny = base_utc.astimezone(ET)
+    now_dubai = base_utc.astimezone(UAE)
+    return {
+        "utc": base_utc.isoformat(),
+        "dubai": now_dubai.isoformat(),
+        "new_york": now_ny.isoformat(),
+        "new_york_is_dst": bool(now_ny.dst()),
+        "offset_hours": {
+            "utc": 0,
+            "dubai": int(now_dubai.utcoffset().total_seconds() // 3600),
+            "new_york": int(now_ny.utcoffset().total_seconds() // 3600),
+        },
+    }
 
 
 # ── DST diagnostics ───────────────────────────────────────────────────────────
@@ -178,6 +212,24 @@ def get_market_status() -> str:
     return STATUS_CLOSED
 
 
+def session_windows_utc(now: datetime | None = None) -> dict:
+    """
+    Session windows for the ET trading day expressed in UTC (DST-aware).
+    """
+    now_et = _to_aware_utc(now).astimezone(ET)
+    d = now_et.date()
+    pre_open_et = ET.localize(datetime(d.year, d.month, d.day, PRE_MKT_OPEN.hour, PRE_MKT_OPEN.minute))
+    regular_open_et = ET.localize(datetime(d.year, d.month, d.day, MARKET_OPEN.hour, MARKET_OPEN.minute))
+    regular_close_et = ET.localize(datetime(d.year, d.month, d.day, MARKET_CLOSE.hour, MARKET_CLOSE.minute))
+    ah_close_et = ET.localize(datetime(d.year, d.month, d.day, AH_CLOSE.hour, AH_CLOSE.minute))
+    return {
+        "pre_market_open_utc": pre_open_et.astimezone(timezone.utc),
+        "regular_open_utc": regular_open_et.astimezone(timezone.utc),
+        "regular_close_utc": regular_close_et.astimezone(timezone.utc),
+        "after_hours_close_utc": ah_close_et.astimezone(timezone.utc),
+    }
+
+
 def is_market_open() -> bool:
     return get_market_status() == STATUS_OPEN
 
@@ -207,15 +259,9 @@ def minutes_to_open() -> int:
     return max(0, int(delta.total_seconds() / 60))
 
 
-# ── Strict UTC session gatekeeper (requested) ─────────────────────────────────
-#
-# This is a hard safety guard for US equities execution:
-# - Do not even attempt broker API calls outside the UTC window below.
-# - Also enforce a "closing transition" cutoff to avoid POST_MARKET edge cases.
-
-US_CASH_UTC_OPEN = time(13, 30)     # 13:30 UTC
-US_CASH_UTC_CLOSE = time(20, 0)     # 20:00 UTC
-US_CASH_UTC_CUTOFF = time(19, 55)   # Do not send new orders at/after 19:55 UTC
+# ── Strict UTC session gatekeeper (dynamic from ET windows) ───────────────────
+# This guard is computed from ET windows each day so NY DST is always respected.
+US_CASH_ORDER_CUTOFF_MINUTES = 5  # block new orders in final N minutes of RTH
 
 
 def utc_time_now() -> time:
@@ -225,16 +271,20 @@ def utc_time_now() -> time:
 
 def is_within_us_cash_session_utc(now: datetime | None = None) -> tuple[bool, str]:
     """
-    Strict guard: only allow trading between 13:30 and 20:00 UTC.
-    Stop-condition: block at/after 19:55 UTC.
+    Strict guard for regular session only:
+      - allow only during 09:30–16:00 ET converted to UTC dynamically (DST-aware)
+      - block at/after final cutoff (default: last 5 minutes of regular session)
 
     Returns (allowed, reason_code).
     """
-    n = now or datetime.now(timezone.utc)
-    t = n.time()
+    n = _to_aware_utc(now)
+    windows = session_windows_utc(n)
+    open_utc = windows["regular_open_utc"]
+    close_utc = windows["regular_close_utc"]
+    cutoff_utc = close_utc - timedelta(minutes=int(US_CASH_ORDER_CUTOFF_MINUTES))
 
-    if t >= US_CASH_UTC_CUTOFF:
-        return False, "CUTOFF_19_55_UTC"
-    if US_CASH_UTC_OPEN <= t < US_CASH_UTC_CLOSE:
+    if n >= cutoff_utc:
+        return False, "CUTOFF_BEFORE_REGULAR_CLOSE_UTC"
+    if open_utc <= n < close_utc:
         return True, "OK"
-    return False, "OUTSIDE_13_30_20_00_UTC"
+    return False, "OUTSIDE_REGULAR_SESSION_UTC"

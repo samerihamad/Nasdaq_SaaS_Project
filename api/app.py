@@ -25,7 +25,7 @@ Install:
 
 import os
 import sqlite3
-from datetime import date, datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -33,6 +33,7 @@ from fastapi import FastAPI, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from utils.autonomous_training import load_autonomous_training_status
+from utils.market_hours import utc_today
 
 load_dotenv()
 
@@ -86,7 +87,7 @@ def _set_setting(key: str, value: str):
 
 
 def _today_log_dir() -> str:
-    return os.path.join(LOG_ROOT, datetime.now().strftime("%Y-%m-%d"))
+    return os.path.join(LOG_ROOT, datetime.now(timezone.utc).strftime("%Y-%m-%d"))
 
 
 def _read_last_nonempty_line(path: str) -> str:
@@ -321,7 +322,7 @@ def user_status(chat_id: str):
     c.execute(
         "SELECT COUNT(*), SUM(pnl) FROM trades "
         "WHERE chat_id=? AND status='CLOSED' AND DATE(closed_at)=?",
-        (chat_id, str(date.today())),
+        (chat_id, str(utc_today())),
     )
     today_r = c.fetchone()
 

@@ -58,7 +58,7 @@ _REJECTION_NOTIFY_CACHE: dict[str, float] = {}
 def _append_daily_exec_log(filename: str, message: str):
     """Write execution-layer events into daily logs/<date>/ files."""
     try:
-        day_dir = os.path.join(LOG_ROOT, datetime.now().strftime("%Y-%m-%d"))
+        day_dir = os.path.join(LOG_ROOT, datetime.now(timezone.utc).strftime("%Y-%m-%d"))
         os.makedirs(day_dir, exist_ok=True)
         path = os.path.join(day_dir, filename)
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -657,7 +657,7 @@ def _get_current_price(base_url, headers, epic):
 
 
 def _epic_cache_key(chat_id, is_demo):
-    day = datetime.utcnow().strftime('%Y-%m-%d')
+    day = datetime.now(timezone.utc).strftime('%Y-%m-%d')
     return f"{chat_id}|{'DEMO' if is_demo else 'LIVE'}|{day}"
 
 
@@ -670,7 +670,7 @@ def _get_cache_bucket(chat_id, is_demo):
 
 def _prune_old_epic_cache():
     """Keep only today's cache buckets."""
-    today = datetime.utcnow().strftime('%Y-%m-%d')
+    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
     stale = [k for k in _EPIC_CACHE.keys() if not k.endswith(f"|{today}")]
     for k in stale:
         _EPIC_CACHE.pop(k, None)

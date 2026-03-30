@@ -18,6 +18,7 @@ import secrets
 import sqlite3
 from datetime import date, timedelta
 from cryptography.fernet import Fernet, InvalidToken
+from utils.market_hours import utc_today
 
 DB_PATH = 'database/trading_saas.db'
 
@@ -75,12 +76,13 @@ def issue_license(chat_id: str, days: int = 30) -> str:
     Returns the license key.
     """
     key    = generate_license_key()
-    expiry = str(date.today() + timedelta(days=days))
+    base_day = utc_today()
+    expiry = str(base_day + timedelta(days=days))
 
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         "UPDATE subscribers SET license_key=?, expiry_date=?, subscription_started_at=? WHERE chat_id=?",
-        (key, expiry, str(date.today()), chat_id)
+        (key, expiry, str(base_day), chat_id)
     )
     conn.commit()
     conn.close()
@@ -107,7 +109,7 @@ def validate_license_key(input_key: str) -> tuple[str | None, str | None]:
         return None, None
 
     chat_id, expiry_str = row
-    if expiry_str and date.fromisoformat(expiry_str) < date.today():
+    if expiry_str and date.fromisoformat(expiry_str) < utc_today():
         return None, None   # expired
 
     return chat_id, expiry_str
@@ -131,7 +133,7 @@ def check_license(chat_id: str) -> tuple[bool, int | None]:
         return False, None
 
     expiry = date.fromisoformat(row[0])
-    today  = date.today()
+    today  = utc_today()
     if expiry < today:
         return False, 0
 

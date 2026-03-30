@@ -19,6 +19,7 @@ import requests
 import re
 import time
 from datetime import datetime as _dt
+from datetime import timezone
 
 from core.trade_session_finalize import after_trade_leg_closed
 from core.trade_close_messages import (
@@ -28,6 +29,7 @@ from core.trade_close_messages import (
 )
 from database.db_manager import get_subscriber_lang
 from config import FINAL_SYNC_FALLBACK_ENABLED
+from utils.market_hours import utc_now
 
 DB_PATH = 'database/trading_saas.db'
 ENABLE_CLOSE_PENDING_NOTIFY = (os.getenv("ENABLE_CLOSE_PENDING_NOTIFY", "false").strip().lower() == "true")
@@ -86,6 +88,22 @@ def _capital_deal_id_from_row(p: dict) -> str | None:
     """First available id (legacy callers)."""
     ids = _capital_all_ids_from_row(p)
     return next(iter(ids)) if ids else None
+
+
+def _now_utc() -> _dt:
+    return utc_now()
+
+
+def _parse_iso_utc(value: str | None) -> _dt | None:
+    if not value:
+        return None
+    try:
+        dt = _dt.fromisoformat(str(value))
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def _capital_row_matches_symbol_direction_size(
@@ -314,7 +332,7 @@ def mark_trade_closed_pending(
         "deal_reference=COALESCE(NULLIF(?,''), deal_reference), close_sync_notified=1 "
         "WHERE trade_id=? AND status='OPEN'",
         (
-            _dt.now().isoformat(),
+            _now_utc().isoformat(),
             PENDING_FINAL,
             str(reason),
             "pending_final_sync",
@@ -594,8 +612,10 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
                 continue
             if close_sync_last_try_at:
                 try:
-                    last_try = _dt.fromisoformat(str(close_sync_last_try_at))
-                    delta = (_dt.now() - last_try).total_seconds()
+                    last_try = _parse_iso_utc(str(close_sync_last_try_at))
+                    if last_try is None:
+                        raise ValueError("invalid close_sync_last_try_at")
+                    delta = (_now_utc() - last_try).total_seconds()
                     if delta < max(1, SYNC_RETRY_COOLDOWN_SEC):
                         continue
                 except Exception:
@@ -604,7 +624,7 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
             c.execute(
                 "UPDATE trades SET close_sync_attempts=COALESCE(close_sync_attempts,0)+1, "
                 "close_sync_last_try_at=? WHERE trade_id=? AND status='OPEN'",
-                (_dt.now().isoformat(), int(trade_id)),
+                (_now_utc().isoformat(), int(trade_id)),
             )
             conn.commit()
 
@@ -657,7 +677,7 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
                     pnl,
                     pnl,
                     float(exit_price) if exit_price is not None else None,
-                    _dt.now().isoformat(),
+                    _now_utc().isoformat(),
                     SYNCED,
                     trade_id,
                 ),
@@ -861,15 +881,17 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
             continue
         if close_sync_last_try_at:
             try:
-                last_try = _dt.fromisoformat(str(close_sync_last_try_at))
-                if (_dt.now() - last_try).total_seconds() < max(1, SYNC_RETRY_COOLDOWN_SEC):
+                last_try = _parse_iso_utc(str(close_sync_last_try_at))
+                if last_try is None:
+                    raise ValueError("invalid close_sync_last_try_at")
+                if (_now_utc() - last_try).total_seconds() < max(1, SYNC_RETRY_COOLDOWN_SEC):
                     continue
             except Exception:
                 pass
         c.execute(
             "UPDATE trades SET close_sync_attempts=COALESCE(close_sync_attempts,0)+1, close_sync_last_try_at=? "
             "WHERE trade_id=?",
-            (_dt.now().isoformat(), int(trade_id)),
+            (_now_utc().isoformat(), int(trade_id)),
         )
         conn.commit()
 

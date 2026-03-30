@@ -1,5 +1,6 @@
 import sqlite3
 from datetime import date, timedelta
+from utils.market_hours import utc_today
 
 DB_PATH = 'database/trading_saas.db'
 
@@ -522,7 +523,7 @@ def set_subscription_started_today(chat_id: str):
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         "UPDATE subscribers SET subscription_started_at=? WHERE chat_id=?",
-        (str(date.today()), str(chat_id)),
+        (str(utc_today()), str(chat_id)),
     )
     conn.commit()
     conn.close()

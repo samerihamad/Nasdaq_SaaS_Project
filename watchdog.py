@@ -19,7 +19,7 @@ import sys
 import time
 import json
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -42,7 +42,10 @@ def _read_heartbeat() -> datetime | None:
     try:
         with open(HEARTBEAT_FILE, 'r') as f:
             data = json.load(f)
-        return datetime.fromisoformat(data['timestamp'])
+        hb = datetime.fromisoformat(str(data['timestamp']))
+        if hb.tzinfo is None:
+            return hb.replace(tzinfo=timezone.utc)
+        return hb.astimezone(timezone.utc)
     except Exception:
         return None
 
@@ -86,7 +89,7 @@ def run():
     while True:
         try:
             last_hb  = _read_heartbeat()
-            now      = datetime.now()
+            now      = datetime.now(timezone.utc)
             silence  = (now - last_hb).total_seconds() if last_hb else float('inf')
             now_ts   = time.time()
 
@@ -102,7 +105,7 @@ def run():
                         f"🚨 *Server Down! Subscribers at risk*\n\n"
                         f"آخر نشاط مسجّل: `{last_seen}`\n"
                         f"مدة التوقف: *{int(silence)} ثانية*\n"
-                        f"الوقت الحالي: `{now.strftime('%Y-%m-%d %H:%M:%S')}`\n\n"
+                        f"الوقت الحالي UTC: `{now.strftime('%Y-%m-%d %H:%M:%S')}`\n\n"
                         f"الصفقات المفتوحة ليست تحت مراقبة المحرك."
                     )
                     _last_alert_time = now_ts

@@ -49,7 +49,7 @@ _TF_CONFIG = {
 def _append_data_quality_log(symbol: str, timeframe: str, status: str, details: str):
     """Append per-symbol/timeframe data quality logs into daily folder."""
     try:
-        day_dir = os.path.join(_LOG_ROOT, datetime.now().strftime("%Y-%m-%d"))
+        day_dir = os.path.join(_LOG_ROOT, datetime.now(timezone.utc).strftime("%Y-%m-%d"))
         os.makedirs(day_dir, exist_ok=True)
         path = os.path.join(day_dir, "data_quality.txt")
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -233,7 +233,8 @@ def _parse_capital_ohlcv(payload: dict) -> pd.DataFrame | None:
     if not rows:
         return None
     df = pd.DataFrame(rows)
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    # Force UTC-aware parsing so downstream frames are timezone-safe.
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce", utc=True)
     df = df.dropna(subset=["Date"])
     if df.empty:
         return None
@@ -251,7 +252,7 @@ def _clean_ohlcv(
     Normalize and clean data:
     - NaN / invalid OHLC rows
     - duplicate timestamps
-    - timezone normalization to UTC-naive
+    - timezone normalization to UTC-aware
     - basic gap diagnostics
     """
     if df is None or df.empty:
@@ -272,7 +273,6 @@ def _clean_ohlcv(
     else:
         work.index = work.index.tz_convert("UTC")
     work = work[~work.index.isna()]
-    work.index = work.index.tz_localize(None)
 
     dup_count = int(work.index.duplicated(keep="last").sum())
     if dup_count:

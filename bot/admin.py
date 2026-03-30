@@ -251,7 +251,7 @@ def _build_ai_runtime_panel() -> str:
     - deep inference state
     - latest cycle/telemetry summary from daily logs
     """
-    day_dir = os.path.join(LOG_ROOT, datetime.now().strftime("%Y-%m-%d"))
+    day_dir = os.path.join(LOG_ROOT, datetime.now(timezone.utc).strftime("%Y-%m-%d"))
     cycle_last = _read_last_log_line(os.path.join(day_dir, "engine_cycle.txt"))
     ai_last = _read_last_log_line(os.path.join(day_dir, "ai_telemetry.txt"))
     rej_last = _read_last_log_line(os.path.join(day_dir, "structural_rejections.txt"))

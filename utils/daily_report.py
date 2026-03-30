@@ -13,9 +13,9 @@ Report includes:
 import sqlite3
 import requests
 from collections import defaultdict
-from datetime import date
 
 from bot.notifier import send_telegram_message
+from utils.market_hours import utc_today
 
 DB_PATH = 'database/trading_saas.db'
 
@@ -141,7 +141,7 @@ def _fetch_open_positions(chat_id: str) -> list[dict]:
 # ── Report builder ────────────────────────────────────────────────────────────
 
 def build_report(chat_id: str, lang: str) -> str:
-    today_str = str(date.today())
+    today_str = str(utc_today())
     lines     = [_t('title', lang, date=today_str)]
 
     # ── Closed trades today ───────────────────────────────────────────────────
