@@ -39,6 +39,7 @@ from utils.market_hours import (
     STATUS_CLOSED,
     utc_today,
     get_current_timezones,
+    ET,
 )
 from utils.daily_report import send_daily_reports
 from core.executor import place_trade_for_user, monitor_and_close, process_pending_limit_orders
@@ -129,6 +130,8 @@ _unsupported_all_day: set[str] = set()  # symbols unsupported for all users toda
 _last_structural_rejection_sent_at: dict[str, float] = {}
 _last_structural_suppression_notice_at: float = 0.0
 _autotrain_manager: Optional[AutonomousTrainingManager] = None
+_market_open_last_alert_date: str | None = None
+_market_open_state_file = os.path.join(LOG_ROOT, "market_open_state.json")
 
 # Daily log folders (Phase 6 baseline).
 LOG_ROOT = os.getenv("ENGINE_LOG_ROOT", "logs")
@@ -154,6 +157,39 @@ def _append_daily_log(filename: str, message: str):
             f.write(f"[{ts}] {message}\n")
     except Exception as exc:
         print(f"[LOG] Failed writing {filename}: {exc}")
+
+
+def _append_market_open_log(message: str):
+    """Append market-open alert entries into logs/market_open.log."""
+    try:
+        os.makedirs(LOG_ROOT, exist_ok=True)
+        path = os.path.join(LOG_ROOT, "market_open.log")
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {message}\n")
+    except Exception as exc:
+        print(f"[MARKET OPEN LOG] write failed: {exc}")
+
+
+def _load_market_open_last_alert_date() -> str | None:
+    try:
+        if not os.path.exists(_market_open_state_file):
+            return None
+        with open(_market_open_state_file, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+        val = str(data.get("last_alert_date") or "").strip()
+        return val or None
+    except Exception:
+        return None
+
+
+def _save_market_open_last_alert_date(ny_date: str):
+    try:
+        os.makedirs(LOG_ROOT, exist_ok=True)
+        with open(_market_open_state_file, "w", encoding="utf-8") as f:
+            json.dump({"last_alert_date": str(ny_date)}, f)
+    except Exception as exc:
+        _append_market_open_log(f"state_write_error={exc}")
 
 
 def _log_structural_rejection(symbol: str, strategy: str, reason: str, notified: bool = False):
@@ -370,6 +406,43 @@ def _limit_order_worker_loop():
         time.sleep(5)
 
 
+def _market_open_alert_loop():
+    """
+    Daemon loop: sends one admin alert exactly at NYSE/NASDAQ regular open (09:30 ET).
+    Checks every 30 seconds and enforces one alert per New York trading date.
+    """
+    global _market_open_last_alert_date
+    if _market_open_last_alert_date is None:
+        _market_open_last_alert_date = _load_market_open_last_alert_date()
+    while True:
+        try:
+            now_utc = datetime.now(timezone.utc)
+            now_ny = now_utc.astimezone(ET)
+            ny_date = now_ny.date().isoformat()
+            is_open_tick = (
+                now_ny.hour == 9
+                and now_ny.minute == 30
+                and 0 <= now_ny.second < 60
+            )
+            if is_open_tick and _market_open_last_alert_date != ny_date:
+                msg = "🚀 Market Open — NYSE/NASDAQ just opened."
+                if ADMIN_CHAT_ID:
+                    try:
+                        send_telegram_message(ADMIN_CHAT_ID, msg)
+                    except Exception as exc:
+                        _append_market_open_log(f"notify_error={exc}")
+                tz_map = get_current_timezones(now_utc)
+                _append_market_open_log(
+                    f"alert_sent=1 ny_date={ny_date} utc={tz_map.get('utc')} "
+                    f"new_york={tz_map.get('new_york')} dubai={tz_map.get('dubai')}"
+                )
+                _market_open_last_alert_date = ny_date
+                _save_market_open_last_alert_date(ny_date)
+        except Exception as exc:
+            _append_market_open_log(f"loop_error={exc}")
+        time.sleep(30)
+
+
 def _start_background_threads():
     global _autotrain_manager
     for target, name in [
@@ -377,6 +450,7 @@ def _start_background_threads():
         (_backup_loop,          "backup"),
         (_hybrid_approval_loop, "hybrid-approvals"),
         (_limit_order_worker_loop, "limit-orders"),
+        (_market_open_alert_loop, "market-open-alert"),
     ]:
         t = threading.Thread(target=target, name=name, daemon=True)
         t.start()
