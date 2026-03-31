@@ -17,6 +17,7 @@ import os
 import sqlite3
 import requests
 import re
+import threading
 import time
 from datetime import datetime as _dt
 from datetime import timezone
@@ -36,8 +37,16 @@ ENABLE_CLOSE_PENDING_NOTIFY = (os.getenv("ENABLE_CLOSE_PENDING_NOTIFY", "false")
 SYNC_RETRY_COOLDOWN_SEC = int(os.getenv("CLOSE_SYNC_RETRY_COOLDOWN_SEC", "30"))
 SYNC_MAX_ATTEMPTS = int(os.getenv("CLOSE_SYNC_MAX_ATTEMPTS", "120"))
 PENDING_FINAL = "PENDING_FINAL"
+# New canonical: waiting for broker history (preferred on write).
+PENDING_SYNC = "PENDING_SYNC"
 SYNCED = "SYNCED"
 FINALIZED_NO_PNL = "FINALIZED_NO_PNL"
+
+# Final close history sync: wall-clock budget and exponential-style backoff (seconds).
+FINAL_SYNC_MAX_WALL_SEC = float(os.getenv("FINAL_SYNC_MAX_WALL_SEC", "300"))
+# Per monitoring-cycle reconcile: avoid blocking the whole loop for the full budget.
+RECONCILE_FINAL_SYNC_WALL_SEC = float(os.getenv("RECONCILE_FINAL_SYNC_WALL_SEC", "60"))
+FINAL_SYNC_BACKOFF_SEC = [5.0, 15.0, 30.0, 60.0]
 
 # After DELETE / manual close, poll /positions before trusting "closed" (2s, 5s, 10s gaps in fetch_closed_deal_final_data).
 VERIFY_CLOSE_MAX_POLLS = int(os.getenv("VERIFY_CLOSE_MAX_POLLS", "10"))
@@ -344,7 +353,7 @@ def mark_trade_closed_pending(
         "WHERE trade_id=? AND status='OPEN'",
         (
             _now_utc().isoformat(),
-            PENDING_FINAL,
+            PENDING_SYNC,
             str(reason),
             "pending_final_sync",
             str(deal_reference or "").strip(),
@@ -369,6 +378,8 @@ def fetch_closed_deal_final_data(
     wait_for_realized: bool = True,
     identifiers: list[str] | None = None,
     lookback_max: int = 2000,
+    max_wall_sec: float | None = None,
+    quiet: bool = True,
 ) -> dict | None:
     """
     Fetch broker-truth final close data for a dealId from Capital.com history.
@@ -376,9 +387,9 @@ def fetch_closed_deal_final_data(
     Returns dict:
       { 'actual_pnl': float, 'exit_price': float|None }
 
-    Stop-condition:
-    - If history endpoint fails or the deal cannot be found (after retries),
-      return None and the caller MUST stop the close/report sequence.
+    Retries with exponential-style backoff (5s, 15s, 30s, 60s, then 60s) until
+    max_wall_sec (default FINAL_SYNC_MAX_WALL_SEC, e.g. 300s). Intermediate errors
+    are logged only if quiet=False; final failure is always logged.
 
     Important:
     - We do NOT calculate PnL manually. We only read realized PnL from broker history.
@@ -480,9 +491,9 @@ def fetch_closed_deal_final_data(
             return False, [], int(res.status_code), txt[:300]
         return True, (res.json() or {}).get("transactions", []) or [], int(res.status_code), ""
 
-    # Capital history can lag after close. Retry with 2s, 5s, 10s (then 10s) between attempts.
-    attempts = 12 if wait_for_realized else 3
-    post_fail_delays = [2.0, 5.0, 10.0]
+    wall = float(max_wall_sec) if max_wall_sec is not None else float(FINAL_SYNC_MAX_WALL_SEC)
+    if not wait_for_realized:
+        wall = min(wall, 45.0)
 
     ids = [str(deal_id)]
     if identifiers:
@@ -511,59 +522,160 @@ def fetch_closed_deal_final_data(
             return True
         return False
 
-    for attempt in range(attempts):
+    def _sleep_for_attempt(attempt_idx: int) -> float:
+        if attempt_idx < len(FINAL_SYNC_BACKOFF_SEC):
+            return float(FINAL_SYNC_BACKOFF_SEC[attempt_idx])
+        return 60.0
+
+    t0 = time.monotonic()
+    attempt_idx = 0
+    last_issue = ""
+
+    while True:
+        elapsed = time.monotonic() - t0
+        if elapsed >= wall:
+            break
+
         ok, txs, st, info = _fetch({"dealId": str(deal_id)})
         if not ok:
-            # Stop-condition: endpoint failure (do not proceed with close reporting).
-            print("Error: Could not sync final data from Capital.com", flush=True)
-            print(f"[Capital Sync] history/transactions failed status={st} info={info}", flush=True)
-            return None
-        if not txs:
+            last_issue = f"history/transactions failed status={st} info={info}"
+            if not quiet:
+                print("Error: Could not sync final data from Capital.com", flush=True)
+                print(f"[Capital Sync] {last_issue}", flush=True)
+        elif not txs:
             ok2, txs2, st2, info2 = _fetch({"max": int(lookback_max)})
             if not ok2:
-                print("Error: Could not sync final data from Capital.com", flush=True)
-                print(f"[Capital Sync] history/transactions failed status={st2} info={info2}", flush=True)
-                return None
-            txs = txs2
+                last_issue = f"history/transactions(max) failed status={st2} info={info2}"
+                if not quiet:
+                    print("Error: Could not sync final data from Capital.com", flush=True)
+                    print(f"[Capital Sync] {last_issue}", flush=True)
+                txs = []
+            else:
+                txs = txs2
 
-        for tx in txs:
-            tx_deal = tx.get("dealId")
-            tx_ref = tx.get("dealReference")
-            tx_related = tx.get("relatedDealId") or tx.get("relatedDealReference")
-            tx_reference = tx.get("reference") or tx.get("transactionReference")
-            tx_opening = tx.get("openingDealId") or tx.get("openDealId") or tx.get("positionId")
-            match = False
-            for x in ids:
-                if (
-                    _id_match(tx_deal, x)
-                    or _id_match(tx_ref, x)
-                    or _id_match(tx_related, x)
-                    or _id_match(tx_reference, x)
-                    or _id_match(tx_opening, x)
-                ):
-                    match = True
-                    break
-            if not match:
-                continue
-            pnl = _parse_pnl(tx)
-            if pnl is None:
-                continue
-            # Capital sometimes returns 0.0 briefly right after close; allow retries.
-            if wait_for_realized and float(pnl) == 0.0 and attempt < attempts - 1:
-                break
-            return {
-                "actual_pnl": float(pnl),
-                "exit_price": _parse_exit_price(tx),
-            }
+        if ok and txs:
+            found_zero_hold = False
+            for tx in txs:
+                tx_deal = tx.get("dealId")
+                tx_ref = tx.get("dealReference")
+                tx_related = tx.get("relatedDealId") or tx.get("relatedDealReference")
+                tx_reference = tx.get("reference") or tx.get("transactionReference")
+                tx_opening = tx.get("openingDealId") or tx.get("openDealId") or tx.get("positionId")
+                match = False
+                for x in ids:
+                    if (
+                        _id_match(tx_deal, x)
+                        or _id_match(tx_ref, x)
+                        or _id_match(tx_related, x)
+                        or _id_match(tx_reference, x)
+                        or _id_match(tx_opening, x)
+                    ):
+                        match = True
+                        break
+                if not match:
+                    continue
+                pnl = _parse_pnl(tx)
+                if pnl is None:
+                    continue
+                if wait_for_realized and float(pnl) == 0.0:
+                    found_zero_hold = True
+                    continue
+                return {
+                    "actual_pnl": float(pnl),
+                    "exit_price": _parse_exit_price(tx),
+                }
+            if wait_for_realized and found_zero_hold:
+                last_issue = "pnl_zero_placeholder_retry"
 
-        if wait_for_realized and attempt < attempts - 1:
-            idx = min(attempt, len(post_fail_delays) - 1)
-            time.sleep(post_fail_delays[idx])
+        if time.monotonic() - t0 >= wall:
+            break
+        sl = _sleep_for_attempt(attempt_idx)
+        remaining = wall - (time.monotonic() - t0)
+        if remaining <= 0:
+            break
+        sl = min(sl, max(0.0, remaining))
+        time.sleep(sl)
+        attempt_idx += 1
 
-    # Stop-condition: not found / not ready.
     print("Error: Could not sync final data from Capital.com", flush=True)
-    print(f"[Capital Sync] transaction not found yet ids={ids}", flush=True)
+    print(
+        f"[Capital Sync] transaction not found yet ids={ids} "
+        f"after {wall:.0f}s wall last_issue={last_issue or 'no_match'}",
+        flush=True,
+    )
     return None
+
+
+def _finalize_trade_close_notifications(trade_id: int) -> None:
+    """After DB row has final PnL: circuit breaker hook + Telegram from persisted row."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        row = conn.execute(
+            "SELECT chat_id, COALESCE(parent_session,''), COALESCE(actual_pnl, pnl, 0) "
+            "FROM trades WHERE trade_id=?",
+            (int(trade_id),),
+        ).fetchone()
+        conn.close()
+        if not row:
+            return
+        chat_id, parent_session, pnl_v = row
+        after_trade_leg_closed(str(chat_id), str(parent_session or "").strip(), float(pnl_v or 0.0))
+    except Exception:
+        pass
+    try:
+        from core.trade_close_messages import send_bot_automated_close_from_db
+
+        send_bot_automated_close_from_db(int(trade_id))
+    except Exception:
+        pass
+
+
+def spawn_background_final_sync(
+    trade_id: int,
+    *,
+    max_wall_sec: float | None = None,
+) -> None:
+    """
+    Non-blocking: daemon thread runs full broker history sync with exponential backoff
+    up to max_wall_sec (default FINAL_SYNC_MAX_WALL_SEC). Admin Telegram only if that
+    full budget is exhausted without success.
+    """
+    wall = float(max_wall_sec) if max_wall_sec is not None else float(FINAL_SYNC_MAX_WALL_SEC)
+    tid = int(trade_id)
+
+    def _run() -> None:
+        try:
+            result = try_sync_final_for_trade_id(
+                tid,
+                max_wall_sec=wall,
+                with_notifications=True,
+            )
+            if result is None:
+                try:
+                    from bot.notifier import notify_admin_alert
+
+                    notify_admin_alert(
+                        "Final Capital.com history sync failed after all retry attempts "
+                        f"(~{wall:.0f}s budget). trade_id={tid}\n"
+                        "Check DB sync_status / close_sync_last_error; reconcile will keep trying."
+                    )
+                except Exception:
+                    pass
+        except Exception as exc:
+            try:
+                from bot.notifier import notify_admin_alert
+
+                notify_admin_alert(
+                    f"Background final_sync crashed trade_id={tid}: {exc!s}"
+                )
+            except Exception:
+                pass
+
+    threading.Thread(
+        target=_run,
+        daemon=True,
+        name=f"final_sync_{tid}",
+    ).start()
 
 
 def try_sync_final_for_trade_id(
@@ -571,6 +683,8 @@ def try_sync_final_for_trade_id(
     *,
     attempts: int = 3,
     delay_sec: float = 2.0,
+    max_wall_sec: float | None = None,
+    with_notifications: bool = False,
 ) -> dict | None:
     """
     Emergency one-trade sync:
@@ -645,20 +759,22 @@ def try_sync_final_for_trade_id(
     except Exception:
         return None
 
-    final = None
     tries = max(1, int(attempts))
-    for idx in range(tries):
-        final = fetch_closed_deal_final_data(
-            base_url,
-            session_headers,
-            str(deal_id),
-            wait_for_realized=False,
-            identifiers=[str(deal_reference).strip()] if str(deal_reference or "").strip() else None,
-        )
-        if final is not None:
-            break
-        if idx < tries - 1:
-            time.sleep(max(0.0, float(delay_sec)))
+    if max_wall_sec is not None:
+        wall = float(max_wall_sec)
+    else:
+        wall = min(120.0, max(12.0, float(tries) * max(0.5, float(delay_sec)) * 20.0))
+    wait_realized = float(wall) >= 90.0
+
+    final = fetch_closed_deal_final_data(
+        base_url,
+        session_headers,
+        str(deal_id),
+        wait_for_realized=wait_realized,
+        identifiers=[str(deal_reference).strip()] if str(deal_reference or "").strip() else None,
+        max_wall_sec=wall,
+        quiet=True,
+    )
     if not final:
         return None
 
@@ -698,6 +814,8 @@ def try_sync_final_for_trade_id(
         f"{('n/a' if exit_price is None else float(exit_price))}. Realized PnL: {float(pnl_val):.2f}",
         flush=True,
     )
+    if with_notifications:
+        _finalize_trade_close_notifications(int(tid))
     return {"actual_pnl": float(pnl_val), "exit_price": exit_price}
 
 
@@ -823,6 +941,8 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
                 str(deal_id),
                 wait_for_realized=True,
                 identifiers=[dr] if dr else None,
+                max_wall_sec=RECONCILE_FINAL_SYNC_WALL_SEC,
+                quiet=True,
             )
             if not final:
                 # Hard check: never mark CLOSED / notify if the broker still lists this leg.
@@ -999,8 +1119,8 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
         "SELECT trade_id, deal_id, COALESCE(deal_reference,''), symbol, direction, entry_price, size, "
         "COALESCE(leg_role,''), COALESCE(parent_session,''), stop_distance, trailing_stop, "
         "COALESCE(close_sync_attempts,0), close_sync_last_try_at "
-        "FROM trades WHERE chat_id=? AND status='CLOSED' AND COALESCE(sync_status,'')=?",
-        (chat_id, PENDING_FINAL),
+        "FROM trades WHERE chat_id=? AND status='CLOSED' AND COALESCE(sync_status,'') IN (?, ?)",
+        (chat_id, PENDING_FINAL, PENDING_SYNC),
     )
     pending_rows = c.fetchall()
     for (
@@ -1043,7 +1163,7 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
                         from bot.notifier import notify_admin_alert
 
                         notify_admin_alert(
-                            "Desync (PENDING_FINAL): DB CLOSED but broker still shows OPEN position.\n"
+                            "Desync (PENDING_FINAL/PENDING_SYNC): DB CLOSED but broker still shows OPEN position.\n"
                             f"chat_id={chat_id} trade_id={trade_id} deal_id={deal_id} {symbol} {direction}\n"
                             "Skipped misleading 'PnL unavailable' user message."
                         )
@@ -1087,6 +1207,8 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
             str(deal_id),
             wait_for_realized=True,
             identifiers=[dr] if dr else None,
+            max_wall_sec=RECONCILE_FINAL_SYNC_WALL_SEC,
+            quiet=True,
         )
         if not final:
             c.execute(

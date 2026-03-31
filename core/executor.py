@@ -39,12 +39,11 @@ from core.trailing_stop import (
     close_trade_in_db, record_open_trade,
 )
 from core.sync import reconcile
-from core.sync import fetch_closed_deal_final_data
 from core.sync import mark_trade_closed_pending
+from core.sync import spawn_background_final_sync
 from core.sync import capital_verify_deal_closed_after_close_request
 from core.sync import capital_deal_still_open
 from core.sync import _capital_all_ids_from_row
-from core.trade_close_messages import send_bot_automated_close_from_db
 from utils.market_hours import synchronized_utc_now, sync_utc_with_ntp
 
 # Daily per-user symbol→epic cache (and unsupported symbols) to avoid
@@ -62,39 +61,6 @@ _TIME_SHIFT_ERROR_MARKERS = (
     "invalid timestamp",
     "request expired",
 )
-
-
-def _fetch_final_close_with_retry(
-    base_url: str,
-    headers: dict,
-    deal_id: str,
-    *,
-    identifiers: list[str] | None = None,
-    attempts: int = 3,
-    delay_sec: float = 2.0,
-) -> dict | None:
-    """
-    Small post-close retry loop for broker history.
-    Keeps notifier DB-first by waiting for closePrice/realizedPnl before messaging.
-    """
-    tries = max(1, int(attempts))
-    for idx in range(tries):
-        final = fetch_closed_deal_final_data(
-            base_url,
-            headers,
-            str(deal_id),
-            wait_for_realized=False,
-            identifiers=identifiers,
-        )
-        if final is not None:
-            exit_price = final.get("exit_price")
-            pnl_val = float(final.get("actual_pnl", 0.0))
-            # Accept immediately when either exit or non-zero pnl is present.
-            if exit_price is not None or pnl_val != 0.0 or idx == tries - 1:
-                return final
-        if idx < tries - 1:
-            time.sleep(max(0.0, float(delay_sec)))
-    return None
 
 
 def _append_daily_exec_log(filename: str, message: str):
@@ -1900,49 +1866,25 @@ def monitor_and_close(chat_id):
                         pass
                     continue
 
-                # Broker-truth sync (realized PnL + exit price) only after verified absence from /positions.
-                final = _fetch_final_close_with_retry(
+                # Broker-truth PnL: non-blocking — mark CLOSED + PENDING_SYNC, daemon retries with
+                # exponential backoff up to ~5m; Telegram after successful sync (admin only if all retries fail).
+                if capital_deal_still_open(
                     base_url,
                     headers,
                     str(deal_id),
-                    identifiers=[str(deal_ref)] if deal_ref else None,
-                    attempts=3,
-                    delay_sec=2.0,
-                )
-                if not final:
-                    # History miss: never mark CLOSED if GET /positions still shows this leg.
-                    if capital_deal_still_open(
-                        base_url,
-                        headers,
-                        str(deal_id),
-                        symbol=str(symbol or ""),
-                        direction=str(direction or ""),
-                        size=_sz_v,
-                    ):
-                        try:
-                            notify_admin_alert(
-                                "ABORT mark_trade_closed_pending: DELETE ok but position still on broker "
-                                f"(history miss). chat_id={chat_id} trade_id={trade_id} {symbol} deal_id={deal_id}"
-                            )
-                        except Exception:
-                            pass
-                        continue
-                    # Position is gone but history not ready — mark CLOSED pending PnL (no full close Telegram).
-                    mark_trade_closed_pending(
-                        chat_id,
-                        int(trade['trade_id']),
-                        symbol=symbol,
-                        direction=direction,
-                        deal_reference=str(deal_ref).strip() if deal_ref else None,
-                        reason="transaction_not_found_or_not_realized",
-                        notify=True,
-                    )
+                    symbol=str(symbol or ""),
+                    direction=str(direction or ""),
+                    size=_sz_v,
+                ):
+                    try:
+                        notify_admin_alert(
+                            "ABORT mark_trade_closed_pending: DELETE ok but position still on broker "
+                            f"(pre-sync check). chat_id={chat_id} trade_id={trade_id} {symbol} deal_id={deal_id}"
+                        )
+                    except Exception:
+                        pass
                     continue
 
-                actual_pnl = float(final["actual_pnl"])
-                exit_price = final.get("exit_price")
-
-                # Derive final label for reporting (milestone vs exit condition).
                 leg = (leg_role or "").strip().upper()
                 if leg == "TP2" and ("trailing" in str(stop_label).lower() or "tp2 passed" in str(stop_label).lower()):
                     target_label = "TRAILING_STOP_EXIT"
@@ -1955,32 +1897,25 @@ def monitor_and_close(chat_id):
                 else:
                     target_label = "STOP_LOSS"
 
-                close_trade_in_db(
-                    int(trade['trade_id']),
-                    actual_pnl=actual_pnl,
-                    exit_price=float(exit_price) if exit_price is not None else None,
-                    target_reached=target_label,
-                    close_reason=stop_label,
-                    sync_status="SYNCED",
+                conn_u = sqlite3.connect(DB_PATH)
+                conn_u.execute(
+                    "UPDATE trades SET target_reached=COALESCE(?, target_reached), close_reason=COALESCE(?, close_reason) "
+                    "WHERE trade_id=? AND status='OPEN'",
+                    (target_label, str(stop_label) if stop_label else None, int(trade["trade_id"])),
                 )
-                print(
-                    f"[PROFIT_FIX] Trade {int(trade_id)} closed at "
-                    f"{('n/a' if exit_price is None else float(exit_price))}. "
-                    f"Realized PnL: {float(actual_pnl):.2f}",
-                    flush=True,
-                )
-                _append_daily_exec_log(
-                    "execution_events.txt",
-                    (
-                        f"[PROFIT_FIX] trade_id={int(trade_id)} symbol={symbol} "
-                        f"exit_price={('n/a' if exit_price is None else float(exit_price))} "
-                        f"realized_pnl={float(actual_pnl):.2f}"
-                    ),
-                )
-                after_trade_leg_closed(chat_id, parent_session, actual_pnl)
+                conn_u.commit()
+                conn_u.close()
 
-                # DB-first: Telegram body is built from persisted trade row.
-                send_bot_automated_close_from_db(int(trade_id))
+                mark_trade_closed_pending(
+                    chat_id,
+                    int(trade["trade_id"]),
+                    symbol=symbol,
+                    direction=direction,
+                    deal_reference=str(deal_ref).strip() if deal_ref else None,
+                    reason="awaiting_background_final_sync",
+                    notify=False,
+                )
+                spawn_background_final_sync(int(trade["trade_id"]))
                 closed_any = True
             else:
                 _audit_exec_event(
