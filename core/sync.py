@@ -45,7 +45,7 @@ FINALIZED_NO_PNL = "FINALIZED_NO_PNL"
 # Final close history sync: wall-clock budget and exponential-style backoff (seconds).
 FINAL_SYNC_MAX_WALL_SEC = float(os.getenv("FINAL_SYNC_MAX_WALL_SEC", "300"))
 # Per monitoring-cycle reconcile: avoid blocking the whole loop for the full budget.
-RECONCILE_FINAL_SYNC_WALL_SEC = float(os.getenv("RECONCILE_FINAL_SYNC_WALL_SEC", "60"))
+RECONCILE_FINAL_SYNC_WALL_SEC = float(os.getenv("RECONCILE_FINAL_SYNC_WALL_SEC", "300"))
 FINAL_SYNC_BACKOFF_SEC = [5.0, 15.0, 30.0, 60.0]
 
 # After DELETE / manual close, poll /positions before trusting "closed" (2s, 5s, 10s gaps in fetch_closed_deal_final_data).
@@ -540,14 +540,14 @@ def fetch_closed_deal_final_data(
         if not ok:
             last_issue = f"history/transactions failed status={st} info={info}"
             if not quiet:
-                print("Error: Could not sync final data from Capital.com", flush=True)
+                print("Warning: Could not sync final data from Capital.com", flush=True)
                 print(f"[Capital Sync] {last_issue}", flush=True)
         elif not txs:
             ok2, txs2, st2, info2 = _fetch({"max": int(lookback_max)})
             if not ok2:
                 last_issue = f"history/transactions(max) failed status={st2} info={info2}"
                 if not quiet:
-                    print("Error: Could not sync final data from Capital.com", flush=True)
+                    print("Warning: Could not sync final data from Capital.com", flush=True)
                     print(f"[Capital Sync] {last_issue}", flush=True)
                 txs = []
             else:
@@ -597,7 +597,7 @@ def fetch_closed_deal_final_data(
         time.sleep(sl)
         attempt_idx += 1
 
-    print("Error: Could not sync final data from Capital.com", flush=True)
+    print("Warning: Could not sync final data from Capital.com", flush=True)
     print(
         f"[Capital Sync] transaction not found yet ids={ids} "
         f"after {wall:.0f}s wall last_issue={last_issue or 'no_match'}",

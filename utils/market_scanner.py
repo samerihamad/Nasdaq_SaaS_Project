@@ -30,6 +30,16 @@ _SESSION_CACHE: dict[str, dict] = {}
 _EPIC_CACHE: dict[str, str] = {}
 _UNSUPPORTED_CACHE: set[str] = set()
 
+
+def clear_local_price_caches() -> None:
+    """
+    Clear in-process Capital.com session/epic caches so the next requests
+    fetch fresh history (e.g. up to max=1000 daily bars). Call once at engine startup.
+    """
+    _SESSION_CACHE.clear()
+    _EPIC_CACHE.clear()
+    _UNSUPPORTED_CACHE.clear()
+
 _TF_CONFIG = {
     "1d": {
         "resolutions": ("DAY", "D1", "DAY_1"),
@@ -71,7 +81,7 @@ def _max_bar_attempts(base_max: int) -> list[int]:
 
 
 def _log_recovered_proceed(symbol: str, bar_count: int, timeframe: str) -> None:
-    """Soft band (e.g. 200–219 daily bars): proceed but make it visible in logs."""
+    """Soft band between MIN_ANALYSIS_BARS and TARGET_ANALYSIS_BARS: proceed but log visibility."""
     _append_data_quality_log(
         symbol,
         timeframe,
@@ -516,7 +526,7 @@ def _fetch_bars(
     """
     Fetch OHLCV from Capital.com /prices/{epic} only.
     Retries with larger `max` when cleaned row count is below min_rows (indicators need depth).
-    For daily (1d), requires at least MIN_ANALYSIS_BARS rows (default 200); soft band to TARGET
+    For daily (1d), requires at least MIN_ANALYSIS_BARS rows; soft band to TARGET
     logs [RECOVERED] via _log_recovered_proceed.
     """
     cfg = _TF_CONFIG[timeframe]

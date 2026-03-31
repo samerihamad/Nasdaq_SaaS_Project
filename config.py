@@ -32,8 +32,9 @@ WATCHLIST = [
 # Reject only when cleaned history is strictly below MIN_ANALYSIS_BARS.
 # Counts in [MIN_ANALYSIS_BARS, TARGET_ANALYSIS_BARS) still run; scanner logs
 # "[RECOVERED] Proceeding with X bars for [Symbol]" for that soft band (daily).
-MIN_ANALYSIS_BARS = int(os.getenv("MIN_ANALYSIS_BARS", "200"))
-TARGET_ANALYSIS_BARS = int(os.getenv("TARGET_ANALYSIS_BARS", "220"))
+# Defaults 180/200: typical listings (~209 daily bars) pass without recovery.
+MIN_ANALYSIS_BARS = int(os.getenv("MIN_ANALYSIS_BARS", "180"))
+TARGET_ANALYSIS_BARS = int(os.getenv("TARGET_ANALYSIS_BARS", "200"))
 
 # ── Mean Reversion Parameters ─────────────────────────────────────────────────
 

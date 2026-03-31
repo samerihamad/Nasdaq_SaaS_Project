@@ -24,7 +24,7 @@ from typing import Optional
 
 from database.db_manager import create_db, is_maintenance_mode
 from utils.filters import get_nasdaq_tickers, level1_filter, level2_filter, level3_filter
-from utils.market_scanner import scan_multi_timeframe, scan_market
+from utils.market_scanner import scan_multi_timeframe, scan_market, clear_local_price_caches
 from utils.ai_model import (
     analyze_multi_timeframe,
     load_or_train_model,
@@ -117,6 +117,7 @@ atexit.register(_release_lock)
 
 # Ensure all DB tables exist before anything else runs
 create_db()
+clear_local_price_caches()
 
 # --- Configuration ---
 ADMIN_CHAT_ID      = os.getenv("ADMIN_CHAT_ID", "")   # admin-only notifications

@@ -49,7 +49,7 @@ log = logging.getLogger(__name__)
 MODEL_DIR             = "models"
 MODEL_VERSION         = 4          # bump to force retrain after provider/feature alignment changes
 AI_PROBABILITY_THRESHOLD = 60.0    # minimum probability to approve a trade
-# Align with config MIN_ANALYSIS_BARS (default 200); soft target TARGET_ANALYSIS_BARS (220) for logging.
+# Align with config MIN_ANALYSIS_BARS / TARGET_ANALYSIS_BARS (scanner + training gate).
 MIN_TRAIN_BARS = MIN_ANALYSIS_BARS
 TRAIN_RETRY_HOURS     = 6          # avoid retry spam for symbols with short history
 
