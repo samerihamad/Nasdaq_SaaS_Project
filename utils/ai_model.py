@@ -41,6 +41,7 @@ from config import (
     MS_SCORE_AI_NEUTRAL,
     MS_SCORE_AI_SCALE,
     MS_SCORE_AI_MAX_IMPACT,
+    MIN_ANALYSIS_BARS,
 )
 
 log = logging.getLogger(__name__)
@@ -48,7 +49,8 @@ log = logging.getLogger(__name__)
 MODEL_DIR             = "models"
 MODEL_VERSION         = 4          # bump to force retrain after provider/feature alignment changes
 AI_PROBABILITY_THRESHOLD = 60.0    # minimum probability to approve a trade
-MIN_TRAIN_BARS        = 220        # supports EMA200 + labeling while allowing newer listings
+# Align with config MIN_ANALYSIS_BARS (default 200); soft target TARGET_ANALYSIS_BARS (220) for logging.
+MIN_TRAIN_BARS = MIN_ANALYSIS_BARS
 TRAIN_RETRY_HOURS     = 6          # avoid retry spam for symbols with short history
 
 os.makedirs(MODEL_DIR, exist_ok=True)
@@ -305,12 +307,12 @@ def train_model(symbol: str, timeframe: str = "1d"):
     log.info("Training RF model for %s (%s)...", symbol, label)
     df = scan_market(symbol, period=period, interval=interval)
     bars = len(df) if df is not None else 0
-    if df is None or bars < MIN_TRAIN_BARS:
+    if df is None or bars < MIN_ANALYSIS_BARS:
         # Retry later instead of re-attempting every scan cycle.
         _train_retry_after[retry_key] = now + timedelta(hours=TRAIN_RETRY_HOURS)
         log.warning(
             "Insufficient data for %s (%s, %s bars, need >= %s). Retry after %sh.",
-            symbol, tf, bars, MIN_TRAIN_BARS, TRAIN_RETRY_HOURS
+            symbol, tf, bars, MIN_ANALYSIS_BARS, TRAIN_RETRY_HOURS
         )
         return None, None
 

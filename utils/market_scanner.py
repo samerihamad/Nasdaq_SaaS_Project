@@ -14,6 +14,8 @@ from config import (
     MARKET_DATA_CAPITAL_EMAIL,
     MARKET_DATA_CAPITAL_PASSWORD,
     MARKET_DATA_CAPITAL_IS_DEMO,
+    MIN_ANALYSIS_BARS,
+    TARGET_ANALYSIS_BARS,
 )
 
 _DATA_TIMEOUT_SEC = int(os.getenv("MARKET_DATA_TIMEOUT_SEC", "20"))
@@ -21,6 +23,8 @@ _SESSION_TTL_SEC = int(os.getenv("MARKET_DATA_SESSION_TTL_SEC", "45"))
 _LOG_ROOT = os.getenv("ENGINE_LOG_ROOT", "logs")
 # Capital.com /prices max= upper bound (broker caps vary; stay within common API limits).
 _CAPITAL_PRICES_MAX_BARS_CAP = int(os.getenv("CAPITAL_PRICES_MAX_BARS_CAP", "1000"))
+# Daily: ask for the deepest history the API allows (capped at 1000).
+_DAILY_PRICES_MAX = min(1000, max(50, _CAPITAL_PRICES_MAX_BARS_CAP))
 
 _SESSION_CACHE: dict[str, dict] = {}
 _EPIC_CACHE: dict[str, str] = {}
@@ -29,7 +33,7 @@ _UNSUPPORTED_CACHE: set[str] = set()
 _TF_CONFIG = {
     "1d": {
         "resolutions": ("DAY", "D1", "DAY_1"),
-        "max": 300,
+        "max": _DAILY_PRICES_MAX,
         "step_sec": 86400,
         "min_rows": 40,
     },
@@ -64,6 +68,78 @@ def _max_bar_attempts(base_max: int) -> list[int]:
     if cap not in attempts:
         attempts.append(cap)
     return sorted(set(attempts))
+
+
+def _log_recovered_proceed(symbol: str, bar_count: int, timeframe: str) -> None:
+    """Soft band (e.g. 200–219 daily bars): proceed but make it visible in logs."""
+    _append_data_quality_log(
+        symbol,
+        timeframe,
+        "OK",
+        f"[RECOVERED] Proceeding with {bar_count} bars for {symbol}",
+    )
+
+
+def _smart_retry_daily_fetch(
+    base_url: str,
+    headers: dict,
+    epic: str,
+    cfg: dict,
+    log_symbol: str,
+) -> pd.DataFrame | None:
+    """
+    After normal escalation fails to reach MIN_ANALYSIS_BARS on daily data, try once more:
+    deepest max= with resolutions in reverse order, then a second pass with a slightly
+    lower max (covers API quirks without another data source).
+    """
+    cap = min(1000, max(50, int(_CAPITAL_PRICES_MAX_BARS_CAP)))
+    resolutions = list(cfg["resolutions"])
+    alt_maxes = (cap, max(MIN_ANALYSIS_BARS, int(round(cap * 0.92))))
+    last_err = ""
+    for max_try in alt_maxes:
+        for res_name in reversed(resolutions):
+            try:
+                res = requests.get(
+                    f"{base_url}/prices/{epic}",
+                    params={"resolution": res_name, "max": int(max_try)},
+                    headers=headers,
+                    timeout=_DATA_TIMEOUT_SEC,
+                )
+                if res.status_code != 200:
+                    last_err = f"smart_retry status={res.status_code} res={res_name} max={max_try}"
+                    continue
+                df_raw = _parse_capital_ohlcv(res.json() or {})
+                if df_raw is None or df_raw.empty:
+                    last_err = f"smart_retry empty res={res_name} max={max_try}"
+                    continue
+                df_clean = _clean_ohlcv(
+                    symbol=epic,
+                    timeframe="1d",
+                    df=df_raw,
+                    step_sec=int(cfg["step_sec"]),
+                )
+                if df_clean is None or df_clean.empty:
+                    last_err = f"smart_retry clean failed res={res_name} max={max_try}"
+                    continue
+                n = len(df_clean)
+                if n < int(cfg["min_rows"]):
+                    continue
+                if n < MIN_ANALYSIS_BARS:
+                    last_err = f"smart_retry rows={n} min={MIN_ANALYSIS_BARS} res={res_name} max={max_try}"
+                    continue
+                _append_data_quality_log(
+                    epic,
+                    "1d",
+                    "OK",
+                    f"smart_retry_ok resolution={res_name} max={max_try} rows={n}",
+                )
+                if MIN_ANALYSIS_BARS <= n < TARGET_ANALYSIS_BARS:
+                    _log_recovered_proceed(log_symbol, n, "1d")
+                return df_clean
+            except Exception as exc:
+                last_err = f"smart_retry exception res={res_name} max={max_try}: {exc}"
+    _append_data_quality_log(epic, "1d", "WARN", f"smart_retry_exhausted last={last_err}")
+    return None
 
 
 def _append_data_quality_log(symbol: str, timeframe: str, status: str, details: str):
@@ -434,13 +510,18 @@ def _fetch_bars(
     headers: dict,
     epic: str,
     timeframe: str,
+    *,
+    log_symbol: str | None = None,
 ) -> pd.DataFrame | None:
     """
     Fetch OHLCV from Capital.com /prices/{epic} only.
     Retries with larger `max` when cleaned row count is below min_rows (indicators need depth).
+    For daily (1d), requires at least MIN_ANALYSIS_BARS rows (default 200); soft band to TARGET
+    logs [RECOVERED] via _log_recovered_proceed.
     """
     cfg = _TF_CONFIG[timeframe]
     min_rows = int(cfg["min_rows"])
+    label = (log_symbol or epic).strip() or epic
     last_err = ""
     for max_try in _max_bar_attempts(int(cfg["max"])):
         for res_name in cfg["resolutions"]:
@@ -474,6 +555,14 @@ def _fetch_bars(
                         f"resolution={res_name} max={max_try}"
                     )
                     continue
+                if timeframe == "1d" and n < MIN_ANALYSIS_BARS:
+                    last_err = (
+                        f"insufficient rows={n} need>={MIN_ANALYSIS_BARS} "
+                        f"resolution={res_name} max={max_try}"
+                    )
+                    continue
+                if timeframe == "1d" and MIN_ANALYSIS_BARS <= n < TARGET_ANALYSIS_BARS:
+                    _log_recovered_proceed(label, n, timeframe)
                 if max_try > int(cfg["max"]):
                     _append_data_quality_log(
                         epic,
@@ -484,6 +573,13 @@ def _fetch_bars(
                 return df_clean
             except Exception as exc:
                 last_err = f"exception resolution={res_name} max={max_try}: {exc}"
+
+    if timeframe == "1d":
+        recovered = _smart_retry_daily_fetch(
+            base_url, headers, epic, cfg, log_symbol=label
+        )
+        if recovered is not None:
+            return recovered
 
     _append_data_quality_log(epic, timeframe, "ERROR", last_err or "unknown fetch error")
     return None
@@ -532,36 +628,65 @@ def scan_market(ticker_symbol, period="1d", interval="5m", session_context: dict
         )
         return None
 
+    sym = str(ticker_symbol).strip()
+    is_daily = str(interval).lower() == "1d"
+    daily_resolutions = ("DAY", "D1", "DAY_1")
+    resolutions_try = daily_resolutions if is_daily else (resolution,)
+
     try:
         last_status = 0
         for max_bars in max_attempts:
-            res = requests.get(
-                f"{base_url}/prices/{epic}",
-                params={"resolution": resolution, "max": int(max_bars)},
-                headers=headers,
-                timeout=_DATA_TIMEOUT_SEC,
-            )
-            last_status = int(res.status_code)
-            if res.status_code != 200:
-                continue
-            parsed = _parse_capital_ohlcv(res.json() or {})
-            if parsed is None or parsed.empty:
-                continue
-            cleaned = _clean_ohlcv(
-                symbol=str(ticker_symbol),
-                timeframe=str(interval),
-                df=parsed,
-                step_sec=step_sec,
-            )
-            if cleaned is not None and not cleaned.empty:
+            for res_one in resolutions_try:
+                res = requests.get(
+                    f"{base_url}/prices/{epic}",
+                    params={"resolution": res_one, "max": int(max_bars)},
+                    headers=headers,
+                    timeout=_DATA_TIMEOUT_SEC,
+                )
+                last_status = int(res.status_code)
+                if res.status_code != 200:
+                    continue
+                parsed = _parse_capital_ohlcv(res.json() or {})
+                if parsed is None or parsed.empty:
+                    continue
+                cleaned = _clean_ohlcv(
+                    symbol=str(ticker_symbol),
+                    timeframe=str(interval),
+                    df=parsed,
+                    step_sec=step_sec,
+                )
+                if cleaned is None or cleaned.empty:
+                    continue
+                n = len(cleaned)
+                if is_daily:
+                    if n < MIN_ANALYSIS_BARS:
+                        continue
+                    if MIN_ANALYSIS_BARS <= n < TARGET_ANALYSIS_BARS:
+                        _log_recovered_proceed(sym, n, str(interval))
+                    if max_bars > base_need:
+                        _append_data_quality_log(
+                            str(ticker_symbol),
+                            str(interval),
+                            "OK",
+                            f"capital_retry_ok max={max_bars} res={res_one} rows={n}",
+                        )
+                    return cleaned
                 if max_bars > base_need:
                     _append_data_quality_log(
                         str(ticker_symbol),
                         str(interval),
                         "OK",
-                        f"capital_retry_ok max={max_bars} rows={len(cleaned)}",
+                        f"capital_retry_ok max={max_bars} rows={n}",
                     )
                 return cleaned
+
+        if is_daily:
+            cfg_1d = _TF_CONFIG["1d"]
+            recovered = _smart_retry_daily_fetch(
+                base_url, headers, epic, cfg_1d, log_symbol=sym
+            )
+            if recovered is not None:
+                return recovered
 
         _append_data_quality_log(
             str(ticker_symbol),
@@ -595,9 +720,9 @@ def scan_multi_timeframe(symbol, session_context: dict | None = None):
             _append_data_quality_log(symbol, "all", "ERROR", "epic not found on Capital")
             return None
 
-        df_1d = _fetch_bars(base_url, headers, epic, "1d")
-        df_4h = _fetch_bars(base_url, headers, epic, "4h")
-        df_15m = _fetch_bars(base_url, headers, epic, "15m")
+        df_1d = _fetch_bars(base_url, headers, epic, "1d", log_symbol=str(symbol))
+        df_4h = _fetch_bars(base_url, headers, epic, "4h", log_symbol=str(symbol))
+        df_15m = _fetch_bars(base_url, headers, epic, "15m", log_symbol=str(symbol))
 
         if any(df is None or df.empty for df in (df_1d, df_4h, df_15m)):
             _append_data_quality_log(

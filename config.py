@@ -28,6 +28,13 @@ WATCHLIST = [
     "XOM",  "CVX",  "GLD",  "SLV",  "USO",
 ]
 
+# ── Capital.com bar depth (scanner + AI training) ────────────────────────────
+# Reject only when cleaned history is strictly below MIN_ANALYSIS_BARS.
+# Counts in [MIN_ANALYSIS_BARS, TARGET_ANALYSIS_BARS) still run; scanner logs
+# "[RECOVERED] Proceeding with X bars for [Symbol]" for that soft band (daily).
+MIN_ANALYSIS_BARS = int(os.getenv("MIN_ANALYSIS_BARS", "200"))
+TARGET_ANALYSIS_BARS = int(os.getenv("TARGET_ANALYSIS_BARS", "220"))
+
 # ── Mean Reversion Parameters ─────────────────────────────────────────────────
 
 # RSI thresholds — tier-based (Fast vs Gold / GOLDEN signal profile).
