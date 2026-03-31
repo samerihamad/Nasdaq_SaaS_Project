@@ -44,6 +44,7 @@ from core.sync import capital_verify_deal_closed_after_close_request
 from core.sync import capital_deal_still_open
 from core.sync import _capital_all_ids_from_row
 from core.trade_close_messages import send_bot_automated_close_from_db
+from utils.market_hours import synchronized_utc_now, sync_utc_with_ntp
 
 # Daily per-user symbol→epic cache (and unsupported symbols) to avoid
 # repeating broker lookups for every signal cycle.
@@ -53,6 +54,13 @@ SESSION_TTL_SECONDS = 45
 DB_PATH = 'database/trading_saas.db'
 LOG_ROOT = os.getenv("ENGINE_LOG_ROOT", "logs")
 _REJECTION_NOTIFY_CACHE: dict[str, float] = {}
+
+_TIME_SHIFT_ERROR_MARKERS = (
+    "time shift",
+    "session expired",
+    "invalid timestamp",
+    "request expired",
+)
 
 
 def _fetch_final_close_with_retry(
@@ -192,6 +200,95 @@ def _safe_json_response(res: requests.Response) -> dict:
         return {}
 
 
+def _utc_timestamp_ms() -> str:
+    return str(int(synchronized_utc_now().timestamp() * 1000))
+
+
+def _with_broker_timestamp_headers(headers: dict | None) -> dict:
+    out = dict(headers or {})
+    ts_ms = _utc_timestamp_ms()
+    out["X-CAP-TIMESTAMP"] = ts_ms
+    out["X-TIMESTAMP"] = ts_ms
+    return out
+
+
+def _is_time_or_session_error(status_code: int, error_message: str) -> bool:
+    if int(status_code) in (401, 403):
+        return True
+    msg = str(error_message or "").lower()
+    return any(marker in msg for marker in _TIME_SHIFT_ERROR_MARKERS)
+
+
+def _force_resync_and_relogin(
+    *,
+    creds=None,
+    chat_id: str | None = None,
+    reason: str = "",
+) -> tuple[bool, str, dict | None]:
+    """
+    Self-healing path:
+    1) sync process UTC offset from NTP
+    2) force fresh Capital session tokens
+    """
+    sync_diag = sync_utc_with_ntp()
+    _audit_exec_event(
+        stage="clock_resync",
+        chat_id=(str(chat_id) if chat_id is not None else None),
+        symbol=None,
+        action=None,
+        details=f"reason={reason[:120]} ntp_ok={int(bool(sync_diag.get('ok')))} diag={sync_diag}",
+    )
+    if creds is None:
+        return False, "missing creds for relogin", None
+    base_url, headers = get_session(
+        creds,
+        chat_id=(str(chat_id) if chat_id is not None else None),
+        force_refresh=True,
+    )
+    if not headers:
+        return False, "relogin_failed", None
+    return True, "recovered", {"base_url": base_url, "headers": headers}
+
+
+def _resilient_capital_get(
+    url: str,
+    *,
+    headers: dict,
+    timeout: int = 20,
+    chat_id: str | None = None,
+    creds=None,
+) -> tuple[requests.Response | None, dict]:
+    """
+    GET with broker timestamp + one-shot self-heal for time/session errors.
+    Returns (response, active_headers).
+    """
+    stamped = _with_broker_timestamp_headers(headers)
+    try:
+        res = requests.get(url, headers=stamped, timeout=timeout)
+    except Exception:
+        return None, headers
+
+    if res.status_code in (401, 403):
+        err = _normalize_broker_error(res=res, payload=_safe_json_response(res))
+        recovered, _, payload = _force_resync_and_relogin(
+            creds=creds,
+            chat_id=chat_id,
+            reason=err,
+        )
+        if recovered and payload and payload.get("headers"):
+            new_headers = payload["headers"]
+            try:
+                res2 = requests.get(
+                    url,
+                    headers=_with_broker_timestamp_headers(new_headers),
+                    timeout=timeout,
+                )
+                return res2, new_headers
+            except Exception:
+                return res, headers
+    return res, headers
+
+
 def _normalize_broker_error(res: requests.Response | None = None, payload: dict | None = None) -> str:
     """
     Unified Capital.com error parser to avoid scattered string handling.
@@ -241,16 +338,19 @@ def _broker_request(
     json_payload: dict | None = None,
     params: dict | None = None,
     timeout: int = 20,
+    creds=None,
+    chat_id: str | None = None,
 ) -> tuple[bool, dict, str, int]:
     """
     Unified broker request wrapper.
     Returns: (ok, payload, error_msg, status_code)
     """
+    req_headers = _with_broker_timestamp_headers(headers)
     try:
         res = requests.request(
             method=method.upper(),
             url=url,
-            headers=headers,
+            headers=req_headers,
             json=json_payload,
             params=params,
             timeout=timeout,
@@ -260,7 +360,37 @@ def _broker_request(
 
     data = _safe_json_response(res)
     if res.status_code != 200:
-        return False, data, _normalize_broker_error(res=res, payload=data), int(res.status_code)
+        err = _normalize_broker_error(res=res, payload=data)
+        # Self-heal on session expiry/time drift and retry once with fresh session.
+        if _is_time_or_session_error(int(res.status_code), err):
+            recovered, _, payload = _force_resync_and_relogin(
+                creds=creds,
+                chat_id=chat_id,
+                reason=err,
+            )
+            if recovered and payload and payload.get("headers"):
+                try:
+                    headers.clear()
+                    headers.update(payload["headers"])
+                except Exception:
+                    pass
+                retry_headers = _with_broker_timestamp_headers(payload["headers"])
+                try:
+                    res2 = requests.request(
+                        method=method.upper(),
+                        url=url,
+                        headers=retry_headers,
+                        json=json_payload,
+                        params=params,
+                        timeout=timeout,
+                    )
+                    data2 = _safe_json_response(res2)
+                    if res2.status_code == 200 and not (isinstance(data2, dict) and data2.get("errorCode")):
+                        return True, data2, "", int(res2.status_code)
+                    return False, data2, _normalize_broker_error(res=res2, payload=data2), int(res2.status_code)
+                except Exception as exc2:
+                    return False, {}, str(exc2), 0
+        return False, data, err, int(res.status_code)
     if isinstance(data, dict) and data.get("errorCode"):
         return False, data, _normalize_broker_error(res=res, payload=data), int(res.status_code)
     return True, data, "", int(res.status_code)
@@ -504,7 +634,7 @@ def get_user_credentials(chat_id):
     return (safe_decrypt(data[0]), safe_decrypt(data[1]), data[2], safe_decrypt(data[3]))
 
 
-def get_session(creds, chat_id: str | None = None):
+def get_session(creds, chat_id: str | None = None, force_refresh: bool = False):
     api_key, password, is_demo, user_email = (
         str(creds[0]).strip(), str(creds[1]).strip(), creds[2], str(creds[3]).strip()
     )
@@ -522,7 +652,7 @@ def get_session(creds, chat_id: str | None = None):
     cache_key = f"{api_key}|{is_demo}|{user_email}"
     now = datetime.now(timezone.utc)
     cached = _SESSION_CACHE.get(cache_key)
-    if cached and cached.get("expires_at") and cached["expires_at"] > now:
+    if (not force_refresh) and cached and cached.get("expires_at") and cached["expires_at"] > now:
         return cached["base_url"], cached["headers"]
 
     auth_res = None
@@ -530,10 +660,11 @@ def get_session(creds, chat_id: str | None = None):
     # Retry briefly before surfacing an authentication failure to the user.
     for attempt in range(3):
         try:
+            auth_headers = _with_broker_timestamp_headers(headers)
             auth_res = requests.post(
                 f"{base_url}/session",
                 json={"identifier": user_email, "password": password},
-                headers=headers,
+                headers=auth_headers,
                 timeout=20,
             )
         except Exception as exc:
@@ -592,7 +723,7 @@ def _scanner_context_from_creds(chat_id: str, creds) -> dict:
 
 def _get_balance(base_url, headers):
     try:
-        res = requests.get(f"{base_url}/accounts", headers=headers)
+        res = requests.get(f"{base_url}/accounts", headers=_with_broker_timestamp_headers(headers))
         if res.status_code == 200:
             return float(res.json()['accounts'][0]['balance']['balance'])
     except Exception:
@@ -605,7 +736,7 @@ def _get_balance_and_free_margin(base_url, headers) -> tuple[float, float]:
     Return (balance, free_margin) with robust fallback across Capital payload shapes.
     """
     try:
-        res = requests.get(f"{base_url}/accounts", headers=headers, timeout=20)
+        res = requests.get(f"{base_url}/accounts", headers=_with_broker_timestamp_headers(headers), timeout=20)
         if res.status_code != 200:
             bal = _get_balance(base_url, headers)
             return float(bal), float(bal)
@@ -645,7 +776,7 @@ def _current_exposure_notional(base_url, headers, symbol: str, order_epic: str) 
     total_exposure = 0.0
     by_symbol: dict[str, float] = {}
     try:
-        res = requests.get(f"{base_url}/positions", headers=headers, timeout=20)
+        res = requests.get(f"{base_url}/positions", headers=_with_broker_timestamp_headers(headers), timeout=20)
         if res.status_code != 200:
             return 0.0, 0.0, {}
         for p in (res.json() or {}).get("positions", []):
@@ -681,7 +812,7 @@ def _current_exposure_notional(base_url, headers, symbol: str, order_epic: str) 
 def _get_current_price(base_url, headers, epic):
     """Fetch latest bid price for an instrument."""
     try:
-        res = requests.get(f"{base_url}/markets/{epic}", headers=headers)
+        res = requests.get(f"{base_url}/markets/{epic}", headers=_with_broker_timestamp_headers(headers))
         if res.status_code == 200:
             return float(res.json().get('snapshot', {}).get('bid', 0))
     except Exception:
@@ -726,7 +857,7 @@ def _resolve_epic(base_url, headers, symbol):
 
     # 1) Fast path: assume provided symbol is already an epic.
     try:
-        direct = requests.get(f"{base_url}/markets/{s}", headers=headers)
+        direct = requests.get(f"{base_url}/markets/{s}", headers=_with_broker_timestamp_headers(headers))
         if direct.status_code == 200:
             return s
     except Exception:
@@ -736,7 +867,7 @@ def _resolve_epic(base_url, headers, symbol):
     candidates = [f"US.{s}.CASH", f"US.{s}.CFD", f"{s}.CASH", f"{s}.CFD"]
     for epic in candidates:
         try:
-            res = requests.get(f"{base_url}/markets/{epic}", headers=headers)
+            res = requests.get(f"{base_url}/markets/{epic}", headers=_with_broker_timestamp_headers(headers))
             if res.status_code == 200:
                 return epic
         except Exception:
@@ -751,7 +882,7 @@ def _resolve_epic(base_url, headers, symbol):
         res = requests.get(
             f"{base_url}/markets",
             params={"searchTerm": s},
-            headers=headers,
+            headers=_with_broker_timestamp_headers(headers),
         )
         if res.status_code == 200:
             markets = res.json().get("markets", [])
@@ -806,7 +937,7 @@ def _get_min_deal_size(base_url, headers, epic) -> float:
     Returns 1.0 if unavailable.
     """
     try:
-        res = requests.get(f"{base_url}/markets/{epic}", headers=headers, timeout=20)
+        res = requests.get(f"{base_url}/markets/{epic}", headers=_with_broker_timestamp_headers(headers), timeout=20)
         if res.status_code != 200:
             return 1.0
         data = res.json() or {}
@@ -832,7 +963,7 @@ def _get_min_stop_profit_distance(base_url, headers, epic) -> float | None:
     Returns None if unavailable.
     """
     try:
-        res = requests.get(f"{base_url}/markets/{epic}", headers=headers, timeout=20)
+        res = requests.get(f"{base_url}/markets/{epic}", headers=_with_broker_timestamp_headers(headers), timeout=20)
         if res.status_code != 200:
             return None
         data = res.json() or {}
@@ -894,7 +1025,7 @@ def _get_max_stop_profit_distance(base_url, headers, epic) -> float | None:
     Returns None if unavailable.
     """
     try:
-        res = requests.get(f"{base_url}/markets/{epic}", headers=headers, timeout=20)
+        res = requests.get(f"{base_url}/markets/{epic}", headers=_with_broker_timestamp_headers(headers), timeout=20)
         if res.status_code != 200:
             return None
         data = res.json() or {}
@@ -951,7 +1082,7 @@ def _market_tradeability(base_url: str, headers: dict, epic: str) -> tuple[bool,
     if not epic:
         return False, "UNKNOWN"
     try:
-        res = requests.get(f"{base_url}/markets/{epic}", headers=headers, timeout=20)
+        res = requests.get(f"{base_url}/markets/{epic}", headers=_with_broker_timestamp_headers(headers), timeout=20)
         if res.status_code != 200:
             return False, f"HTTP_{res.status_code}"
         data = res.json() or {}
@@ -991,7 +1122,14 @@ def _split_qty_70_30(*, qty_total: float, min_deal_size: float) -> tuple[bool, f
     return True, float(q1), float(q2), ""
 
 
-def _delete_position(base_url: str, headers: dict, deal_id: str) -> tuple[bool, str]:
+def _delete_position(
+    base_url: str,
+    headers: dict,
+    deal_id: str,
+    *,
+    creds=None,
+    chat_id: str | None = None,
+) -> tuple[bool, str]:
     """Attempt to close an open broker position by dealId."""
     if not deal_id:
         return False, "missing deal_id"
@@ -1000,6 +1138,8 @@ def _delete_position(base_url: str, headers: dict, deal_id: str) -> tuple[bool, 
         f"{base_url}/positions/{deal_id}",
         headers=headers,
         timeout=20,
+        creds=creds,
+        chat_id=chat_id,
     )
     if ok:
         return True, "ok"
@@ -1076,7 +1216,18 @@ def is_symbol_supported_for_user(chat_id, symbol) -> bool:
     return bool(resolve_epic_for_user(chat_id, symbol))
 
 
-def _open_position_with_protection(base_url, headers, epic, action, size, stop_level, target_level):
+def _open_position_with_protection(
+    base_url,
+    headers,
+    epic,
+    action,
+    size,
+    stop_level,
+    target_level,
+    *,
+    creds=None,
+    chat_id: str | None = None,
+):
     """
     Open one position with attached stop-loss and take-profit levels.
     Returns (ok: bool, payload_or_error: dict|str).
@@ -1112,6 +1263,8 @@ def _open_position_with_protection(base_url, headers, epic, action, size, stop_l
             headers=headers,
             json_payload=payload,
             timeout=20,
+            creds=creds,
+            chat_id=chat_id,
         )
         if ok:
             return True, data
@@ -1135,7 +1288,7 @@ def _position_has_deal(base_url, headers, deal_id: str) -> bool:
     if not deal_id:
         return False
     try:
-        res = requests.get(f"{base_url}/positions", headers=headers, timeout=20)
+        res = requests.get(f"{base_url}/positions", headers=_with_broker_timestamp_headers(headers), timeout=20)
         if res.status_code != 200:
             return False
         for p in res.json().get("positions", []):
@@ -1153,7 +1306,7 @@ def _position_get_by_deal_id(base_url, headers, deal_id: str) -> bool:
         return False
     try:
         res = requests.get(
-            f"{base_url}/positions/{deal_id}", headers=headers, timeout=15
+            f"{base_url}/positions/{deal_id}", headers=_with_broker_timestamp_headers(headers), timeout=15
         )
         if res.status_code == 200:
             data = res.json() or {}
@@ -1190,7 +1343,7 @@ def _find_open_deal_by_epic_size(
     if not epic or not direction or leg_size is None:
         return None
     try:
-        res = requests.get(f"{base_url}/positions", headers=headers, timeout=20)
+        res = requests.get(f"{base_url}/positions", headers=_with_broker_timestamp_headers(headers), timeout=20)
         if res.status_code != 200:
             return None
         want_tok = _epic_last_token(epic)
@@ -1275,7 +1428,7 @@ def _confirm_deal_and_visibility(
     while deal_ref and _time.time() < deadline:
         try:
             res = requests.get(
-                f"{base_url}/confirms/{deal_ref}", headers=headers, timeout=20
+                f"{base_url}/confirms/{deal_ref}", headers=_with_broker_timestamp_headers(headers), timeout=20
             )
             if res.status_code == 200:
                 data = res.json() or {}
@@ -1355,7 +1508,15 @@ def _confirm_deal_and_visibility(
     )
 
 
-def _sync_stop_to_broker(base_url, headers, deal_id, stop_level):
+def _sync_stop_to_broker(
+    base_url,
+    headers,
+    deal_id,
+    stop_level,
+    *,
+    creds=None,
+    chat_id: str | None = None,
+):
     """
     Push updated trailing-stop level to Capital for an open position.
     Returns (ok: bool, info: str).
@@ -1375,6 +1536,8 @@ def _sync_stop_to_broker(base_url, headers, deal_id, stop_level):
             headers=headers,
             json_payload=payload,
             timeout=20,
+            creds=creds,
+            chat_id=chat_id,
         )
         if ok:
             return True, "ok"
@@ -1382,7 +1545,16 @@ def _sync_stop_to_broker(base_url, headers, deal_id, stop_level):
     return False, last_err or "unknown error"
 
 
-def _sync_protection_to_broker(base_url, headers, deal_id, stop_level, profit_level):
+def _sync_protection_to_broker(
+    base_url,
+    headers,
+    deal_id,
+    stop_level,
+    profit_level,
+    *,
+    creds=None,
+    chat_id: str | None = None,
+):
     """
     Ensure both SL and TP are set on broker for a live position.
     Returns (ok: bool, info: str).
@@ -1403,6 +1575,8 @@ def _sync_protection_to_broker(base_url, headers, deal_id, stop_level, profit_le
             headers=headers,
             json_payload=payload,
             timeout=20,
+            creds=creds,
+            chat_id=chat_id,
         )
         if ok:
             return True, "ok"
@@ -1473,7 +1647,15 @@ def monitor_and_close(chat_id):
     reconcile(chat_id, base_url, headers)
 
     # Fetch live positions for price data and hard-stop checks
-    pos_res = requests.get(f"{base_url}/positions", headers=headers)
+    pos_res, headers = _resilient_capital_get(
+        f"{base_url}/positions",
+        headers=headers,
+        timeout=20,
+        chat_id=str(chat_id),
+        creds=creds,
+    )
+    if pos_res is None:
+        return False
     if pos_res.status_code != 200:
         return False
 
@@ -1570,7 +1752,14 @@ def monitor_and_close(chat_id):
                 new_stop = advance_trailing_stop(prev_stop, candidate, direction)
                 if base_stop != new_stop:
                     update_trade_stop(trade['trade_id'], new_stop)
-                    ok, info = _sync_stop_to_broker(base_url, headers, deal_id, new_stop)
+                    ok, info = _sync_stop_to_broker(
+                        base_url,
+                        headers,
+                        deal_id,
+                        new_stop,
+                        creds=creds,
+                        chat_id=str(chat_id),
+                    )
                     if not ok:
                         print(f"⚠️  Broker stop sync failed [{symbol} {deal_id}]: {info}")
                 stop_triggered = is_stop_hit(current_price, new_stop, direction)
@@ -1601,7 +1790,14 @@ def monitor_and_close(chat_id):
 
                 if base_stop != new_stop:
                     update_trade_stop(trade['trade_id'], new_stop)
-                    ok, info = _sync_stop_to_broker(base_url, headers, deal_id, new_stop)
+                    ok, info = _sync_stop_to_broker(
+                        base_url,
+                        headers,
+                        deal_id,
+                        new_stop,
+                        creds=creds,
+                        chat_id=str(chat_id),
+                    )
                     if not ok:
                         print(f"⚠️  Broker stop sync failed [{symbol} {deal_id}]: {info}")
                 stop_triggered = is_stop_hit(current_price, new_stop, direction)
@@ -1638,7 +1834,14 @@ def monitor_and_close(chat_id):
                     )
                     if float(base_stop) != new_stop:
                         update_trade_stop(trade['trade_id'], new_stop)
-                        ok, info = _sync_stop_to_broker(base_url, headers, deal_id, new_stop)
+                        ok, info = _sync_stop_to_broker(
+                            base_url,
+                            headers,
+                            deal_id,
+                            new_stop,
+                            creds=creds,
+                            chat_id=str(chat_id),
+                        )
                         if not ok:
                             print(f"⚠️  Broker stop sync failed [{symbol} {deal_id}]: {info}")
 
@@ -1659,15 +1862,16 @@ def monitor_and_close(chat_id):
         )
 
         if stop_triggered:
-            del_res = requests.delete(
-                f"{base_url}/positions/{deal_id}", headers=headers
+            ok_del, close_payload, close_err, close_status = _broker_request(
+                "DELETE",
+                f"{base_url}/positions/{deal_id}",
+                headers=headers,
+                timeout=20,
+                creds=creds,
+                chat_id=str(chat_id),
             )
-            if del_res.status_code == 200:
+            if ok_del:
                 # Capture dealReference from close response when present (Capital often keys history by it).
-                try:
-                    close_payload = del_res.json() or {}
-                except Exception:
-                    close_payload = {}
                 deal_ref = (
                     close_payload.get("dealReference")
                     or close_payload.get("dealRef")
@@ -1777,6 +1981,14 @@ def monitor_and_close(chat_id):
                 # DB-first: Telegram body is built from persisted trade row.
                 send_bot_automated_close_from_db(int(trade_id))
                 closed_any = True
+            else:
+                _audit_exec_event(
+                    stage="close_request_failed",
+                    chat_id=str(chat_id),
+                    symbol=str(symbol),
+                    action=str(direction),
+                    details=f"deal_id={deal_id} status={close_status} err={str(close_err)[:220]}",
+                )
 
     return closed_any
 
@@ -1855,7 +2067,17 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
         return msg
 
     # ── Duplicate check (epic-first, robust) ─────────────────────────────────
-    pos_res = requests.get(f"{base_url}/positions", headers=headers)
+    pos_res, headers = _resilient_capital_get(
+        f"{base_url}/positions",
+        headers=headers,
+        timeout=20,
+        chat_id=str(chat_id),
+        creds=creds,
+    )
+    if pos_res is None:
+        msg = f"❌ Order failed ({symbol} {action}): broker request failed"
+        _maybe_notify_rejection(chat_id, msg, symbol=symbol, action=action, stage="broker_positions_request")
+        return msg
     if pos_res.status_code == 200:
         for p in pos_res.json().get('positions', []):
             m = p.get('market', {})
@@ -2204,7 +2426,15 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
         last_err = ""
         for attempt in range(attempts):
             ok, out = _open_position_with_protection(
-                base_url, headers, order_epic, action, leg_size, stop_level, leg_target
+                base_url,
+                headers,
+                order_epic,
+                action,
+                leg_size,
+                stop_level,
+                leg_target,
+                creds=creds,
+                chat_id=str(chat_id),
             )
             if not ok:
                 last_err = str(out)
@@ -2241,7 +2471,13 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
                 }
             )
             ok_sync, info = _sync_protection_to_broker(
-                base_url, headers, str(deal_id), stop_level, float(leg_target)
+                base_url,
+                headers,
+                str(deal_id),
+                stop_level,
+                float(leg_target),
+                creds=creds,
+                chat_id=str(chat_id),
             )
             if not ok_sync:
                 print(
@@ -2253,7 +2489,13 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
         # If this leg failed, rollback any opened legs and abort (no half-configured trade).
         if len(opened_broker_legs) != (idx + 1):
             for ob in reversed(opened_broker_legs):
-                ok_del, info = _delete_position(base_url, headers, str(ob.get("deal_id") or ""))
+                ok_del, info = _delete_position(
+                    base_url,
+                    headers,
+                    str(ob.get("deal_id") or ""),
+                    creds=creds,
+                    chat_id=str(chat_id),
+                )
                 if not ok_del:
                     print(f"⚠️  Rollback failed for {symbol} deal={ob.get('deal_id')}: {info}")
             reason = last_err or "unknown rejection"

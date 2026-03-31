@@ -3,8 +3,21 @@ import smtplib
 from email.mime.text import MIMEText
 import requests
 from dotenv import load_dotenv
+from utils.market_hours import now_uae
 
 load_dotenv()
+
+
+def _dubai_timestamp() -> str:
+    return now_uae().strftime("%Y-%m-%d %H:%M:%S GST")
+
+
+def _with_dubai_footer(message: str) -> str:
+    text = str(message or "")
+    # Avoid duplicate footer if caller already added Dubai/GST line.
+    if "GST" in text and ("Dubai" in text or "دبي" in text):
+        return text
+    return f"{text}\n\n🕓 Dubai: {_dubai_timestamp()}"
 
 
 def send_telegram_message(chat_id, message):
@@ -14,9 +27,10 @@ def send_telegram_message(chat_id, message):
         print("[Telegram] Missing TELEGRAM_BOT_TOKEN; message not sent.", flush=True)
         return None
     url = f"https://api.telegram.org/bot{token}/sendMessage"
+    stamped_message = _with_dubai_footer(str(message))
     payload = {
         "chat_id":    chat_id,
-        "text":       message,
+        "text":       stamped_message,
         "parse_mode": "Markdown",
     }
     try:
@@ -37,6 +51,7 @@ def send_telegram_message(chat_id, message):
             # Fallback: resend without Markdown formatting to avoid parse errors blocking alerts.
             try:
                 payload2 = {"chat_id": chat_id, "text": str(message)}
+                payload2["text"] = stamped_message
                 response2 = requests.post(url, json=payload2, timeout=20)
                 data2 = response2.json()
                 if isinstance(data2, dict) and data2.get("ok", False):
@@ -67,11 +82,11 @@ def notify_admin_alert(message: str) -> None:
     """
     admin_id = (os.getenv("ADMIN_CHAT_ID") or "").strip()
     token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-    text = str(message or "")[:4000]
+    text = _with_dubai_footer(str(message or ""))[:4000]
     if not text:
         return
     if not admin_id or not token:
-        print(f"[Admin alert] {text}", flush=True)
+        print(f"[Admin alert { _dubai_timestamp() }] {text}", flush=True)
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:

@@ -29,12 +29,21 @@ Storage rule
 """
 
 from datetime import datetime, time, timedelta, timezone
+import socket
+import struct
 import pytz
 
 # ── Timezone constants ────────────────────────────────────────────────────────
 
 ET  = pytz.timezone('America/New_York')   # EDT (UTC-4) ↔ EST (UTC-5), auto-DST
 UAE = pytz.timezone('Asia/Dubai')         # GST = UTC+4, no DST ever
+UTC = pytz.utc
+
+# Runtime UTC correction from NTP (seconds). We never mutate system clock;
+# we keep a process-level offset and use it for all broker-critical timestamps.
+_NTP_OFFSET_SECONDS = 0.0
+_NTP_LAST_SYNC_UTC: datetime | None = None
+_NTP_LAST_SERVER = ""
 
 # ── ET session boundary times (always relative to ET clock) ──────────────────
 
@@ -59,7 +68,7 @@ def _now_et() -> datetime:
     pytz applies the correct UTC offset (EDT or EST) at call-time.
     No static offset is ever used.
     """
-    return datetime.now(ET)
+    return synchronized_utc_now().astimezone(ET)
 
 
 def utc_now() -> datetime:
@@ -67,7 +76,7 @@ def utc_now() -> datetime:
     Current UTC timestamp — use this for ALL database writes.
     Produces timezone-aware datetimes; call .isoformat() for storage.
     """
-    return datetime.now(timezone.utc)
+    return synchronized_utc_now()
 
 
 def utc_today() -> datetime.date:
@@ -77,7 +86,75 @@ def utc_today() -> datetime.date:
 
 def now_uae() -> datetime:
     """Current wall-clock time in Dubai (GST, UTC+4)."""
-    return datetime.now(UAE)
+    return synchronized_utc_now().astimezone(UAE)
+
+
+def synchronized_utc_now() -> datetime:
+    """
+    UTC now corrected by the in-process NTP offset.
+    Falls back to system UTC when no sync exists.
+    """
+    return datetime.now(timezone.utc) + timedelta(seconds=float(_NTP_OFFSET_SECONDS))
+
+
+def sync_utc_with_ntp(
+    ntp_servers: list[str] | None = None,
+    timeout_sec: float = 2.5,
+) -> dict:
+    """
+    Sync process UTC offset with a public NTP server.
+    Returns diagnostics and never raises.
+    """
+    global _NTP_OFFSET_SECONDS, _NTP_LAST_SYNC_UTC, _NTP_LAST_SERVER
+    servers = ntp_servers or ["pool.ntp.org", "time.google.com", "time.windows.com"]
+    timeout = max(0.5, float(timeout_sec))
+    # RFC 5905: NTP timestamp is seconds since 1900-01-01.
+    ntp_epoch_offset = 2208988800
+    packet = b"\x1b" + 47 * b"\0"
+
+    last_error = "ntp_sync_failed"
+    for host in servers:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.settimeout(timeout)
+            t0 = datetime.now(timezone.utc).timestamp()
+            sock.sendto(packet, (host, 123))
+            data, _ = sock.recvfrom(48)
+            t3 = datetime.now(timezone.utc).timestamp()
+            if len(data) < 48:
+                last_error = f"short_ntp_reply:{host}"
+                continue
+            # Receive timestamp (T4/server transmit) is bytes 40:48.
+            recv_sec, recv_frac = struct.unpack("!II", data[40:48])
+            server_time = float(recv_sec - ntp_epoch_offset) + (float(recv_frac) / 2**32)
+            local_midpoint = (t0 + t3) / 2.0
+            offset = server_time - local_midpoint
+            _NTP_OFFSET_SECONDS = float(offset)
+            _NTP_LAST_SYNC_UTC = datetime.now(timezone.utc)
+            _NTP_LAST_SERVER = str(host)
+            return {
+                "ok": True,
+                "server": str(host),
+                "offset_seconds": float(offset),
+                "latency_ms": float((t3 - t0) * 1000.0),
+                "synced_at_utc": _NTP_LAST_SYNC_UTC.isoformat(),
+            }
+        except Exception as exc:
+            last_error = f"{host}:{exc}"
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+    return {"ok": False, "error": str(last_error)}
+
+
+def get_clock_sync_state() -> dict:
+    return {
+        "offset_seconds": float(_NTP_OFFSET_SECONDS),
+        "last_sync_utc": _NTP_LAST_SYNC_UTC.isoformat() if _NTP_LAST_SYNC_UTC else None,
+        "ntp_server": _NTP_LAST_SERVER or None,
+    }
 
 
 def _to_aware_utc(dt: datetime | None) -> datetime:
@@ -266,7 +343,7 @@ US_CASH_ORDER_CUTOFF_MINUTES = 5  # block new orders in final N minutes of RTH
 
 def utc_time_now() -> time:
     """Current UTC wall-clock time (naive time object)."""
-    return datetime.now(timezone.utc).time()
+    return synchronized_utc_now().time()
 
 
 def is_within_us_cash_session_utc(now: datetime | None = None) -> tuple[bool, str]:

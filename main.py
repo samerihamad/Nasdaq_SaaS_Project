@@ -40,6 +40,9 @@ from utils.market_hours import (
     utc_today,
     get_current_timezones,
     ET,
+    UAE,
+    synchronized_utc_now,
+    sync_utc_with_ntp,
 )
 from utils.daily_report import send_daily_reports
 from core.executor import place_trade_for_user, monitor_and_close, process_pending_limit_orders
@@ -144,7 +147,7 @@ _market_open_state_file = os.path.join(LOG_ROOT, "market_open_state.json")
 
 def _ensure_daily_log_dir() -> str:
     """Create daily log directory and return its path."""
-    day_dir = os.path.join(LOG_ROOT, datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+    day_dir = os.path.join(LOG_ROOT, synchronized_utc_now().strftime("%Y-%m-%d"))
     os.makedirs(day_dir, exist_ok=True)
     return day_dir
 
@@ -154,7 +157,7 @@ def _append_daily_log(filename: str, message: str):
     try:
         log_dir = _ensure_daily_log_dir()
         path = os.path.join(log_dir, filename)
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        ts = synchronized_utc_now().strftime("%Y-%m-%d %H:%M:%S UTC")
         with open(path, "a", encoding="utf-8") as f:
             f.write(f"[{ts}] {message}\n")
     except Exception as exc:
@@ -166,7 +169,7 @@ def _append_market_open_log(message: str):
     try:
         os.makedirs(LOG_ROOT, exist_ok=True)
         path = os.path.join(LOG_ROOT, "market_open.log")
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        ts = synchronized_utc_now().strftime("%Y-%m-%d %H:%M:%S UTC")
         with open(path, "a", encoding="utf-8") as f:
             f.write(f"[{ts}] {message}\n")
     except Exception as exc:
@@ -288,7 +291,7 @@ def _heartbeat_loop():
     while True:
         try:
             with open(HEARTBEAT_FILE, 'w') as f:
-                json.dump({'timestamp': datetime.now(timezone.utc).isoformat()}, f)
+                json.dump({'timestamp': synchronized_utc_now().isoformat()}, f)
         except Exception as e:
             print(f"[HEARTBEAT] write error: {e}")
         time.sleep(HEARTBEAT_INTERVAL)
@@ -495,32 +498,36 @@ def _market_open_alert_loop():
         _market_open_last_alert_date = _load_market_open_last_alert_date()
     while True:
         try:
-            now_utc = datetime.now(timezone.utc)
+            now_utc = synchronized_utc_now()
             now_ny = now_utc.astimezone(ET)
             ny_date = now_ny.date().isoformat()
-            is_open_tick = (
+            now_dubai = now_utc.astimezone(UAE)
+            # Wide-enough window to avoid missing 09:30 tick if loop is delayed.
+            is_open_window = (
                 now_ny.hour == 9
-                and now_ny.minute == 30
-                and 0 <= now_ny.second < 60
+                and 30 <= now_ny.minute <= 35
             )
-            if is_open_tick and _market_open_last_alert_date != ny_date:
+            if is_open_window and _market_open_last_alert_date != ny_date:
                 tz_map = get_current_timezones(now_utc)
                 snapshot = _compute_open_snapshot(now_utc)
-                ny_clock = now_utc.astimezone(ET).strftime("%Y-%m-%d %H:%M:%S ET")
-                dubai_clock = tz_map.get("dubai", "")
+                ny_clock = now_ny.strftime("%Y-%m-%d %H:%M:%S ET")
+                dubai_clock = now_dubai.strftime("%Y-%m-%d %H:%M:%S GST")
                 watchlist_size = len(_watchlist)
                 spy_open_txt = _fmt_float(snapshot.get("spy_open"), 2)
                 gap_pct_val = snapshot.get("gap_pct")
                 gap_pct_txt = _fmt_float(gap_pct_val, 2)
                 lang = os.getenv("ADMIN_LANG", "ar").strip().lower()
+                system_status = (
+                    f"Engine=ACTIVE | Market={get_market_status()} | Watchlist={watchlist_size}"
+                )
 
                 english_template = (
                     "🚀 Market Open — NYSE/NASDAQ just opened.\n"
                     "🕘 New York time: {ny_time}\n"
                     "🕓 Dubai time: {dubai_time}\n"
+                    "🟢 System status: {system_status}\n"
                     "📈 SPY price at open: {spy_open}\n"
                     "📊 Gap: {gap_dir} ({gap_pct}%)\n"
-                    "🧾 Watchlist size: {watchlist_size}\n"
                     "🌅 Pre-market summary: {premarket_summary}\n"
                     "— NATB v2.0"
                 )
@@ -528,9 +535,9 @@ def _market_open_alert_loop():
                     "🚀 افتتاح السوق — NYSE/NASDAQ بدأ الآن.\n"
                     "🕘 توقيت نيويورك: {ny_time}\n"
                     "🕓 توقيت دبي: {dubai_time}\n"
+                    "🟢 حالة النظام: {system_status}\n"
                     "📈 سعر SPY عند الافتتاح: {spy_open}\n"
                     "📊 الفجوة: {gap_dir} ({gap_pct}%)\n"
-                    "🧾 حجم قائمة المراقبة: {watchlist_size}\n"
                     "🌅 ملخص ما قبل الافتتاح: {premarket_summary}\n"
                     "— NATB v2.0"
                 )
@@ -539,20 +546,20 @@ def _market_open_alert_loop():
                     msg = english_template.format(
                         ny_time=ny_clock,
                         dubai_time=dubai_clock,
+                        system_status=system_status,
                         spy_open=spy_open_txt,
                         gap_dir=snapshot.get("gap_dir_en", "Flat"),
                         gap_pct=gap_pct_txt,
-                        watchlist_size=watchlist_size,
                         premarket_summary=snapshot.get("premarket_summary_en", "N/A"),
                     )
                 else:
                     msg = arabic_template.format(
                         ny_time=ny_clock,
                         dubai_time=dubai_clock,
+                        system_status=system_status,
                         spy_open=spy_open_txt,
                         gap_dir=snapshot.get("gap_dir_ar", "محايد"),
                         gap_pct=gap_pct_txt,
-                        watchlist_size=watchlist_size,
                         premarket_summary=snapshot.get("premarket_summary_ar", "غير متاح"),
                     )
                 if ADMIN_CHAT_ID:
@@ -695,7 +702,7 @@ def _auto_resume_trading_at_open():
 
 def run_daily_scan():
     print("=" * 55)
-    print(f"🌅 المسح اليومي الشامل — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"🌅 المسح اليومي الشامل — {synchronized_utc_now().strftime('%Y-%m-%d %H:%M UTC')}")
 
     tickers = get_nasdaq_tickers()
     if not tickers:
@@ -1103,6 +1110,11 @@ def run_trading_bot():
     active_min_conf = float(SIGNAL_MIN_CONFIDENCE if SIGNAL_MIN_CONFIDENCE is not None else MIN_CONFIDENCE)
     print(f"   الثقة الدنيا: {active_min_conf}% | فحص كل {CHECK_INTERVAL}s")
     print("-" * 55)
+    try:
+        ntp_diag = sync_utc_with_ntp()
+        _append_daily_log("timezone_snapshot.txt", f"startup_ntp_sync={ntp_diag}")
+    except Exception:
+        pass
 
     # Timezone snapshot for runtime auditability.
     try:
@@ -1122,7 +1134,7 @@ def run_trading_bot():
         if not ADMIN_CHAT_ID:
             print("[Telegram] ADMIN_CHAT_ID is not set; startup ping skipped.", flush=True)
         elif not is_maintenance_mode():
-            now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            now_utc = synchronized_utc_now().strftime("%Y-%m-%d %H:%M UTC")
             send_telegram_message(
                 ADMIN_CHAT_ID,
                 f"✅ Engine started\n🕒 {now_utc}",
@@ -1134,7 +1146,7 @@ def run_trading_bot():
 
     while True:
         try:
-            now_utc       = datetime.now(timezone.utc)
+            now_utc       = synchronized_utc_now()
             today         = utc_today()
             market_status = get_market_status()
 
