@@ -46,6 +46,13 @@ _TF_CONFIG = {
 }
 
 
+_SECONDARY_TF_CONFIG = {
+    "1d": {"interval": "1d", "range": "1y", "needs_4h_resample": False},
+    "4h": {"interval": "60m", "range": "6mo", "needs_4h_resample": True},
+    "15m": {"interval": "15m", "range": "60d", "needs_4h_resample": False},
+}
+
+
 def _append_data_quality_log(symbol: str, timeframe: str, status: str, details: str):
     """Append per-symbol/timeframe data quality logs into daily folder."""
     try:
@@ -242,6 +249,93 @@ def _parse_capital_ohlcv(payload: dict) -> pd.DataFrame | None:
     return df
 
 
+def _parse_secondary_ohlcv(payload: dict) -> pd.DataFrame | None:
+    """
+    Secondary data-source parser (Yahoo Chart API shape).
+    """
+    try:
+        result = (((payload or {}).get("chart") or {}).get("result") or [])
+        if not result:
+            return None
+        row0 = result[0] or {}
+        ts = row0.get("timestamp") or []
+        quote = (((row0.get("indicators") or {}).get("quote") or [{}])[0]) or {}
+        if not ts:
+            return None
+        n = len(ts)
+        opens = list(quote.get("open") or [None] * n)
+        highs = list(quote.get("high") or [None] * n)
+        lows = list(quote.get("low") or [None] * n)
+        closes = list(quote.get("close") or [None] * n)
+        vols = list(quote.get("volume") or [0] * n)
+        rows = []
+        for i in range(n):
+            rows.append(
+                {
+                    "Date": pd.to_datetime(int(ts[i]), unit="s", utc=True),
+                    "Open": opens[i],
+                    "High": highs[i],
+                    "Low": lows[i],
+                    "Close": closes[i],
+                    "Volume": vols[i] if vols[i] is not None else 0,
+                }
+            )
+        if not rows:
+            return None
+        df = pd.DataFrame(rows).dropna(subset=["Date"])
+        if df.empty:
+            return None
+        return df.set_index("Date")
+    except Exception:
+        return None
+
+
+def _fetch_secondary_bars(symbol: str, timeframe: str) -> pd.DataFrame | None:
+    """
+    Secondary fallback source for insufficient/failed primary fetches.
+    Uses Yahoo Finance chart endpoint without extra package dependencies.
+    """
+    tf = str(timeframe).lower()
+    cfg = _SECONDARY_TF_CONFIG.get(tf)
+    if cfg is None:
+        return None
+
+    query_symbol = str(symbol or "").strip().upper()
+    if not query_symbol:
+        return None
+    # Yahoo symbols generally use '-' instead of '.' for class shares.
+    query_symbol = query_symbol.replace(".", "-")
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{query_symbol}"
+    params = {
+        "interval": cfg["interval"],
+        "range": cfg["range"],
+        "includePrePost": "true",
+        "events": "history",
+    }
+
+    try:
+        res = requests.get(url, params=params, timeout=_DATA_TIMEOUT_SEC)
+        if res.status_code != 200:
+            return None
+        parsed = _parse_secondary_ohlcv(res.json() or {})
+        if parsed is None or parsed.empty:
+            return None
+        if bool(cfg.get("needs_4h_resample")):
+            agg = {
+                "Open": "first",
+                "High": "max",
+                "Low": "min",
+                "Close": "last",
+                "Volume": "sum",
+            }
+            parsed = parsed.resample("4h").agg(agg).dropna(subset=["Open", "High", "Low", "Close"])
+            if parsed.empty:
+                return None
+        return parsed
+    except Exception:
+        return None
+
+
 def _clean_ohlcv(
     symbol: str,
     timeframe: str,
@@ -409,7 +503,14 @@ def _resolve_epic(base_url: str, headers: dict, symbol: str) -> str | None:
     return None
 
 
-def _fetch_bars(base_url: str, headers: dict, epic: str, timeframe: str) -> pd.DataFrame | None:
+def _fetch_bars(
+    base_url: str,
+    headers: dict,
+    epic: str,
+    timeframe: str,
+    *,
+    fallback_symbol: str | None = None,
+) -> pd.DataFrame | None:
     cfg = _TF_CONFIG[timeframe]
     last_err = ""
     for res_name in cfg["resolutions"]:
@@ -445,6 +546,33 @@ def _fetch_bars(base_url: str, headers: dict, epic: str, timeframe: str) -> pd.D
             return df_clean
         except Exception as exc:
             last_err = f"exception resolution={res_name}: {exc}"
+
+    # Secondary source fallback for insufficient/failed primary data.
+    if fallback_symbol:
+        df_secondary = _fetch_secondary_bars(str(fallback_symbol), timeframe)
+        if df_secondary is not None and not df_secondary.empty:
+            df_secondary_clean = _clean_ohlcv(
+                symbol=str(fallback_symbol),
+                timeframe=timeframe,
+                df=df_secondary,
+                step_sec=int(cfg["step_sec"]),
+            )
+            if (
+                df_secondary_clean is not None
+                and not df_secondary_clean.empty
+                and len(df_secondary_clean) >= int(cfg["min_rows"])
+            ):
+                _append_data_quality_log(
+                    str(fallback_symbol),
+                    timeframe,
+                    "WARN",
+                    (
+                        "primary_failed_secondary_used "
+                        f"rows={len(df_secondary_clean)} last_primary_error={last_err}"
+                    ),
+                )
+                return df_secondary_clean
+
     _append_data_quality_log(epic, timeframe, "ERROR", last_err or "unknown fetch error")
     return None
 
@@ -499,22 +627,52 @@ def scan_market(ticker_symbol, period="1d", interval="5m", session_context: dict
             timeout=_DATA_TIMEOUT_SEC,
         )
         if res.status_code != 200:
+            parsed = None
+        else:
+            parsed = _parse_capital_ohlcv(res.json() or {})
+        cleaned = None
+        if parsed is not None and not parsed.empty:
+            cleaned = _clean_ohlcv(
+                symbol=str(ticker_symbol),
+                timeframe=str(interval),
+                df=parsed,
+                step_sec=step_sec,
+            )
+        if cleaned is not None and not cleaned.empty:
+            return cleaned
+
+        # Secondary fallback if primary source returns insufficient/invalid data.
+        fallback_tf = "15m" if str(interval).lower() in ("5m", "15m") else str(interval).lower()
+        secondary = _fetch_secondary_bars(str(ticker_symbol), fallback_tf)
+        if secondary is None or secondary.empty:
             _append_data_quality_log(
                 str(ticker_symbol),
                 str(interval),
                 "ERROR",
-                f"HTTP {res.status_code}",
+                f"insufficient data on primary and secondary source (primary_status={res.status_code})",
             )
             return None
-        parsed = _parse_capital_ohlcv(res.json() or {})
-        if parsed is None or parsed.empty:
-            return None
-        return _clean_ohlcv(
+        secondary_clean = _clean_ohlcv(
             symbol=str(ticker_symbol),
             timeframe=str(interval),
-            df=parsed,
+            df=secondary,
             step_sec=step_sec,
         )
+        if secondary_clean is None or secondary_clean.empty:
+            _append_data_quality_log(
+                str(ticker_symbol),
+                str(interval),
+                "ERROR",
+                "secondary source returned unusable data after cleaning",
+            )
+            return None
+        _append_data_quality_log(
+            str(ticker_symbol),
+            str(interval),
+            "WARN",
+            f"primary_failed_secondary_used primary_status={res.status_code}",
+        )
+        return secondary_clean
     except Exception as exc:
         print(f"❌ Scanner error [{ticker_symbol}]: {exc}")
         return None
@@ -540,9 +698,9 @@ def scan_multi_timeframe(symbol, session_context: dict | None = None):
             _append_data_quality_log(symbol, "all", "ERROR", "epic not found on Capital")
             return None
 
-        df_1d = _fetch_bars(base_url, headers, epic, "1d")
-        df_4h = _fetch_bars(base_url, headers, epic, "4h")
-        df_15m = _fetch_bars(base_url, headers, epic, "15m")
+        df_1d = _fetch_bars(base_url, headers, epic, "1d", fallback_symbol=str(symbol))
+        df_4h = _fetch_bars(base_url, headers, epic, "4h", fallback_symbol=str(symbol))
+        df_15m = _fetch_bars(base_url, headers, epic, "15m", fallback_symbol=str(symbol))
 
         if any(df is None or df.empty for df in (df_1d, df_4h, df_15m)):
             _append_data_quality_log(

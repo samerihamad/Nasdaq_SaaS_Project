@@ -19,7 +19,13 @@ import requests
 from bot.notifier import send_telegram_message
 from bot.licensing import safe_decrypt
 from utils.market_hours import utc_today
-from config import MAX_DAILY_TRADES, GLOBAL_MAX_OPEN_TRADES, MAX_DAILY_LOSS_PCT
+from config import (
+    MAX_DAILY_TRADES,
+    GLOBAL_MAX_OPEN_TRADES,
+    MAX_DAILY_LOSS_PCT,
+    HIGH_CONFIDENCE_SL_RELAX_THRESHOLD,
+    HIGH_CONFIDENCE_SL_RELAX_MULTIPLIER,
+)
 from database.db_manager import (
     is_master_kill_switch, get_user_kill_switch, get_user_risk_params,
     get_preferred_leverage, set_trading_enabled,
@@ -771,10 +777,17 @@ def validate_pre_trade(
     stop_loss_pct = stop_dist / entry
     if stop_loss_pct <= 0 or stop_loss_pct >= 0.5:
         return False, "Trade rejected: invalid stop-loss ratio", {}
-    if (stop_loss_pct - float(MAX_STOP_LOSS_PCT)) > 1e-9:
+    conf_val = float(confidence)
+    max_stop_loss_pct_allowed = float(MAX_STOP_LOSS_PCT)
+    if conf_val > float(HIGH_CONFIDENCE_SL_RELAX_THRESHOLD):
+        max_stop_loss_pct_allowed = float(MAX_STOP_LOSS_PCT) * float(HIGH_CONFIDENCE_SL_RELAX_MULTIPLIER)
+
+    if (stop_loss_pct - max_stop_loss_pct_allowed) > 1e-9:
         return False, "Trade rejected: stop-loss exceeds max risk distance", {
             "stop_loss_pct": round(stop_loss_pct, 8),
-            "max_stop_loss_pct": float(MAX_STOP_LOSS_PCT),
+            "max_stop_loss_pct": round(max_stop_loss_pct_allowed, 8),
+            "base_max_stop_loss_pct": float(MAX_STOP_LOSS_PCT),
+            "confidence": round(conf_val, 2),
         }
 
     # Trade count constraints

@@ -31,8 +31,9 @@ WATCHLIST = [
 # ── Mean Reversion Parameters ─────────────────────────────────────────────────
 
 # RSI thresholds for oversold / overbought detection
-MR_RSI_OVERSOLD      = 35      # institutional strict: deeper oversold
-MR_RSI_OVERBOUGHT    = 65      # institutional strict: deeper overbought
+# Requested profile: accept extremes at <= 40 and >= 60.
+MR_RSI_OVERSOLD      = 40
+MR_RSI_OVERBOUGHT    = 60
 
 # Required % deviation from VWAP to confirm price is stretched
 MR_VWAP_DEV_PCT      = 1.2
@@ -238,6 +239,11 @@ MS_SCORE_AI_MAX_IMPACT = float(os.getenv("MS_SCORE_AI_MAX_IMPACT", "8.0"))
 
 # Anti-spam: minimum gap between repeated rejection notifications to the same user.
 EXECUTION_REJECTION_NOTIFY_COOLDOWN_SEC = int(os.getenv("EXECUTION_REJECTION_NOTIFY_COOLDOWN_SEC", "600"))
+
+# High-confidence risk-distance relaxation:
+# when confidence > threshold, allow up to (base max stop-loss pct * multiplier).
+HIGH_CONFIDENCE_SL_RELAX_THRESHOLD = float(os.getenv("HIGH_CONFIDENCE_SL_RELAX_THRESHOLD", "80.0"))
+HIGH_CONFIDENCE_SL_RELAX_MULTIPLIER = float(os.getenv("HIGH_CONFIDENCE_SL_RELAX_MULTIPLIER", "1.15"))
 
 # ── Phase 7: Deep Direction Model (optional) ─────────────────────────────────
 # RF pipeline remains default. These settings configure optional LSTM/GRU/Transformer training.
