@@ -3,6 +3,7 @@ import asyncio
 from datetime import datetime, timezone
 
 import aiohttp
+from multidict import CIMultiDictProxy
 import numpy as np
 import pandas as pd
 
@@ -183,7 +184,7 @@ async def _aio_post_json(
     *,
     headers: dict,
     json_body: dict,
-) -> tuple[int, aiohttp.MultidictProxy | dict, dict | None]:
+) -> tuple[int, CIMultiDictProxy | dict, dict | None]:
     """POST JSON; returns (status, response_headers, body or None)."""
     for attempt in range(2):
         async with sem:
