@@ -1,3 +1,7 @@
+"""
+Capital.com OHLCV via aiohttp. Watchlist Level 2 gap filter calls `scan_market_async`
+with a shared session and `CAPITAL_HTTP_CONCURRENCY` (see utils.filters.level2_filter_async).
+"""
 import os
 import asyncio
 from datetime import datetime, timezone

@@ -597,12 +597,13 @@ def fetch_closed_deal_final_data(
         time.sleep(sl)
         attempt_idx += 1
 
-    print("Warning: Could not sync final data from Capital.com", flush=True)
-    print(
-        f"[Capital Sync] transaction not found yet ids={ids} "
-        f"after {wall:.0f}s wall last_issue={last_issue or 'no_match'}",
-        flush=True,
-    )
+    if not quiet:
+        print("Warning: Could not sync final data from Capital.com", flush=True)
+        print(
+            f"[Capital Sync] transaction not found yet ids={ids} "
+            f"after {wall:.0f}s wall last_issue={last_issue or 'no_match'}",
+            flush=True,
+        )
     return None
 
 
@@ -630,46 +631,69 @@ def _finalize_trade_close_notifications(trade_id: int) -> None:
         pass
 
 
+FINAL_SYNC_HOURLY_RETRY_SEC = float(os.getenv("FINAL_SYNC_HOURLY_RETRY_SEC", "3600"))
+FINAL_SYNC_CONSOLE_WARN_AFTER_SEC = float(os.getenv("FINAL_SYNC_CONSOLE_WARN_AFTER_SEC", "86400"))
+
+
 def spawn_background_final_sync(
     trade_id: int,
     *,
     max_wall_sec: float | None = None,
 ) -> None:
     """
-    Non-blocking: daemon thread runs full broker history sync with exponential backoff
-    up to max_wall_sec (default FINAL_SYNC_MAX_WALL_SEC). Admin Telegram only if that
-    full budget is exhausted without success.
+    Non-blocking: daemon thread retries broker history sync on a schedule:
+    - Each attempt uses max_wall_sec (default FINAL_SYNC_MAX_WALL_SEC) with quiet logs.
+    - Waits FINAL_SYNC_HOURLY_RETRY_SEC between attempts (default 1h), indefinitely.
+    - No console Warning spam; first console + admin alert only after
+      FINAL_SYNC_CONSOLE_WARN_AFTER_SEC (default 24h) if still unsynced.
     """
     wall = float(max_wall_sec) if max_wall_sec is not None else float(FINAL_SYNC_MAX_WALL_SEC)
     tid = int(trade_id)
 
     def _run() -> None:
-        try:
-            result = try_sync_final_for_trade_id(
-                tid,
-                max_wall_sec=wall,
-                with_notifications=True,
-            )
-            if result is None:
+        t0 = time.time()
+        warned = False
+        while True:
+            try:
+                result = try_sync_final_for_trade_id(
+                    tid,
+                    max_wall_sec=wall,
+                    with_notifications=True,
+                    quiet=True,
+                )
+                if result is not None:
+                    return
+            except Exception as exc:
                 try:
                     from bot.notifier import notify_admin_alert
 
                     notify_admin_alert(
-                        "Final Capital.com history sync failed after all retry attempts "
-                        f"(~{wall:.0f}s budget). trade_id={tid}\n"
-                        "Check DB sync_status / close_sync_last_error; reconcile will keep trying."
+                        f"Background final_sync exception trade_id={tid}: {exc!s}"
                     )
                 except Exception:
                     pass
-        except Exception as exc:
-            try:
-                from bot.notifier import notify_admin_alert
 
-                notify_admin_alert(
-                    f"Background final_sync crashed trade_id={tid}: {exc!s}"
+            elapsed = time.time() - t0
+            if elapsed >= FINAL_SYNC_CONSOLE_WARN_AFTER_SEC and not warned:
+                print(
+                    "Warning: Final Capital.com history still missing after "
+                    f"{int(FINAL_SYNC_CONSOLE_WARN_AFTER_SEC // 3600)}h for trade_id={tid} "
+                    "(hourly retries continue).",
+                    flush=True,
                 )
-            except Exception:
-                pass
+                try:
+                    from bot.notifier import notify_admin_alert
+
+                    notify_admin_alert(
+                        "Final Capital.com history sync still failing after "
+                        f"{int(FINAL_SYNC_CONSOLE_WARN_AFTER_SEC // 3600)}h. trade_id={tid}\n"
+                        "Check sync_status / broker history; background worker continues hourly."
+                    )
+                except Exception:
+                    pass
+                warned = True
+
+            time.sleep(max(60.0, float(FINAL_SYNC_HOURLY_RETRY_SEC)))
 
     threading.Thread(
         target=_run,
@@ -685,6 +709,7 @@ def try_sync_final_for_trade_id(
     delay_sec: float = 2.0,
     max_wall_sec: float | None = None,
     with_notifications: bool = False,
+    quiet: bool = True,
 ) -> dict | None:
     """
     Emergency one-trade sync:
@@ -773,7 +798,7 @@ def try_sync_final_for_trade_id(
         wait_for_realized=wait_realized,
         identifiers=[str(deal_reference).strip()] if str(deal_reference or "").strip() else None,
         max_wall_sec=wall,
-        quiet=True,
+        quiet=quiet,
     )
     if not final:
         return None

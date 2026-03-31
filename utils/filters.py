@@ -1,10 +1,17 @@
+import asyncio
 import logging
+import aiohttp
 import requests
 import pandas as pd
 from io import StringIO
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from utils.market_scanner import scan_market
+from utils.market_scanner import (
+    scan_market,
+    scan_market_async,
+    CAPITAL_CLIENT_TIMEOUT,
+    CAPITAL_HTTP_CONCURRENCY,
+)
 from config import EARNINGS_TIMEOUT_SEC, EARNINGS_CACHE_TTL_SEC, FMP_API_KEY
 
 log = logging.getLogger(__name__)
@@ -454,6 +461,78 @@ def level1_filter(tickers: list[str], top_n: int = 300) -> list[str]:
 
 # ── Level 2 filter ────────────────────────────────────────────────────────────
 
+async def _fetch_daily_async(
+    session: aiohttp.ClientSession,
+    sem: asyncio.Semaphore,
+    symbol: str,
+    days: int = 5,
+) -> pd.DataFrame | None:
+    """Capital daily bars via shared aiohttp session (same Semaphore(3) as signal scan)."""
+    period = "5d" if int(days) <= 5 else "1mo"
+    try:
+        return await scan_market_async(
+            symbol,
+            period=period,
+            interval="1d",
+            session_context=None,
+            session=session,
+            semaphore=sem,
+        )
+    except Exception:
+        return None
+
+
+async def level2_filter_async(tickers: list[str]) -> list[str]:
+    """
+    Level 2 — Stability filter (async).
+    Gap checks run with shared aiohttp + bounded concurrency (CAPITAL_HTTP_CONCURRENCY).
+    Earnings remain bulk calendar fetch (not per symbol).
+    """
+    print(f"📊 المستوى 2: تصفية {len(tickers)} سهم (أخبار وفجوات) [async Capital]...")
+    today = datetime.now(timezone.utc).date()
+    earnings_cutoff = today + timedelta(days=EARNINGS_BUFFER_DAYS)
+    syms = [str(s).strip() for s in (tickers or []) if str(s).strip()]
+    n = len(syms)
+    if n == 0:
+        return []
+
+    gap_ok: set[str] = set()
+    sem = asyncio.Semaphore(CAPITAL_HTTP_CONCURRENCY)
+
+    async with aiohttp.ClientSession(timeout=CAPITAL_CLIENT_TIMEOUT) as session:
+
+        async def _gap_one(sym: str) -> None:
+            try:
+                hist = await _fetch_daily_async(session, sem, sym, 5)
+                if hist is None or len(hist) < 2:
+                    gap_ok.add(sym)
+                    return
+                prev_close = float(hist["Close"].iloc[-2])
+                curr_open = float(hist["Open"].iloc[-1])
+                if prev_close > 0 and abs(curr_open - prev_close) / prev_close > MAX_GAP_PCT:
+                    return
+                gap_ok.add(sym)
+            except Exception:
+                gap_ok.add(sym)
+
+        for batch_start in range(0, n, 20):
+            batch = syms[batch_start : batch_start + 20]
+            done = min(batch_start + len(batch), n)
+            print(f"[LEVEL 2] Processing {done}/{n}", flush=True)
+            await asyncio.gather(*[_gap_one(s) for s in batch])
+
+    candidates = [s for s in syms if s in gap_ok]
+
+    near_earnings_symbols = _get_near_earnings_symbols(today, earnings_cutoff)
+    if near_earnings_symbols:
+        stable = [s for s in candidates if str(s).upper() not in near_earnings_symbols]
+    else:
+        stable = candidates
+
+    print(f"✅ المستوى 2: اجتاز {len(stable)} سهم")
+    return stable
+
+
 def level2_filter(tickers: list[str]) -> list[str]:
     """
     Level 2 — Stability filter.
@@ -461,44 +540,11 @@ def level2_filter(tickers: list[str]) -> list[str]:
       - Earnings announcement within EARNINGS_BUFFER_DAYS days.
       - Price gap (open vs prev close) exceeding MAX_GAP_PCT (2%).
 
-    Gap check uses provider daily bars.
-    Earnings check uses NASDAQ earnings calendar (cached); optional FMP fallback.
+    Gap check uses provider daily bars (async aiohttp + shared Semaphore; see level2_filter_async).
+    Earnings check uses NASDAQ earnings calendar (cached, bulk by date range); optional FMP fallback.
     On provider failure, it safely degrades to pass-through.
     """
-    print(f"📊 المستوى 2: تصفية {len(tickers)} سهم (أخبار وفجوات)...")
-    today           = datetime.now(timezone.utc).date()
-    earnings_cutoff = today + timedelta(days=EARNINGS_BUFFER_DAYS)
-
-    # ── Step 1: gap check via provider daily bars ─────────────────────────────
-    gap_ok: set[str] = set()
-    with ThreadPoolExecutor(max_workers=20) as pool:
-        futures = {pool.submit(_fetch_daily, sym, 5): sym for sym in tickers}
-        for fut in as_completed(futures):
-            sym = futures[fut]
-            try:
-                hist = fut.result()
-                if hist is None or len(hist) < 2:
-                    gap_ok.add(sym)   # no data → don't penalise
-                    continue
-                prev_close = float(hist["Close"].iloc[-2])
-                curr_open = float(hist["Open"].iloc[-1])
-                if prev_close > 0 and abs(curr_open - prev_close) / prev_close > MAX_GAP_PCT:
-                    continue
-                gap_ok.add(sym)
-            except Exception:
-                gap_ok.add(sym)
-
-    candidates = [s for s in tickers if s in gap_ok]
-
-    # ── Step 2: earnings check via stable calendar provider ───────────────────
-    near_earnings_symbols = _get_near_earnings_symbols(today, earnings_cutoff)
-    if near_earnings_symbols:
-        stable = [s for s in candidates if str(s).upper() not in near_earnings_symbols]
-    else:
-        stable = candidates  # provider unavailable -> don't penalise
-
-    print(f"✅ المستوى 2: اجتاز {len(stable)} سهم")
-    return stable
+    return asyncio.run(level2_filter_async(tickers))
 
 
 def level3_filter(tickers: list[str]) -> list[str]:
