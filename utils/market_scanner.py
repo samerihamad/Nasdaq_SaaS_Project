@@ -1,9 +1,10 @@
 import os
+import asyncio
 from datetime import datetime, timezone
 
+import aiohttp
 import numpy as np
 import pandas as pd
-import requests
 
 from config import (
     CAPITAL_API_KEY,
@@ -21,24 +22,13 @@ from config import (
 _DATA_TIMEOUT_SEC = int(os.getenv("MARKET_DATA_TIMEOUT_SEC", "20"))
 _SESSION_TTL_SEC = int(os.getenv("MARKET_DATA_SESSION_TTL_SEC", "45"))
 _LOG_ROOT = os.getenv("ENGINE_LOG_ROOT", "logs")
-# Capital.com /prices max= upper bound (broker caps vary; stay within common API limits).
 _CAPITAL_PRICES_MAX_BARS_CAP = int(os.getenv("CAPITAL_PRICES_MAX_BARS_CAP", "1000"))
-# Daily: ask for the deepest history the API allows (capped at 1000).
 _DAILY_PRICES_MAX = min(1000, max(50, _CAPITAL_PRICES_MAX_BARS_CAP))
+CAPITAL_HTTP_CONCURRENCY = max(1, int(os.getenv("CAPITAL_HTTP_CONCURRENCY", "3")))
 
 _SESSION_CACHE: dict[str, dict] = {}
 _EPIC_CACHE: dict[str, str] = {}
 _UNSUPPORTED_CACHE: set[str] = set()
-
-
-def clear_local_price_caches() -> None:
-    """
-    Clear in-process Capital.com session/epic caches so the next requests
-    fetch fresh history (e.g. up to max=1000 daily bars). Call once at engine startup.
-    """
-    _SESSION_CACHE.clear()
-    _EPIC_CACHE.clear()
-    _UNSUPPORTED_CACHE.clear()
 
 _TF_CONFIG = {
     "1d": {
@@ -61,12 +51,22 @@ _TF_CONFIG = {
     },
 }
 
+_AIO_TIMEOUT = aiohttp.ClientTimeout(total=_DATA_TIMEOUT_SEC)
+# Shared aiohttp ClientSession timeout for batch scans (signal_engine).
+CAPITAL_CLIENT_TIMEOUT = _AIO_TIMEOUT
+
+
+def _new_http_semaphore() -> asyncio.Semaphore:
+    return asyncio.Semaphore(CAPITAL_HTTP_CONCURRENCY)
+
+
+def clear_local_price_caches() -> None:
+    _SESSION_CACHE.clear()
+    _EPIC_CACHE.clear()
+    _UNSUPPORTED_CACHE.clear()
+
 
 def _max_bar_attempts(base_max: int) -> list[int]:
-    """
-    Escalate Capital.com historical `max` when the first response has too few bars.
-    Tries progressively larger windows up to _CAPITAL_PRICES_MAX_BARS_CAP.
-    """
     cap = max(50, min(int(_CAPITAL_PRICES_MAX_BARS_CAP), 1000))
     m = max(1, int(base_max))
     attempts: list[int] = [min(m, cap)]
@@ -81,7 +81,6 @@ def _max_bar_attempts(base_max: int) -> list[int]:
 
 
 def _log_recovered_proceed(symbol: str, bar_count: int, timeframe: str) -> None:
-    """Soft band between MIN_ANALYSIS_BARS and TARGET_ANALYSIS_BARS: proceed but log visibility."""
     _append_data_quality_log(
         symbol,
         timeframe,
@@ -90,70 +89,7 @@ def _log_recovered_proceed(symbol: str, bar_count: int, timeframe: str) -> None:
     )
 
 
-def _smart_retry_daily_fetch(
-    base_url: str,
-    headers: dict,
-    epic: str,
-    cfg: dict,
-    log_symbol: str,
-) -> pd.DataFrame | None:
-    """
-    After normal escalation fails to reach MIN_ANALYSIS_BARS on daily data, try once more:
-    deepest max= with resolutions in reverse order, then a second pass with a slightly
-    lower max (covers API quirks without another data source).
-    """
-    cap = min(1000, max(50, int(_CAPITAL_PRICES_MAX_BARS_CAP)))
-    resolutions = list(cfg["resolutions"])
-    alt_maxes = (cap, max(MIN_ANALYSIS_BARS, int(round(cap * 0.92))))
-    last_err = ""
-    for max_try in alt_maxes:
-        for res_name in reversed(resolutions):
-            try:
-                res = requests.get(
-                    f"{base_url}/prices/{epic}",
-                    params={"resolution": res_name, "max": int(max_try)},
-                    headers=headers,
-                    timeout=_DATA_TIMEOUT_SEC,
-                )
-                if res.status_code != 200:
-                    last_err = f"smart_retry status={res.status_code} res={res_name} max={max_try}"
-                    continue
-                df_raw = _parse_capital_ohlcv(res.json() or {})
-                if df_raw is None or df_raw.empty:
-                    last_err = f"smart_retry empty res={res_name} max={max_try}"
-                    continue
-                df_clean = _clean_ohlcv(
-                    symbol=epic,
-                    timeframe="1d",
-                    df=df_raw,
-                    step_sec=int(cfg["step_sec"]),
-                )
-                if df_clean is None or df_clean.empty:
-                    last_err = f"smart_retry clean failed res={res_name} max={max_try}"
-                    continue
-                n = len(df_clean)
-                if n < int(cfg["min_rows"]):
-                    continue
-                if n < MIN_ANALYSIS_BARS:
-                    last_err = f"smart_retry rows={n} min={MIN_ANALYSIS_BARS} res={res_name} max={max_try}"
-                    continue
-                _append_data_quality_log(
-                    epic,
-                    "1d",
-                    "OK",
-                    f"smart_retry_ok resolution={res_name} max={max_try} rows={n}",
-                )
-                if MIN_ANALYSIS_BARS <= n < TARGET_ANALYSIS_BARS:
-                    _log_recovered_proceed(log_symbol, n, "1d")
-                return df_clean
-            except Exception as exc:
-                last_err = f"smart_retry exception res={res_name} max={max_try}: {exc}"
-    _append_data_quality_log(epic, "1d", "WARN", f"smart_retry_exhausted last={last_err}")
-    return None
-
-
 def _append_data_quality_log(symbol: str, timeframe: str, status: str, details: str):
-    """Append per-symbol/timeframe data quality logs into daily folder."""
     try:
         day_dir = os.path.join(_LOG_ROOT, datetime.now(timezone.utc).strftime("%Y-%m-%d"))
         os.makedirs(day_dir, exist_ok=True)
@@ -176,18 +112,6 @@ def _get_base_url(is_demo: bool) -> str:
 
 
 def _resolve_market_data_identity(session_context: dict | None = None) -> dict:
-    """
-    Resolve market-data credentials.
-    Backward compatible default is the global scanner identity from config.py.
-
-    session_context supported keys:
-      - api_key
-      - email
-      - password
-      - is_demo
-      - cache_key (optional explicit identity key)
-      - label (optional log label)
-    """
     ctx = dict(session_context or {})
     default_api_key = str(MARKET_DATA_CAPITAL_API_KEY or CAPITAL_API_KEY or "").strip()
     default_email = str(MARKET_DATA_CAPITAL_EMAIL or CAPITAL_EMAIL or "").strip()
@@ -218,10 +142,77 @@ def _resolve_market_data_identity(session_context: dict | None = None) -> dict:
     }
 
 
-def _get_market_data_session(session_context: dict | None = None) -> tuple[str | None, dict | None]:
-    """
-    Authenticate once and reuse short-lived Capital headers for scanner calls.
-    """
+async def _aio_get(
+    session: aiohttp.ClientSession,
+    sem: asyncio.Semaphore,
+    url: str,
+    *,
+    headers: dict,
+    params: dict | None = None,
+) -> tuple[int, dict | list | None]:
+    """GET JSON with semaphore + one retry on failure. Returns (status, body or None)."""
+    for attempt in range(2):
+        async with sem:
+            try:
+                async with session.get(
+                    url, headers=headers, params=params, timeout=_AIO_TIMEOUT
+                ) as resp:
+                    status = int(resp.status)
+                    if status == 200:
+                        try:
+                            data = await resp.json()
+                        except Exception:
+                            data = None
+                        return status, data
+                    if attempt == 0:
+                        await asyncio.sleep(0.12)
+                        continue
+                    return status, None
+            except Exception:
+                if attempt == 0:
+                    await asyncio.sleep(0.12)
+                    continue
+                return 0, None
+    return 0, None
+
+
+async def _aio_post_json(
+    session: aiohttp.ClientSession,
+    sem: asyncio.Semaphore,
+    url: str,
+    *,
+    headers: dict,
+    json_body: dict,
+) -> tuple[int, aiohttp.MultidictProxy | dict, dict | None]:
+    """POST JSON; returns (status, response_headers, body or None)."""
+    for attempt in range(2):
+        async with sem:
+            try:
+                async with session.post(
+                    url,
+                    headers=headers,
+                    json=json_body,
+                    timeout=_AIO_TIMEOUT,
+                ) as resp:
+                    status = int(resp.status)
+                    try:
+                        data = await resp.json() if status == 200 else None
+                    except Exception:
+                        data = None
+                    return status, resp.headers, data
+            except Exception:
+                if attempt == 0:
+                    await asyncio.sleep(0.12)
+                    continue
+                return 0, {}, None
+    return 0, {}, None
+
+
+async def _get_market_data_session_aio(
+    session: aiohttp.ClientSession,
+    sem: asyncio.Semaphore,
+    session_context: dict | None = None,
+) -> tuple[str | None, dict | None]:
     ident = _resolve_market_data_identity(session_context)
     api_key = str(ident["api_key"])
     email = str(ident["email"])
@@ -253,28 +244,26 @@ def _get_market_data_session(session_context: dict | None = None) -> tuple[str |
         "Accept": "application/json",
     }
     try:
-        res = requests.post(
+        st, hdrs, _ = await _aio_post_json(
+            session,
+            sem,
             f"{base_url}/session",
-            json={
-                "identifier": email,
-                "password": password,
-            },
             headers=base_headers,
-            timeout=_DATA_TIMEOUT_SEC,
+            json_body={"identifier": email, "password": password},
         )
-        if res.status_code != 200:
-            txt = (res.text or "").strip()
+        if st != 200:
+            txt = ""
             _append_data_quality_log(
                 label,
                 "auth",
                 "ERROR",
-                f"Capital auth failed status={res.status_code} body={txt[:220]}",
+                f"Capital auth failed status={st} body={txt[:220]}",
             )
             return None, None
         session_headers = {
             **base_headers,
-            "CST": res.headers.get("CST", ""),
-            "X-SECURITY-TOKEN": res.headers.get("X-SECURITY-TOKEN", ""),
+            "CST": hdrs.get("CST", "") if hasattr(hdrs, "get") else "",
+            "X-SECURITY-TOKEN": hdrs.get("X-SECURITY-TOKEN", "") if hasattr(hdrs, "get") else "",
         }
         _SESSION_CACHE[cache_key] = {
             "headers": session_headers,
@@ -339,7 +328,6 @@ def _parse_capital_ohlcv(payload: dict) -> pd.DataFrame | None:
     if not rows:
         return None
     df = pd.DataFrame(rows)
-    # Force UTC-aware parsing so downstream frames are timezone-safe.
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce", utc=True)
     df = df.dropna(subset=["Date"])
     if df.empty:
@@ -354,13 +342,6 @@ def _clean_ohlcv(
     df: pd.DataFrame,
     step_sec: int,
 ) -> pd.DataFrame | None:
-    """
-    Normalize and clean data:
-    - NaN / invalid OHLC rows
-    - duplicate timestamps
-    - timezone normalization to UTC-aware
-    - basic gap diagnostics
-    """
     if df is None or df.empty:
         _append_data_quality_log(symbol, timeframe, "ERROR", "empty dataframe")
         return None
@@ -436,12 +417,16 @@ def _clean_ohlcv(
     return work
 
 
-def _resolve_epic(base_url: str, headers: dict, symbol: str) -> str | None:
+async def _resolve_epic_aio(
+    session: aiohttp.ClientSession,
+    sem: asyncio.Semaphore,
+    base_url: str,
+    headers: dict,
+    symbol: str,
+) -> str | None:
     s = str(symbol or "").strip().upper()
     if not s:
         return None
-
-    # Keep compatibility with historical alias used elsewhere in the project.
     if s == "PAYP":
         s = "PYPL"
 
@@ -450,72 +435,120 @@ def _resolve_epic(base_url: str, headers: dict, symbol: str) -> str | None:
     if s in _UNSUPPORTED_CACHE:
         return None
 
-    try:
-        direct = requests.get(
-            f"{base_url}/markets/{s}",
-            headers=headers,
-            timeout=_DATA_TIMEOUT_SEC,
-        )
-        if direct.status_code == 200:
-            _EPIC_CACHE[s] = s
-            return s
-    except Exception:
-        pass
+    st, data = await _aio_get(session, sem, f"{base_url}/markets/{s}", headers=headers)
+    if st == 200 and data is not None:
+        _EPIC_CACHE[s] = s
+        return s
 
     candidates = [f"US.{s}.CASH", f"US.{s}.CFD", f"{s}.CASH", f"{s}.CFD"]
     for epic in candidates:
-        try:
-            res = requests.get(
-                f"{base_url}/markets/{epic}",
-                headers=headers,
-                timeout=_DATA_TIMEOUT_SEC,
-            )
-            if res.status_code == 200:
-                _EPIC_CACHE[s] = epic
-                return epic
-        except Exception:
-            continue
-
-    try:
-        res = requests.get(
-            f"{base_url}/markets",
-            params={"searchTerm": s},
-            headers=headers,
-            timeout=_DATA_TIMEOUT_SEC,
+        st2, data2 = await _aio_get(
+            session, sem, f"{base_url}/markets/{epic}", headers=headers
         )
-        if res.status_code == 200:
-            markets = (res.json() or {}).get("markets", []) or []
-            best_score = -1
-            best_epic = None
-            for m in markets:
-                epic = str(m.get("epic", "")).upper()
-                if not epic:
-                    continue
-                inst = str(m.get("instrumentName", "")).upper()
-                country = str(m.get("countryCode", "")).upper()
-                currency = str(m.get("currency", "")).upper()
-                market_id = str(m.get("marketId", "")).upper()
-                score = 0
-                if s in epic or s in inst:
-                    score += 60
-                if country == "US" or currency == "USD" or ".US." in f".{epic}.":
-                    score += 20
-                if market_id in ("SHARES", "SHARE"):
-                    score += 8
-                if score > best_score:
-                    best_score = score
-                    best_epic = epic
-            if best_epic:
-                _EPIC_CACHE[s] = best_epic
-                return best_epic
-    except Exception:
-        pass
+        if st2 == 200 and data2 is not None:
+            _EPIC_CACHE[s] = epic
+            return epic
+
+    st3, data3 = await _aio_get(
+        session,
+        sem,
+        f"{base_url}/markets",
+        headers=headers,
+        params={"searchTerm": s},
+    )
+    if st3 == 200 and isinstance(data3, dict):
+        markets = data3.get("markets", []) or []
+        best_score = -1
+        best_epic = None
+        for m in markets:
+            epic = str(m.get("epic", "")).upper()
+            if not epic:
+                continue
+            inst = str(m.get("instrumentName", "")).upper()
+            country = str(m.get("countryCode", "")).upper()
+            currency = str(m.get("currency", "")).upper()
+            market_id = str(m.get("marketId", "")).upper()
+            score = 0
+            if s in epic or s in inst:
+                score += 60
+            if country == "US" or currency == "USD" or ".US." in f".{epic}.":
+                score += 20
+            if market_id in ("SHARES", "SHARE"):
+                score += 8
+            if score > best_score:
+                best_score = score
+                best_epic = epic
+        if best_epic:
+            _EPIC_CACHE[s] = best_epic
+            return best_epic
 
     _UNSUPPORTED_CACHE.add(s)
     return None
 
 
-def _fetch_bars(
+async def _smart_retry_daily_fetch_aio(
+    session: aiohttp.ClientSession,
+    sem: asyncio.Semaphore,
+    base_url: str,
+    headers: dict,
+    epic: str,
+    cfg: dict,
+    log_symbol: str,
+) -> pd.DataFrame | None:
+    cap = min(1000, max(50, int(_CAPITAL_PRICES_MAX_BARS_CAP)))
+    resolutions = list(cfg["resolutions"])
+    alt_maxes = (cap, max(MIN_ANALYSIS_BARS, int(round(cap * 0.92))))
+    last_err = ""
+    for max_try in alt_maxes:
+        for res_name in reversed(resolutions):
+            try:
+                st, payload = await _aio_get(
+                    session,
+                    sem,
+                    f"{base_url}/prices/{epic}",
+                    headers=headers,
+                    params={"resolution": res_name, "max": int(max_try)},
+                )
+                if st != 200 or not isinstance(payload, dict):
+                    last_err = f"smart_retry status={st} res={res_name} max={max_try}"
+                    continue
+                df_raw = _parse_capital_ohlcv(payload)
+                if df_raw is None or df_raw.empty:
+                    last_err = f"smart_retry empty res={res_name} max={max_try}"
+                    continue
+                df_clean = _clean_ohlcv(
+                    symbol=epic,
+                    timeframe="1d",
+                    df=df_raw,
+                    step_sec=int(cfg["step_sec"]),
+                )
+                if df_clean is None or df_clean.empty:
+                    last_err = f"smart_retry clean failed res={res_name} max={max_try}"
+                    continue
+                n = len(df_clean)
+                if n < int(cfg["min_rows"]):
+                    continue
+                if n < MIN_ANALYSIS_BARS:
+                    last_err = f"smart_retry rows={n} min={MIN_ANALYSIS_BARS} res={res_name} max={max_try}"
+                    continue
+                _append_data_quality_log(
+                    epic,
+                    "1d",
+                    "OK",
+                    f"smart_retry_ok resolution={res_name} max={max_try} rows={n}",
+                )
+                if MIN_ANALYSIS_BARS <= n < TARGET_ANALYSIS_BARS:
+                    _log_recovered_proceed(log_symbol, n, "1d")
+                return df_clean
+            except Exception as exc:
+                last_err = f"smart_retry exception res={res_name} max={max_try}: {exc}"
+    _append_data_quality_log(epic, "1d", "WARN", f"smart_retry_exhausted last={last_err}")
+    return None
+
+
+async def _fetch_bars_aio(
+    session: aiohttp.ClientSession,
+    sem: asyncio.Semaphore,
     base_url: str,
     headers: dict,
     epic: str,
@@ -523,12 +556,6 @@ def _fetch_bars(
     *,
     log_symbol: str | None = None,
 ) -> pd.DataFrame | None:
-    """
-    Fetch OHLCV from Capital.com /prices/{epic} only.
-    Retries with larger `max` when cleaned row count is below min_rows (indicators need depth).
-    For daily (1d), requires at least MIN_ANALYSIS_BARS rows; soft band to TARGET
-    logs [RECOVERED] via _log_recovered_proceed.
-    """
     cfg = _TF_CONFIG[timeframe]
     min_rows = int(cfg["min_rows"])
     label = (log_symbol or epic).strip() or epic
@@ -536,16 +563,17 @@ def _fetch_bars(
     for max_try in _max_bar_attempts(int(cfg["max"])):
         for res_name in cfg["resolutions"]:
             try:
-                res = requests.get(
+                st, payload = await _aio_get(
+                    session,
+                    sem,
                     f"{base_url}/prices/{epic}",
-                    params={"resolution": res_name, "max": int(max_try)},
                     headers=headers,
-                    timeout=_DATA_TIMEOUT_SEC,
+                    params={"resolution": res_name, "max": int(max_try)},
                 )
-                if res.status_code != 200:
-                    last_err = f"status={res.status_code} resolution={res_name} max={max_try}"
+                if st != 200 or not isinstance(payload, dict):
+                    last_err = f"status={st} resolution={res_name} max={max_try}"
                     continue
-                df_raw = _parse_capital_ohlcv(res.json() or {})
+                df_raw = _parse_capital_ohlcv(payload)
                 if df_raw is None or df_raw.empty:
                     last_err = f"empty payload resolution={res_name} max={max_try}"
                     continue
@@ -585,8 +613,8 @@ def _fetch_bars(
                 last_err = f"exception resolution={res_name} max={max_try}: {exc}"
 
     if timeframe == "1d":
-        recovered = _smart_retry_daily_fetch(
-            base_url, headers, epic, cfg, log_symbol=label
+        recovered = await _smart_retry_daily_fetch_aio(
+            session, sem, base_url, headers, epic, cfg, log_symbol=label
         )
         if recovered is not None:
             return recovered
@@ -595,17 +623,20 @@ def _fetch_bars(
     return None
 
 
-def scan_market(ticker_symbol, period="1d", interval="5m", session_context: dict | None = None):
-    """
-    Fetch OHLCV data for a single symbol. Kept for backward compatibility.
-    Capital.com API only (/prices/{epic}); retries with larger max= if history is short.
-    """
+async def scan_market_async(
+    ticker_symbol,
+    period="1d",
+    interval="5m",
+    session_context: dict | None = None,
+    *,
+    session: aiohttp.ClientSession | None = None,
+    semaphore: asyncio.Semaphore | None = None,
+) -> pd.DataFrame | None:
     interval_map = {
         "15m": ("MINUTE_15", 900),
         "1h": ("HOUR", 3600),
         "4h": ("HOUR_4", 14400),
         "1d": ("DAY", 86400),
-        # backward-compat fallback for existing callers
         "5m": ("MINUTE_15", 900),
     }
     resolution, step_sec = interval_map.get(str(interval).lower(), ("MINUTE_15", 900))
@@ -625,38 +656,45 @@ def scan_market(ticker_symbol, period="1d", interval="5m", session_context: dict
     base_need = max(20, int((days * 86400) / max(step_sec, 1)) + 10)
     max_attempts = _max_bar_attempts(max(20, min(int(_CAPITAL_PRICES_MAX_BARS_CAP), base_need)))
 
-    base_url, headers = _get_market_data_session(session_context=session_context)
-    if not base_url or not headers:
-        return None
-    epic = _resolve_epic(base_url, headers, ticker_symbol)
-    if not epic:
-        _append_data_quality_log(
-            str(ticker_symbol),
-            str(interval),
-            "ERROR",
-            "epic resolution failed",
-        )
-        return None
-
-    sym = str(ticker_symbol).strip()
-    is_daily = str(interval).lower() == "1d"
-    daily_resolutions = ("DAY", "D1", "DAY_1")
-    resolutions_try = daily_resolutions if is_daily else (resolution,)
+    close_local = session is None
+    if session is None:
+        session = aiohttp.ClientSession(timeout=_AIO_TIMEOUT)
+    if semaphore is None:
+        semaphore = _new_http_semaphore()
 
     try:
+        base_url, headers = await _get_market_data_session_aio(session, semaphore, session_context)
+        if not base_url or not headers:
+            return None
+        epic = await _resolve_epic_aio(session, semaphore, base_url, headers, ticker_symbol)
+        if not epic:
+            _append_data_quality_log(
+                str(ticker_symbol),
+                str(interval),
+                "ERROR",
+                "epic resolution failed",
+            )
+            return None
+
+        sym = str(ticker_symbol).strip()
+        is_daily = str(interval).lower() == "1d"
+        daily_resolutions = ("DAY", "D1", "DAY_1")
+        resolutions_try = daily_resolutions if is_daily else (resolution,)
+
         last_status = 0
         for max_bars in max_attempts:
             for res_one in resolutions_try:
-                res = requests.get(
+                st, payload = await _aio_get(
+                    session,
+                    semaphore,
                     f"{base_url}/prices/{epic}",
-                    params={"resolution": res_one, "max": int(max_bars)},
                     headers=headers,
-                    timeout=_DATA_TIMEOUT_SEC,
+                    params={"resolution": res_one, "max": int(max_bars)},
                 )
-                last_status = int(res.status_code)
-                if res.status_code != 200:
+                last_status = int(st)
+                if st != 200 or not isinstance(payload, dict):
                     continue
-                parsed = _parse_capital_ohlcv(res.json() or {})
+                parsed = _parse_capital_ohlcv(payload)
                 if parsed is None or parsed.empty:
                     continue
                 cleaned = _clean_ohlcv(
@@ -692,8 +730,8 @@ def scan_market(ticker_symbol, period="1d", interval="5m", session_context: dict
 
         if is_daily:
             cfg_1d = _TF_CONFIG["1d"]
-            recovered = _smart_retry_daily_fetch(
-                base_url, headers, epic, cfg_1d, log_symbol=sym
+            recovered = await _smart_retry_daily_fetch_aio(
+                session, semaphore, base_url, headers, epic, cfg_1d, log_symbol=sym
             )
             if recovered is not None:
                 return recovered
@@ -708,31 +746,67 @@ def scan_market(ticker_symbol, period="1d", interval="5m", session_context: dict
     except Exception as exc:
         print(f"❌ Scanner error [{ticker_symbol}]: {exc}")
         return None
+    finally:
+        if close_local:
+            await session.close()
 
 
-def scan_multi_timeframe(symbol, session_context: dict | None = None):
+def scan_market(ticker_symbol, period="1d", interval="5m", session_context: dict | None = None):
+    """Sync wrapper: async Capital.com OHLCV fetch with aiohttp (concurrency capped internally)."""
+
+    async def _run():
+        async with aiohttp.ClientSession(timeout=_AIO_TIMEOUT) as sess:
+            sem = _new_http_semaphore()
+            return await scan_market_async(
+                ticker_symbol,
+                period,
+                interval,
+                session_context,
+                session=sess,
+                semaphore=sem,
+            )
+
+    return asyncio.run(_run())
+
+
+async def scan_multi_timeframe_async(
+    symbol,
+    session_context: dict | None = None,
+    *,
+    session: aiohttp.ClientSession | None = None,
+    semaphore: asyncio.Semaphore | None = None,
+) -> dict | None:
     """
-    Fetch three native analysis timeframes (no resampling):
-      - 1D  : master trend
-      - 4H  : structure context
-      - 15M : entry signal
-
-    Returns dict {'1d': df, '4h': df, '15m': df} or None on failure.
+    Async multi-timeframe fetch. Pass shared session+semaphore from scan batches for efficiency.
     """
+    close_local = session is None
+    if session is None:
+        session = aiohttp.ClientSession(timeout=_AIO_TIMEOUT)
+    if semaphore is None:
+        semaphore = _new_http_semaphore()
+
     try:
-        base_url, headers = _get_market_data_session(session_context=session_context)
+        base_url, headers = await _get_market_data_session_aio(session, semaphore, session_context)
         if not base_url or not headers:
             _append_data_quality_log(symbol, "all", "ERROR", "session unavailable")
             return None
 
-        epic = _resolve_epic(base_url, headers, symbol)
+        epic = await _resolve_epic_aio(session, semaphore, base_url, headers, symbol)
         if not epic:
             _append_data_quality_log(symbol, "all", "ERROR", "epic not found on Capital")
             return None
 
-        df_1d = _fetch_bars(base_url, headers, epic, "1d", log_symbol=str(symbol))
-        df_4h = _fetch_bars(base_url, headers, epic, "4h", log_symbol=str(symbol))
-        df_15m = _fetch_bars(base_url, headers, epic, "15m", log_symbol=str(symbol))
+        df_1d, df_4h, df_15m = await asyncio.gather(
+            _fetch_bars_aio(
+                session, semaphore, base_url, headers, epic, "1d", log_symbol=str(symbol)
+            ),
+            _fetch_bars_aio(
+                session, semaphore, base_url, headers, epic, "4h", log_symbol=str(symbol)
+            ),
+            _fetch_bars_aio(
+                session, semaphore, base_url, headers, epic, "15m", log_symbol=str(symbol)
+            ),
+        )
 
         if any(df is None or df.empty for df in (df_1d, df_4h, df_15m)):
             _append_data_quality_log(
@@ -757,3 +831,19 @@ def scan_multi_timeframe(symbol, session_context: dict | None = None):
         _append_data_quality_log(symbol, "all", "ERROR", f"scan_multi_timeframe exception: {exc}")
         print(f"❌ خطأ في جلب البيانات متعددة الأطر [{symbol}]: {exc}")
         return None
+    finally:
+        if close_local:
+            await session.close()
+
+
+def scan_multi_timeframe(symbol, session_context: dict | None = None):
+    """Sync wrapper around async multi-timeframe fetch."""
+
+    async def _run():
+        async with aiohttp.ClientSession(timeout=_AIO_TIMEOUT) as sess:
+            sem = _new_http_semaphore()
+            return await scan_multi_timeframe_async(
+                symbol, session_context, session=sess, semaphore=sem
+            )
+
+    return asyncio.run(_run())

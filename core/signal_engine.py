@@ -14,10 +14,13 @@ Called from main.py on a SCAN_INTERVAL_SEC schedule.
 Never places a trade without passing can_open_trade().
 """
 
+import asyncio
 import logging
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
+
+import aiohttp
 
 from utils.market_hours import utc_today
 from config import (
@@ -31,7 +34,12 @@ from core.strategy_meanrev  import analyze as analyze_meanrev
 from core.strategy_momentum import analyze as analyze_momentum
 from core.risk_manager      import can_open_trade
 from core.executor          import place_trade_for_user
-from utils.market_scanner   import scan_multi_timeframe
+from utils.market_scanner import (
+    scan_multi_timeframe,
+    scan_multi_timeframe_async,
+    CAPITAL_CLIENT_TIMEOUT,
+    CAPITAL_HTTP_CONCURRENCY,
+)
 from utils.ai_model         import analyze_multi_timeframe
 
 DB_PATH = "database/trading_saas.db"
@@ -272,6 +280,171 @@ def run_scan() -> list[dict]:
 
 # ── Parallel scanner (no execution) ───────────────────────────────────────────
 
+def _analyze_one_from_timeframes(symbol: str, timeframes: dict, min_confidence: float) -> dict[str, Any] | None:
+    """Strategy stack (sync) given pre-fetched timeframes — tiers/RSI unchanged inside strategies."""
+    candidates: list[tuple[str, float, str, str, float | None, float | None, float | None]] = []
+    raw_confs: list[float] = []
+
+    try:
+        action, conf, reason = analyze_multi_timeframe(timeframes, symbol=symbol)
+        try:
+            raw_confs.append(float(conf))
+        except Exception:
+            pass
+        if action and conf >= float(min_confidence):
+            candidates.append((action, float(conf), "RF", str(reason), None, None, None))
+    except Exception:
+        pass
+
+    try:
+        mr = analyze_meanrev(symbol, timeframes)
+        try:
+            raw_confs.append(float((mr or {}).get("confidence", 0)))
+        except Exception:
+            pass
+        if mr and mr.get("rejected"):
+            candidates.append((
+                "__REJECTED__",
+                -1.0,
+                str(mr.get("strategy", "MeanRev")),
+                str(mr.get("reason", "Rejected by market structure filter")),
+                None,
+                None,
+                None,
+            ))
+        elif mr and float(mr.get("confidence", 0)) >= float(min_confidence):
+            candidates.append((
+                str(mr["action"]),
+                float(mr["confidence"]),
+                "MeanRev",
+                str(mr.get("reason", "")),
+                mr.get("stop_loss_pct"),
+                (float(mr.get("ms_score")) if mr.get("ms_score") is not None else None),
+                (float(mr.get("score")) if mr.get("score") is not None else None),
+            ))
+    except Exception:
+        pass
+
+    try:
+        mo = analyze_momentum(symbol, timeframes)
+        try:
+            raw_confs.append(float((mo or {}).get("confidence", 0)))
+        except Exception:
+            pass
+        if mo and mo.get("rejected"):
+            candidates.append((
+                "__REJECTED__",
+                -1.0,
+                str(mo.get("strategy", "Momentum")),
+                str(mo.get("reason", "Rejected by market structure filter")),
+                None,
+                None,
+                None,
+            ))
+        elif mo and float(mo.get("confidence", 0)) >= float(min_confidence):
+            candidates.append((
+                str(mo["action"]),
+                float(mo["confidence"]),
+                "Momentum",
+                str(mo.get("reason", "")),
+                mo.get("stop_loss_pct"),
+                (float(mo.get("ms_score")) if mo.get("ms_score") is not None else None),
+                (float(mo.get("score")) if mo.get("score") is not None else None),
+            ))
+    except Exception:
+        pass
+
+    if not candidates:
+        best_conf = max(raw_confs) if raw_confs else 0.0
+        print(f"[NO SIGNAL] {symbol} | best_conf={best_conf:.1f}")
+        return None
+
+    accepted = [c for c in candidates if c[0] != "__REJECTED__"]
+    if not accepted:
+        _, _, rej_label, rej_reason, _, _, _ = candidates[0]
+        return {
+            "symbol": symbol,
+            "action": None,
+            "confidence": 0.0,
+            "strategy_label": rej_label,
+            "reason": rej_reason,
+            "stop_loss_pct": None,
+            "ms_score": None,
+            "score": None,
+            "timeframes": timeframes,
+            "rejected": True,
+        }
+
+    best_action, best_conf, best_label, best_reason, best_sl_pct, best_ms_score, best_score = max(
+        accepted, key=lambda x: x[1]
+    )
+    print(f"[CANDIDATES] {symbol} | count={len(candidates)} | best_conf={best_conf:.1f}")
+
+    return {
+        "symbol": symbol,
+        "action": best_action,
+        "confidence": best_conf,
+        "strategy_label": best_label,
+        "reason": best_reason,
+        "stop_loss_pct": best_sl_pct,
+        "ms_score": best_ms_score,
+        "score": best_score,
+        "timeframes": timeframes,
+    }
+
+
+async def _analyze_one_async(
+    session: aiohttp.ClientSession,
+    sem: asyncio.Semaphore,
+    symbol: str,
+    min_confidence: float,
+) -> dict[str, Any] | None:
+    timeframes = await scan_multi_timeframe_async(symbol, session_context=None, session=session, semaphore=sem)
+    if not timeframes:
+        return None
+    return _analyze_one_from_timeframes(symbol, timeframes, min_confidence)
+
+
+async def scan_watchlist_parallel_async(
+    watchlist: list[str],
+    *,
+    min_confidence: float = ACTIVE_MIN_CONFIDENCE,
+    max_workers: int = 8,
+) -> list[dict[str, Any]]:
+    """
+    Async batch scan: one aiohttp session, global semaphore (default 3 concurrent Capital requests).
+    Processes symbols in groups of three for clean progress logs.
+    """
+    del max_workers  # retained for API compatibility; concurrency is HTTP-only
+
+    wl = [str(s).strip().upper() for s in (watchlist or []) if str(s).strip()]
+    if not wl:
+        return []
+
+    results: list[dict[str, Any]] = []
+    sem = asyncio.Semaphore(CAPITAL_HTTP_CONCURRENCY)
+    n_batches = (len(wl) + 2) // 3
+
+    async with aiohttp.ClientSession(timeout=CAPITAL_CLIENT_TIMEOUT) as session:
+        for bi in range(0, len(wl), 3):
+            batch = wl[bi : bi + 3]
+            bnum = bi // 3 + 1
+            print(
+                f"[SCAN BATCH] {bnum}/{n_batches} tickers={batch} "
+                f"(Capital HTTP concurrency≤{CAPITAL_HTTP_CONCURRENCY})",
+                flush=True,
+            )
+            tasks = [_analyze_one_async(session, sem, sym, float(min_confidence)) for sym in batch]
+            rows = await asyncio.gather(*tasks, return_exceptions=True)
+            for sym, row in zip(batch, rows):
+                if isinstance(row, Exception):
+                    log.warning("[%s] analyze error: %s", sym, row)
+                    continue
+                if row:
+                    results.append(row)
+    return results
+
+
 def scan_watchlist_parallel(
     watchlist: list[str],
     *,
@@ -281,146 +454,17 @@ def scan_watchlist_parallel(
     """
     High-throughput scanner for main.py.
 
-    - Fetches multi-timeframe data once per symbol.
+    - Fetches multi-timeframe data via aiohttp (async) with bounded concurrency.
     - Runs RF + MeanRev + Momentum to build candidates.
     - Returns best-per-symbol signals (does NOT execute, does NOT apply tiers/risk).
 
     Output rows contain:
       symbol, action, confidence, strategy_label, reason, stop_loss_pct, timeframes
     """
-
-    def _analyze_one(symbol: str) -> dict[str, Any] | None:
-        timeframes = scan_multi_timeframe(symbol)
-        if not timeframes:
-            return None
-
-        candidates: list[tuple[str, float, str, str, float | None, float | None, float | None]] = []
-        raw_confs: list[float] = []
-
-        # 1) RF multi-timeframe
-        try:
-            action, conf, reason = analyze_multi_timeframe(timeframes, symbol=symbol)
-            try:
-                raw_confs.append(float(conf))
-            except Exception:
-                pass
-            if action and conf >= float(min_confidence):
-                candidates.append((action, float(conf), "RF", str(reason), None, None, None))
-        except Exception:
-            pass
-
-        # 2) Mean Reversion
-        try:
-            mr = analyze_meanrev(symbol, timeframes)
-            try:
-                raw_confs.append(float((mr or {}).get("confidence", 0)))
-            except Exception:
-                pass
-            if mr and mr.get("rejected"):
-                candidates.append((
-                    "__REJECTED__",
-                    -1.0,
-                    str(mr.get("strategy", "MeanRev")),
-                    str(mr.get("reason", "Rejected by market structure filter")),
-                    None,
-                    None,
-                    None,
-                ))
-            elif mr and float(mr.get("confidence", 0)) >= float(min_confidence):
-                candidates.append((
-                    str(mr["action"]),
-                    float(mr["confidence"]),
-                    "MeanRev",
-                    str(mr.get("reason", "")),
-                    mr.get("stop_loss_pct"),
-                    (float(mr.get("ms_score")) if mr.get("ms_score") is not None else None),
-                    (float(mr.get("score")) if mr.get("score") is not None else None),
-                ))
-        except Exception:
-            pass
-
-        # 3) Momentum
-        try:
-            mo = analyze_momentum(symbol, timeframes)
-            try:
-                raw_confs.append(float((mo or {}).get("confidence", 0)))
-            except Exception:
-                pass
-            if mo and mo.get("rejected"):
-                candidates.append((
-                    "__REJECTED__",
-                    -1.0,
-                    str(mo.get("strategy", "Momentum")),
-                    str(mo.get("reason", "Rejected by market structure filter")),
-                    None,
-                    None,
-                    None,
-                ))
-            elif mo and float(mo.get("confidence", 0)) >= float(min_confidence):
-                candidates.append((
-                    str(mo["action"]),
-                    float(mo["confidence"]),
-                    "Momentum",
-                    str(mo.get("reason", "")),
-                    mo.get("stop_loss_pct"),
-                    (float(mo.get("ms_score")) if mo.get("ms_score") is not None else None),
-                    (float(mo.get("score")) if mo.get("score") is not None else None),
-                ))
-        except Exception:
-            pass
-
-        if not candidates:
-            best_conf = max(raw_confs) if raw_confs else 0.0
-            print(f"[NO SIGNAL] {symbol} | best_conf={best_conf:.1f}")
-            return None
-
-        accepted = [c for c in candidates if c[0] != "__REJECTED__"]
-        if not accepted:
-            _, _, rej_label, rej_reason, _, _, _ = candidates[0]
-            return {
-                "symbol": symbol,
-                "action": None,
-                "confidence": 0.0,
-                "strategy_label": rej_label,
-                "reason": rej_reason,
-                "stop_loss_pct": None,
-                "ms_score": None,
-                "score": None,
-                "timeframes": timeframes,
-                "rejected": True,
-            }
-
-        best_action, best_conf, best_label, best_reason, best_sl_pct, best_ms_score, best_score = max(
-            accepted, key=lambda x: x[1]
+    return asyncio.run(
+        scan_watchlist_parallel_async(
+            watchlist,
+            min_confidence=min_confidence,
+            max_workers=max_workers,
         )
-        print(f"[CANDIDATES] {symbol} | count={len(candidates)} | best_conf={best_conf:.1f}")
-
-        return {
-            "symbol": symbol,
-            "action": best_action,
-            "confidence": best_conf,
-            "strategy_label": best_label,
-            "reason": best_reason,
-            "stop_loss_pct": best_sl_pct,
-            "ms_score": best_ms_score,
-            "score": best_score,
-            "timeframes": timeframes,
-        }
-
-    wl = [str(s).strip().upper() for s in (watchlist or []) if str(s).strip()]
-    if not wl:
-        return []
-
-    # IO-bound: provider calls; keep a conservative default worker count.
-    workers = max(1, min(int(max_workers), len(wl)))
-    results: list[dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_analyze_one, sym): sym for sym in wl}
-        for fut in as_completed(futures):
-            try:
-                row = fut.result()
-                if row:
-                    results.append(row)
-            except Exception:
-                continue
-    return results
+    )

@@ -1288,7 +1288,7 @@ def run_trading_bot():
             scan_started = time.time()
             print(f"[SCAN START] symbols={len(_watchlist)}")
 
-            # Parallel scan: eliminate per-symbol sleeps and IO bottlenecks.
+            # Parallel scan: aiohttp + asyncio (bounded Capital HTTP concurrency; see signal_engine).
             # Returns best-per-symbol signals with timeframes attached (no execution).
             signals = scan_watchlist_parallel(
                 _watchlist,
