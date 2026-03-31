@@ -24,12 +24,13 @@ from config import (
     EXECUTION_REJECTION_NOTIFY_COOLDOWN_SEC,
 )
 from utils.market_scanner import scan_multi_timeframe
-from database.db_manager import is_maintenance_mode, get_subscriber_lang
+from database.db_manager import is_maintenance_mode, get_subscriber_lang, get_user_signal_profile
 from core.risk_manager import (
     can_open_trade,
     calculate_position_size, STATE_MANUAL_OVERRIDE,
     check_daily_drawdown, check_rr_ratio,
     get_effective_leverage, validate_pre_trade, generate_institutional_stop_loss,
+    compute_last_rsi,
 )
 from core.trade_session_finalize import after_trade_leg_closed
 from core.trailing_stop import (
@@ -2131,9 +2132,20 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
     max_dist = _get_max_stop_profit_distance(base_url, headers, order_epic)
 
     liq_levels = None
+    tf: dict = {}
+    df_15m_sl = None
+    rsi_15m_gate = None
     try:
         tf = scan_multi_timeframe(str(symbol), session_context=scanner_ctx) or {}
         df_15m_sl = tf.get("15m")
+        if df_15m_sl is not None and len(df_15m_sl) > 0:
+            rsi_15m_gate = compute_last_rsi(df_15m_sl["Close"])
+    except Exception:
+        tf = {}
+        df_15m_sl = None
+        rsi_15m_gate = None
+
+    try:
         if df_15m_sl is not None and len(df_15m_sl) > 0:
             from core.market_structure import build_liquidity_map
             liq = build_liquidity_map(df_15m_sl)
@@ -2212,6 +2224,9 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
         current_symbol_exposure=float(sym_exposure),
         current_total_exposure=float(total_exposure),
         exposure_by_symbol=exposure_by_symbol,
+        action=str(action),
+        strategy_label=str(strategy_label or ""),
+        rsi_15m=rsi_15m_gate,
     )
     if not approved_pre:
         msg = str(pre_reason or "Trade rejected: pre-trade validation failed")
@@ -2269,19 +2284,32 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             return msg
         lang = get_subscriber_lang(chat_id)
         ttl_bars = int(LIMIT_ORDER_TTL_BARS)
+        _prof = get_user_signal_profile(str(chat_id))
+        _lim_pol_en = (
+            "⚙️ *Fast Entry Executed*"
+            if _prof != "GOLDEN"
+            else "⚙️ *Gold Discipline Applied*"
+        )
+        _lim_pol_ar = (
+            "⚙️ *تنفيذ Fast — Fast Entry Executed*"
+            if _prof != "GOLDEN"
+            else "⚙️ *معيار الذهب — Gold Discipline Applied*"
+        )
         if lang == "en":
             msg = (
                 f"🧾 *Limit order placed* #{oid}\n"
                 f"📌 {symbol} {action}\n"
                 f"💰 Limit price: *{float(limit_px):.4f}*\n"
-                f"⏱️ TTL: *{ttl_bars} bars* ({int(LIMIT_ORDER_BAR_MINUTES)}m)"
+                f"⏱️ TTL: *{ttl_bars} bars* ({int(LIMIT_ORDER_BAR_MINUTES)}m)\n"
+                f"{_lim_pol_en}"
             )
         else:
             msg = (
                 f"🧾 *تم وضع أمر ليمِت* #{oid}\n"
                 f"📌 {symbol} {('شراء' if action=='BUY' else 'بيع')}\n"
                 f"💰 سعر الليمِت: *{float(limit_px):.4f}*\n"
-                f"⏱️ الصلاحية: *{ttl_bars} شموع* ({int(LIMIT_ORDER_BAR_MINUTES)}م)"
+                f"⏱️ الصلاحية: *{ttl_bars} شموع* ({int(LIMIT_ORDER_BAR_MINUTES)}م)\n"
+                f"{_lim_pol_ar}"
             )
         send_telegram_message(chat_id, msg)
         return f"🧾 Limit placed ({symbol} {action}) @ {float(limit_px):.4f}"
@@ -2573,6 +2601,10 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
     now_et_str = _now_et().strftime('%Y-%m-%d %H:%M ET')
 
     lang = get_subscriber_lang(chat_id)
+    _policy_en = str(pre_details.get("execution_policy_en") or "").strip()
+    _policy_ar = str(pre_details.get("execution_policy_ar") or "").strip()
+    _policy_block_en = f"\n{_policy_en}" if _policy_en else ""
+    _policy_block_ar = f"\n{_policy_ar}" if _policy_ar else ""
     partial_note_ar = (
         "\n⚠️ *تنبيه:* فُتح حد طلب واحد فقط على الوسيط — راجع الصفقات المفتوحة."
         if partial_only_one_leg
@@ -2601,6 +2633,7 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             f"🏆  Target 2     :  *{_fmt_money(target2)}*  ({int(qty2)} shares — +{TP2_PCT * 100:.2f}%)\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⚠️  Risk Amount  :  *{_fmt_money(risk_amount)}*\n"
+            f"{_policy_block_en}\n"
             f"🕐  Time (ET)    :  {now_et_str}"
             f"{partial_note_en}"
             f"{sl_adjust_note}"
@@ -2622,6 +2655,7 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             f"🏆  الهدف 2        :  *{_fmt_money(target2)}*  ({int(qty2)} سهم — +{TP2_PCT * 100:.2f}%)\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⚠️  المخاطرة       :  *{_fmt_money(risk_amount)}*\n"
+            f"{_policy_block_ar}\n"
             f"🕐  التوقيت (ET)   :  {now_et_str}"
             f"{partial_note_ar}"
             f"{sl_adjust_note}"
@@ -2645,7 +2679,8 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
         action=str(action),
         details=(
             f"legs={len(opened_legs)} qty={verified_qty:.2f} entry={entry_price:.4f} "
-            f"sl={stop_info} rr={float(rr_ratio):.2f}"
+            f"sl={stop_info} rr={float(rr_ratio):.2f} "
+            f"tier={pre_details.get('subscription_tier', 'n/a')}"
         ),
     )
     return (

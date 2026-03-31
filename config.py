@@ -30,10 +30,15 @@ WATCHLIST = [
 
 # ── Mean Reversion Parameters ─────────────────────────────────────────────────
 
-# RSI thresholds for oversold / overbought detection
-# Requested profile: accept extremes at <= 40 and >= 60.
-MR_RSI_OVERSOLD      = 40
-MR_RSI_OVERBOUGHT    = 60
+# RSI thresholds — tier-based (Fast vs Gold / GOLDEN signal profile).
+# Tuple: (oversold_max_for_BUY, overbought_min_for_SELL) on 15m RSI.
+FAST_RSI_LIMITS = (40, 60)
+GOLD_RSI_LIMITS = (30, 70)
+
+# Strategy scan defaults: use Fast limits so the engine emits candidates broadly;
+# per-user Gold tier re-validates RSI at execution time in validate_pre_trade().
+MR_RSI_OVERSOLD = FAST_RSI_LIMITS[0]
+MR_RSI_OVERBOUGHT = FAST_RSI_LIMITS[1]
 
 # Required % deviation from VWAP to confirm price is stretched
 MR_VWAP_DEV_PCT      = 1.2
@@ -240,10 +245,13 @@ MS_SCORE_AI_MAX_IMPACT = float(os.getenv("MS_SCORE_AI_MAX_IMPACT", "8.0"))
 # Anti-spam: minimum gap between repeated rejection notifications to the same user.
 EXECUTION_REJECTION_NOTIFY_COOLDOWN_SEC = int(os.getenv("EXECUTION_REJECTION_NOTIFY_COOLDOWN_SEC", "600"))
 
-# High-confidence risk-distance relaxation:
-# when confidence > threshold, allow up to (base max stop-loss pct * multiplier).
-HIGH_CONFIDENCE_SL_RELAX_THRESHOLD = float(os.getenv("HIGH_CONFIDENCE_SL_RELAX_THRESHOLD", "80.0"))
-HIGH_CONFIDENCE_SL_RELAX_MULTIPLIER = float(os.getenv("HIGH_CONFIDENCE_SL_RELAX_MULTIPLIER", "1.15"))
+# Tier-based max stop-loss relaxation (applied on top of MAX_STOP_LOSS_PCT in risk_manager).
+# Fast: 15% wider cap when confidence > 80.
+FAST_SL_RELAX_CONFIDENCE_THRESHOLD = float(os.getenv("FAST_SL_RELAX_CONFIDENCE_THRESHOLD", "80.0"))
+FAST_SL_RELAX_MULTIPLIER = float(os.getenv("FAST_SL_RELAX_MULTIPLIER", "1.15"))
+# Gold (GOLDEN): 10% wider cap only when confidence > 90 (stricter discipline).
+GOLD_SL_RELAX_CONFIDENCE_THRESHOLD = float(os.getenv("GOLD_SL_RELAX_CONFIDENCE_THRESHOLD", "90.0"))
+GOLD_SL_RELAX_MULTIPLIER = float(os.getenv("GOLD_SL_RELAX_MULTIPLIER", "1.10"))
 
 # ── Phase 7: Deep Direction Model (optional) ─────────────────────────────────
 # RF pipeline remains default. These settings configure optional LSTM/GRU/Transformer training.

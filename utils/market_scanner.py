@@ -19,6 +19,8 @@ from config import (
 _DATA_TIMEOUT_SEC = int(os.getenv("MARKET_DATA_TIMEOUT_SEC", "20"))
 _SESSION_TTL_SEC = int(os.getenv("MARKET_DATA_SESSION_TTL_SEC", "45"))
 _LOG_ROOT = os.getenv("ENGINE_LOG_ROOT", "logs")
+# Capital.com /prices max= upper bound (broker caps vary; stay within common API limits).
+_CAPITAL_PRICES_MAX_BARS_CAP = int(os.getenv("CAPITAL_PRICES_MAX_BARS_CAP", "1000"))
 
 _SESSION_CACHE: dict[str, dict] = {}
 _EPIC_CACHE: dict[str, str] = {}
@@ -27,30 +29,41 @@ _UNSUPPORTED_CACHE: set[str] = set()
 _TF_CONFIG = {
     "1d": {
         "resolutions": ("DAY", "D1", "DAY_1"),
-        "max": 120,
+        "max": 300,
         "step_sec": 86400,
         "min_rows": 40,
     },
     "4h": {
         "resolutions": ("HOUR_4", "H4", "HOUR4"),
-        "max": 220,
+        "max": 500,
         "step_sec": 14400,
         "min_rows": 40,
     },
     "15m": {
         "resolutions": ("MINUTE_15", "M15", "MINUTE15"),
-        "max": 420,
+        "max": 800,
         "step_sec": 900,
         "min_rows": 80,
     },
 }
 
 
-_SECONDARY_TF_CONFIG = {
-    "1d": {"interval": "1d", "range": "1y", "needs_4h_resample": False},
-    "4h": {"interval": "60m", "range": "6mo", "needs_4h_resample": True},
-    "15m": {"interval": "15m", "range": "60d", "needs_4h_resample": False},
-}
+def _max_bar_attempts(base_max: int) -> list[int]:
+    """
+    Escalate Capital.com historical `max` when the first response has too few bars.
+    Tries progressively larger windows up to _CAPITAL_PRICES_MAX_BARS_CAP.
+    """
+    cap = max(50, min(int(_CAPITAL_PRICES_MAX_BARS_CAP), 1000))
+    m = max(1, int(base_max))
+    attempts: list[int] = [min(m, cap)]
+    for mult in (1.25, 1.5, 2.0, 2.5, 3.0):
+        nxt = int(round(m * mult))
+        nxt = min(max(nxt, attempts[-1] + 1), cap)
+        if nxt not in attempts:
+            attempts.append(nxt)
+    if cap not in attempts:
+        attempts.append(cap)
+    return sorted(set(attempts))
 
 
 def _append_data_quality_log(symbol: str, timeframe: str, status: str, details: str):
@@ -249,93 +262,6 @@ def _parse_capital_ohlcv(payload: dict) -> pd.DataFrame | None:
     return df
 
 
-def _parse_secondary_ohlcv(payload: dict) -> pd.DataFrame | None:
-    """
-    Secondary data-source parser (Yahoo Chart API shape).
-    """
-    try:
-        result = (((payload or {}).get("chart") or {}).get("result") or [])
-        if not result:
-            return None
-        row0 = result[0] or {}
-        ts = row0.get("timestamp") or []
-        quote = (((row0.get("indicators") or {}).get("quote") or [{}])[0]) or {}
-        if not ts:
-            return None
-        n = len(ts)
-        opens = list(quote.get("open") or [None] * n)
-        highs = list(quote.get("high") or [None] * n)
-        lows = list(quote.get("low") or [None] * n)
-        closes = list(quote.get("close") or [None] * n)
-        vols = list(quote.get("volume") or [0] * n)
-        rows = []
-        for i in range(n):
-            rows.append(
-                {
-                    "Date": pd.to_datetime(int(ts[i]), unit="s", utc=True),
-                    "Open": opens[i],
-                    "High": highs[i],
-                    "Low": lows[i],
-                    "Close": closes[i],
-                    "Volume": vols[i] if vols[i] is not None else 0,
-                }
-            )
-        if not rows:
-            return None
-        df = pd.DataFrame(rows).dropna(subset=["Date"])
-        if df.empty:
-            return None
-        return df.set_index("Date")
-    except Exception:
-        return None
-
-
-def _fetch_secondary_bars(symbol: str, timeframe: str) -> pd.DataFrame | None:
-    """
-    Secondary fallback source for insufficient/failed primary fetches.
-    Uses Yahoo Finance chart endpoint without extra package dependencies.
-    """
-    tf = str(timeframe).lower()
-    cfg = _SECONDARY_TF_CONFIG.get(tf)
-    if cfg is None:
-        return None
-
-    query_symbol = str(symbol or "").strip().upper()
-    if not query_symbol:
-        return None
-    # Yahoo symbols generally use '-' instead of '.' for class shares.
-    query_symbol = query_symbol.replace(".", "-")
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{query_symbol}"
-    params = {
-        "interval": cfg["interval"],
-        "range": cfg["range"],
-        "includePrePost": "true",
-        "events": "history",
-    }
-
-    try:
-        res = requests.get(url, params=params, timeout=_DATA_TIMEOUT_SEC)
-        if res.status_code != 200:
-            return None
-        parsed = _parse_secondary_ohlcv(res.json() or {})
-        if parsed is None or parsed.empty:
-            return None
-        if bool(cfg.get("needs_4h_resample")):
-            agg = {
-                "Open": "first",
-                "High": "max",
-                "Low": "min",
-                "Close": "last",
-                "Volume": "sum",
-            }
-            parsed = parsed.resample("4h").agg(agg).dropna(subset=["Open", "High", "Low", "Close"])
-            if parsed.empty:
-                return None
-        return parsed
-    except Exception:
-        return None
-
-
 def _clean_ohlcv(
     symbol: str,
     timeframe: str,
@@ -508,70 +434,56 @@ def _fetch_bars(
     headers: dict,
     epic: str,
     timeframe: str,
-    *,
-    fallback_symbol: str | None = None,
 ) -> pd.DataFrame | None:
+    """
+    Fetch OHLCV from Capital.com /prices/{epic} only.
+    Retries with larger `max` when cleaned row count is below min_rows (indicators need depth).
+    """
     cfg = _TF_CONFIG[timeframe]
+    min_rows = int(cfg["min_rows"])
     last_err = ""
-    for res_name in cfg["resolutions"]:
-        try:
-            res = requests.get(
-                f"{base_url}/prices/{epic}",
-                params={"resolution": res_name, "max": int(cfg["max"])},
-                headers=headers,
-                timeout=_DATA_TIMEOUT_SEC,
-            )
-            if res.status_code != 200:
-                last_err = f"status={res.status_code} resolution={res_name}"
-                continue
-            df_raw = _parse_capital_ohlcv(res.json() or {})
-            if df_raw is None or df_raw.empty:
-                last_err = f"empty payload resolution={res_name}"
-                continue
-            df_clean = _clean_ohlcv(
-                symbol=epic,
-                timeframe=timeframe,
-                df=df_raw,
-                step_sec=int(cfg["step_sec"]),
-            )
-            if df_clean is None or df_clean.empty:
-                last_err = f"clean failed resolution={res_name}"
-                continue
-            if len(df_clean) < int(cfg["min_rows"]):
-                last_err = (
-                    f"insufficient rows={len(df_clean)} min={int(cfg['min_rows'])} "
-                    f"resolution={res_name}"
+    for max_try in _max_bar_attempts(int(cfg["max"])):
+        for res_name in cfg["resolutions"]:
+            try:
+                res = requests.get(
+                    f"{base_url}/prices/{epic}",
+                    params={"resolution": res_name, "max": int(max_try)},
+                    headers=headers,
+                    timeout=_DATA_TIMEOUT_SEC,
                 )
-                continue
-            return df_clean
-        except Exception as exc:
-            last_err = f"exception resolution={res_name}: {exc}"
-
-    # Secondary source fallback for insufficient/failed primary data.
-    if fallback_symbol:
-        df_secondary = _fetch_secondary_bars(str(fallback_symbol), timeframe)
-        if df_secondary is not None and not df_secondary.empty:
-            df_secondary_clean = _clean_ohlcv(
-                symbol=str(fallback_symbol),
-                timeframe=timeframe,
-                df=df_secondary,
-                step_sec=int(cfg["step_sec"]),
-            )
-            if (
-                df_secondary_clean is not None
-                and not df_secondary_clean.empty
-                and len(df_secondary_clean) >= int(cfg["min_rows"])
-            ):
-                _append_data_quality_log(
-                    str(fallback_symbol),
-                    timeframe,
-                    "WARN",
-                    (
-                        "primary_failed_secondary_used "
-                        f"rows={len(df_secondary_clean)} last_primary_error={last_err}"
-                    ),
+                if res.status_code != 200:
+                    last_err = f"status={res.status_code} resolution={res_name} max={max_try}"
+                    continue
+                df_raw = _parse_capital_ohlcv(res.json() or {})
+                if df_raw is None or df_raw.empty:
+                    last_err = f"empty payload resolution={res_name} max={max_try}"
+                    continue
+                df_clean = _clean_ohlcv(
+                    symbol=epic,
+                    timeframe=timeframe,
+                    df=df_raw,
+                    step_sec=int(cfg["step_sec"]),
                 )
-                return df_secondary_clean
+                if df_clean is None or df_clean.empty:
+                    last_err = f"clean failed resolution={res_name} max={max_try}"
+                    continue
+                n = len(df_clean)
+                if n < min_rows:
+                    last_err = (
+                        f"insufficient rows={n} min={min_rows} "
+                        f"resolution={res_name} max={max_try}"
+                    )
+                    continue
+                if max_try > int(cfg["max"]):
+                    _append_data_quality_log(
+                        epic,
+                        timeframe,
+                        "OK",
+                        f"capital_retry_ok max={max_try} resolution={res_name} rows={n}",
+                    )
+                return df_clean
+            except Exception as exc:
+                last_err = f"exception resolution={res_name} max={max_try}: {exc}"
 
     _append_data_quality_log(epic, timeframe, "ERROR", last_err or "unknown fetch error")
     return None
@@ -580,7 +492,7 @@ def _fetch_bars(
 def scan_market(ticker_symbol, period="1d", interval="5m", session_context: dict | None = None):
     """
     Fetch OHLCV data for a single symbol. Kept for backward compatibility.
-    Uses Capital.com market data (not yfinance).
+    Capital.com API only (/prices/{epic}); retries with larger max= if history is short.
     """
     interval_map = {
         "15m": ("MINUTE_15", 900),
@@ -604,7 +516,8 @@ def scan_market(ticker_symbol, period="1d", interval="5m", session_context: dict
         "5y": 1825,
     }
     days = int(period_to_days.get(str(period).lower(), 5))
-    max_bars = max(20, min(1000, int((days * 86400) / max(step_sec, 1)) + 10))
+    base_need = max(20, int((days * 86400) / max(step_sec, 1)) + 10)
+    max_attempts = _max_bar_attempts(max(20, min(int(_CAPITAL_PRICES_MAX_BARS_CAP), base_need)))
 
     base_url, headers = _get_market_data_session(session_context=session_context)
     if not base_url or not headers:
@@ -620,59 +533,43 @@ def scan_market(ticker_symbol, period="1d", interval="5m", session_context: dict
         return None
 
     try:
-        res = requests.get(
-            f"{base_url}/prices/{epic}",
-            params={"resolution": resolution, "max": max_bars},
-            headers=headers,
-            timeout=_DATA_TIMEOUT_SEC,
-        )
-        if res.status_code != 200:
-            parsed = None
-        else:
+        last_status = 0
+        for max_bars in max_attempts:
+            res = requests.get(
+                f"{base_url}/prices/{epic}",
+                params={"resolution": resolution, "max": int(max_bars)},
+                headers=headers,
+                timeout=_DATA_TIMEOUT_SEC,
+            )
+            last_status = int(res.status_code)
+            if res.status_code != 200:
+                continue
             parsed = _parse_capital_ohlcv(res.json() or {})
-        cleaned = None
-        if parsed is not None and not parsed.empty:
+            if parsed is None or parsed.empty:
+                continue
             cleaned = _clean_ohlcv(
                 symbol=str(ticker_symbol),
                 timeframe=str(interval),
                 df=parsed,
                 step_sec=step_sec,
             )
-        if cleaned is not None and not cleaned.empty:
-            return cleaned
+            if cleaned is not None and not cleaned.empty:
+                if max_bars > base_need:
+                    _append_data_quality_log(
+                        str(ticker_symbol),
+                        str(interval),
+                        "OK",
+                        f"capital_retry_ok max={max_bars} rows={len(cleaned)}",
+                    )
+                return cleaned
 
-        # Secondary fallback if primary source returns insufficient/invalid data.
-        fallback_tf = "15m" if str(interval).lower() in ("5m", "15m") else str(interval).lower()
-        secondary = _fetch_secondary_bars(str(ticker_symbol), fallback_tf)
-        if secondary is None or secondary.empty:
-            _append_data_quality_log(
-                str(ticker_symbol),
-                str(interval),
-                "ERROR",
-                f"insufficient data on primary and secondary source (primary_status={res.status_code})",
-            )
-            return None
-        secondary_clean = _clean_ohlcv(
-            symbol=str(ticker_symbol),
-            timeframe=str(interval),
-            df=secondary,
-            step_sec=step_sec,
-        )
-        if secondary_clean is None or secondary_clean.empty:
-            _append_data_quality_log(
-                str(ticker_symbol),
-                str(interval),
-                "ERROR",
-                "secondary source returned unusable data after cleaning",
-            )
-            return None
         _append_data_quality_log(
             str(ticker_symbol),
             str(interval),
-            "WARN",
-            f"primary_failed_secondary_used primary_status={res.status_code}",
+            "ERROR",
+            f"insufficient Capital.com history after retries (last_http={last_status})",
         )
-        return secondary_clean
+        return None
     except Exception as exc:
         print(f"❌ Scanner error [{ticker_symbol}]: {exc}")
         return None
@@ -698,9 +595,9 @@ def scan_multi_timeframe(symbol, session_context: dict | None = None):
             _append_data_quality_log(symbol, "all", "ERROR", "epic not found on Capital")
             return None
 
-        df_1d = _fetch_bars(base_url, headers, epic, "1d", fallback_symbol=str(symbol))
-        df_4h = _fetch_bars(base_url, headers, epic, "4h", fallback_symbol=str(symbol))
-        df_15m = _fetch_bars(base_url, headers, epic, "15m", fallback_symbol=str(symbol))
+        df_1d = _fetch_bars(base_url, headers, epic, "1d")
+        df_4h = _fetch_bars(base_url, headers, epic, "4h")
+        df_15m = _fetch_bars(base_url, headers, epic, "15m")
 
         if any(df is None or df.empty for df in (df_1d, df_4h, df_15m)):
             _append_data_quality_log(

@@ -16,6 +16,8 @@ import os
 import sqlite3
 import math
 import requests
+import numpy as np
+import pandas as pd
 from bot.notifier import send_telegram_message
 from bot.licensing import safe_decrypt
 from utils.market_hours import utc_today
@@ -23,12 +25,16 @@ from config import (
     MAX_DAILY_TRADES,
     GLOBAL_MAX_OPEN_TRADES,
     MAX_DAILY_LOSS_PCT,
-    HIGH_CONFIDENCE_SL_RELAX_THRESHOLD,
-    HIGH_CONFIDENCE_SL_RELAX_MULTIPLIER,
+    FAST_RSI_LIMITS,
+    GOLD_RSI_LIMITS,
+    FAST_SL_RELAX_CONFIDENCE_THRESHOLD,
+    FAST_SL_RELAX_MULTIPLIER,
+    GOLD_SL_RELAX_CONFIDENCE_THRESHOLD,
+    GOLD_SL_RELAX_MULTIPLIER,
 )
 from database.db_manager import (
     is_master_kill_switch, get_user_kill_switch, get_user_risk_params,
-    get_preferred_leverage, set_trading_enabled,
+    get_preferred_leverage, set_trading_enabled, get_user_signal_profile,
 )
 
 STATE_NORMAL          = 'NORMAL'
@@ -732,6 +738,65 @@ def generate_institutional_stop_loss(
     }
 
 
+def compute_last_rsi(close_series, period: int = 14) -> float | None:
+    """Last RSI value from a Close series (matches strategy_meanrev RSI math)."""
+    try:
+        s = pd.Series(close_series).squeeze()
+        if s is None or len(s) < period + 1:
+            return None
+        delta = s.diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+        rs = avg_gain / avg_loss.replace(0, np.nan)
+        rsi = 100 - (100 / (1 + rs))
+        v = float(rsi.iloc[-1])
+        return v if math.isfinite(v) else None
+    except Exception:
+        return None
+
+
+def _subscription_tier_for_chat(chat_id: str | None) -> str:
+    """FAST or GOLDEN (Gold) — from subscribers.signal_profile."""
+    if not chat_id:
+        return "FAST"
+    try:
+        return "GOLDEN" if get_user_signal_profile(str(chat_id)) == "GOLDEN" else "FAST"
+    except Exception:
+        return "FAST"
+
+
+def _is_mean_reversion_strategy(strategy_label: str | None) -> bool:
+    s = (strategy_label or "").strip().lower()
+    return (
+        "meanrev" in s
+        or "meanreversion" in s
+        or "mean_rev" in s
+        or s in ("mean reversion", "meanrev")
+    )
+
+
+def _execution_policy_labels(
+    tier: str,
+    *,
+    sl_relax_active: bool,
+    relax_pct_label: int | None,
+) -> tuple[str, str]:
+    if tier == "GOLDEN":
+        base_en = "⚙️ *Gold Discipline Applied*"
+        base_ar = "⚙️ *معيار الذهب — Gold Discipline Applied*"
+    else:
+        base_en = "⚙️ *Fast Entry Executed*"
+        base_ar = "⚙️ *تنفيذ Fast — Fast Entry Executed*"
+    if sl_relax_active and relax_pct_label:
+        return (
+            f"{base_en} (+{relax_pct_label}% max risk cap)",
+            f"{base_ar} (+{relax_pct_label}% سقف مخاطرة)",
+        )
+    return base_en, base_ar
+
+
 def validate_pre_trade(
     symbol,
     entry_price,
@@ -745,9 +810,16 @@ def validate_pre_trade(
     current_symbol_exposure: float = 0.0,
     current_total_exposure: float = 0.0,
     exposure_by_symbol: dict | None = None,
+    action: str | None = None,
+    strategy_label: str | None = None,
+    rsi_15m: float | None = None,
 ) -> tuple[bool, str, dict]:
     """
     Mandatory pre-trade validation.
+
+    Tier (Fast vs Gold) affects:
+      - Mean Reversion RSI limits at execution (FAST_RSI_LIMITS vs GOLD_RSI_LIMITS)
+      - Max stop-loss % relaxation (Fast: >80% conf → +15%; Gold: >90% conf → +10%)
 
     Returns:
       (approved, reason, details)
@@ -777,10 +849,50 @@ def validate_pre_trade(
     stop_loss_pct = stop_dist / entry
     if stop_loss_pct <= 0 or stop_loss_pct >= 0.5:
         return False, "Trade rejected: invalid stop-loss ratio", {}
+
     conf_val = float(confidence)
+    tier = _subscription_tier_for_chat(chat_id)
+
+    # Tier RSI gate — Mean Reversion only (re-check at execution for Gold vs Fast).
+    if (
+        chat_id
+        and _is_mean_reversion_strategy(strategy_label)
+        and rsi_15m is not None
+        and action in ("BUY", "SELL", "buy", "sell")
+    ):
+        os_lim, ob_lim = (GOLD_RSI_LIMITS if tier == "GOLDEN" else FAST_RSI_LIMITS)
+        rv = float(rsi_15m)
+        au = str(action).upper()
+        if au == "BUY" and rv > float(os_lim):
+            return False, "Trade rejected: RSI outside tier limits (Mean Reversion)", {
+                "rsi_15m": round(rv, 4),
+                "subscription_tier": tier,
+                "rsi_oversold_max": float(os_lim),
+                "rsi_overbought_min": float(ob_lim),
+                "action": au,
+            }
+        if au == "SELL" and rv < float(ob_lim):
+            return False, "Trade rejected: RSI outside tier limits (Mean Reversion)", {
+                "rsi_15m": round(rv, 4),
+                "subscription_tier": tier,
+                "rsi_oversold_max": float(os_lim),
+                "rsi_overbought_min": float(ob_lim),
+                "action": au,
+            }
+
     max_stop_loss_pct_allowed = float(MAX_STOP_LOSS_PCT)
-    if conf_val > float(HIGH_CONFIDENCE_SL_RELAX_THRESHOLD):
-        max_stop_loss_pct_allowed = float(MAX_STOP_LOSS_PCT) * float(HIGH_CONFIDENCE_SL_RELAX_MULTIPLIER)
+    sl_relax_active = False
+    relax_pct_label: int | None = None
+    if tier == "GOLDEN":
+        if conf_val > float(GOLD_SL_RELAX_CONFIDENCE_THRESHOLD):
+            max_stop_loss_pct_allowed = float(MAX_STOP_LOSS_PCT) * float(GOLD_SL_RELAX_MULTIPLIER)
+            sl_relax_active = True
+            relax_pct_label = 10
+    else:
+        if conf_val > float(FAST_SL_RELAX_CONFIDENCE_THRESHOLD):
+            max_stop_loss_pct_allowed = float(MAX_STOP_LOSS_PCT) * float(FAST_SL_RELAX_MULTIPLIER)
+            sl_relax_active = True
+            relax_pct_label = 15
 
     if (stop_loss_pct - max_stop_loss_pct_allowed) > 1e-9:
         return False, "Trade rejected: stop-loss exceeds max risk distance", {
@@ -788,6 +900,7 @@ def validate_pre_trade(
             "max_stop_loss_pct": round(max_stop_loss_pct_allowed, 8),
             "base_max_stop_loss_pct": float(MAX_STOP_LOSS_PCT),
             "confidence": round(conf_val, 2),
+            "subscription_tier": tier,
         }
 
     # Trade count constraints
@@ -878,6 +991,12 @@ def validate_pre_trade(
             "sector_limit": round(sector_limit, 4),
         }
 
+    pol_en, pol_ar = _execution_policy_labels(
+        tier,
+        sl_relax_active=bool(sl_relax_active),
+        relax_pct_label=relax_pct_label,
+    )
+
     return True, "approved", {
         "position_size": round(proposed_size, 4),
         "required_margin": round(required_margin, 4),
@@ -888,4 +1007,8 @@ def validate_pre_trade(
         "remaining_free_margin": round(remaining_free_margin, 4),
         "sector": curr_sector,
         "projected_sector_exposure": round(projected_sector, 4),
+        "subscription_tier": tier,
+        "sl_relaxation_active": bool(sl_relax_active),
+        "execution_policy_en": pol_en,
+        "execution_policy_ar": pol_ar,
     }
