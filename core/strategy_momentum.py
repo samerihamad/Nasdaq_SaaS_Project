@@ -39,6 +39,7 @@ from config import (
     MOM_MIN_SCORE,
     SIGNAL_MOM_MIN_SCORE,
     MIN_15M_BARS,
+    FAST_MOM_ADX_THRESHOLD,
     FAST_MOM_VOL_RATIO,
     FAST_MOM_VOL_RATIO_HIGH_RSI,
     FAST_MOM_RSI_VOL_TIER_HIGH,
@@ -297,8 +298,9 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
     plus_di_val  = float(plus_di.iloc[-1])
     minus_di_val = float(minus_di.iloc[-1])
 
-    if adx_val < MOM_ADX_THRESHOLD:
-        rej = f"Rejected: Weak Trend (ADX {adx_val:.1f} < {float(MOM_ADX_THRESHOLD):.1f})"
+    active_adx_min = float(FAST_MOM_ADX_THRESHOLD or MOM_ADX_THRESHOLD)
+    if adx_val < active_adx_min:
+        rej = f"Rejected: Weak Trend (ADX {adx_val:.1f} < {float(active_adx_min):.1f})"
         log.info("[Momentum %s] %s", symbol, rej)
         return {"rejected": True, "strategy": "Momentum", "reason": rej}
 
@@ -350,10 +352,13 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
 
     # ── MACD crossover ────────────────────────────────────────────────────────
     macd_line, signal_line = _macd(close_15m)
-    if MOM_MACD_CONFIRM and not _macd_crossover(macd_line, signal_line, direction):
+    macd_bypass = direction == "BUY" and rsi_15m_val > float(FAST_MOM_RSI_VOL_TIER_HIGH)
+    if MOM_MACD_CONFIRM and (not macd_bypass) and not _macd_crossover(macd_line, signal_line, direction):
         rej = "Rejected: No MACD Confirmation"
         log.info("[Momentum %s] %s", symbol, rej)
         return {"rejected": True, "strategy": "Momentum", "reason": rej}
+    if MOM_MACD_CONFIRM and macd_bypass:
+        log.info("[Momentum %s] MACD bypass (RSI %.1f > %.1f)", symbol, rsi_15m_val, float(FAST_MOM_RSI_VOL_TIER_HIGH))
 
     # ── Volume vs MA20 (FAST tiered: high RSI >70 → 0.8x min; else 1.0x on BUY; SELL → 1.0x) ─
     vol_ratio = _volume_ratio(df_15m)
@@ -385,7 +390,8 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
     reasons = []
 
     # 1. ADX (20 pts base + 5 bonus for strong trend)
-    adx_pts = min(20, int(20 * (adx_val - MOM_ADX_THRESHOLD) / (MOM_ADX_STRONG - MOM_ADX_THRESHOLD)))
+    adx_den = max(1e-9, float(MOM_ADX_STRONG) - float(active_adx_min))
+    adx_pts = min(20, int(20 * (adx_val - active_adx_min) / adx_den))
     score  += adx_pts
     reasons.append(f"ADX={adx_val:.1f} (+{adx_pts})")
     if adx_val >= MOM_ADX_STRONG:

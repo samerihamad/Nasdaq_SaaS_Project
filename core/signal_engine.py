@@ -139,11 +139,11 @@ def _analyze_ticker(symbol: str) -> dict | None:
 
     if not signals:
         if structural_rejections:
-            best_rej = structural_rejections[0]
-            log.debug(
-                "[%s] %s rejected by structure: %s",
-                symbol, best_rej["strategy"], best_rej["reason"],
-            )
+            for rej in structural_rejections:
+                log.info(
+                    "[%s] REJECTED | strategy=%s | Reason: %s",
+                    symbol, rej.get("strategy", "Unknown"), rej.get("reason", "Rejected"),
+                )
             # Keep structural rejections as internal logs only in this path.
             return None
         return None
@@ -322,6 +322,10 @@ def _analyze_one_from_timeframes(symbol: str, timeframes: dict, min_confidence: 
         except Exception:
             pass
         if mr and mr.get("rejected"):
+            print(
+                f"[{symbol}] REJECTED | strategy=MeanRev | Reason: "
+                f"{str(mr.get('reason', 'Rejected by market structure filter'))}"
+            )
             candidates.append((
                 "__REJECTED__",
                 -1.0,
@@ -403,7 +407,11 @@ def _analyze_one_from_timeframes(symbol: str, timeframes: dict, min_confidence: 
 
     accepted = [c for c in candidates if c[0] != "__REJECTED__"]
     if not accepted:
-        _, _, rej_label, rej_reason, _, _, _, _, _, _, _ = candidates[0]
+        rejected_rows = [c for c in candidates if c[0] == "__REJECTED__"]
+        labels = [str(r[2]) for r in rejected_rows] if rejected_rows else ["Unknown"]
+        reasons = [f"{str(r[2])}: {str(r[3])}" for r in rejected_rows] if rejected_rows else ["Unknown rejection"]
+        rej_label = "+".join(sorted(set(labels)))
+        rej_reason = " || ".join(reasons)
         return {
             "symbol": symbol,
             "action": None,

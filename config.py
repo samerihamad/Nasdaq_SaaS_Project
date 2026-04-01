@@ -87,6 +87,7 @@ MOM_MIN_SCORE        = 68
 MIN_15M_BARS = int(os.getenv("MIN_15M_BARS", "100"))
 
 # Momentum tier gates on 15m (scanner emits FAST-style signals; GOLDEN re-checked in dispatch).
+FAST_MOM_ADX_THRESHOLD = float(os.getenv("FAST_MOM_ADX_THRESHOLD", "18"))
 FAST_MOM_VOL_RATIO = float(os.getenv("FAST_MOM_VOL_RATIO", "1.0"))
 # When 15m RSI > FAST_MOM_RSI_VOL_TIER_HIGH (BUY), allow volume down to this multiple of MA20.
 FAST_MOM_VOL_RATIO_HIGH_RSI = float(os.getenv("FAST_MOM_VOL_RATIO_HIGH_RSI", "0.8"))
