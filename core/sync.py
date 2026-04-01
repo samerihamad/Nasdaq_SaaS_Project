@@ -1032,11 +1032,15 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
     # (trade_id, deal_id, deal_reference, capital_order_id, symbol, direction, entry_price, size,
     #  leg_role, parent_session, stop_distance, trailing_stop, close_sync_notified,
     #  close_sync_attempts, close_sync_last_try_at)
-    # NOTE: `size` (r[6]) is numeric and must NEVER be `.strip()`'d.
+    # NOTE: `entry_price` r[6], `size` r[7] are numeric; `leg_role` is r[8].
     local_open = sorted(
         local_open,
         key=lambda r: (
-            0 if (r[7] or "").strip() == "TP1" else 1 if (r[7] or "").strip() == "TP2" else 2,
+            0
+            if str(r[8] or "").strip() == "TP1"
+            else 1
+            if str(r[8] or "").strip() == "TP2"
+            else 2,
             r[0],
         ),
     )
@@ -1179,7 +1183,7 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
             # if anything fails after updating this row.
             conn.commit()
 
-            ps = (parent_session or "").strip()
+            ps = str(parent_session or "").strip()
             pnl_f = float(pnl)
             # One risk outcome per session (not per leg) for TP1+TP2 splits.
             after_trade_leg_closed(chat_id, ps, pnl_f)
@@ -1197,7 +1201,7 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
             sd = stop_distance
             if sd is None and ts is not None and ep:
                 sd = abs(ep - ts)
-            lr = (leg_role or "").strip()
+            lr = str(leg_role or "").strip()
             agg_parts = int(part_n) if part_n > 1 else None
 
             if lr == "TP1" and ps:
@@ -1428,7 +1432,7 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
         )
         conn.commit()
 
-        ps = (parent_session or "").strip()
+        ps = str(parent_session or "").strip()
         pnl_f = float(pnl)
         after_trade_leg_closed(chat_id, ps, pnl_f)
 
@@ -1439,7 +1443,7 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
         sd = stop_distance
         if sd is None and ts is not None and ep:
             sd = abs(ep - ts)
-        lr = (leg_role or "").strip()
+        lr = str(leg_role or "").strip()
         agg_parts = int(part_n) if part_n > 1 else None
         if lr == "TP1" and ps:
             tp2_open = c.execute(

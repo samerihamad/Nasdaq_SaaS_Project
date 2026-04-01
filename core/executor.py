@@ -1647,7 +1647,7 @@ def monitor_and_close(chat_id):
         symbol    = trade['symbol']
         direction = trade['direction']
         trade_id  = trade['trade_id']
-        leg_role  = trade.get('leg_role') or ''
+        leg_role = str(trade.get("leg_role") or "").strip()
         parent_session = trade.get('parent_session')
         size_leg  = float(trade.get('size') or 0)
         sd_stored = trade.get('stop_distance')
@@ -1699,7 +1699,7 @@ def monitor_and_close(chat_id):
         if atr and atr > 0:
             # We only apply "lock after TP1" and "trailing after TP2"
             # to the TP2 leg, because TP1 leg is closed by broker at TP1.
-            manage_leg = (leg_role or "").strip().upper() == "TP2"
+            manage_leg = leg_role.upper() == "TP2"
 
             if tp2_hit and manage_leg:
                 # Persist milestone once TP2 threshold is first reached.
@@ -1785,7 +1785,7 @@ def monitor_and_close(chat_id):
         else:
             # ATR unavailable: respect existing SL if present, else hard fallback.
             if base_stop is not None:
-                manage_leg = (leg_role or "").strip().upper() == "TP2"
+                manage_leg = leg_role.upper() == "TP2"
                 new_stop = float(base_stop)
                 if manage_leg and tp1_hit:
                     breakeven_lock = (
@@ -1885,7 +1885,7 @@ def monitor_and_close(chat_id):
                         pass
                     continue
 
-                leg = (leg_role or "").strip().upper()
+                leg = leg_role.upper()
                 if leg == "TP2" and ("trailing" in str(stop_label).lower() or "tp2 passed" in str(stop_label).lower()):
                     target_label = "TRAILING_STOP_EXIT"
                 elif leg == "TP1" and tp1_hit:
