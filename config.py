@@ -43,6 +43,10 @@ TARGET_ANALYSIS_BARS = int(os.getenv("TARGET_ANALYSIS_BARS", "200"))
 FAST_RSI_LIMITS = (40, 60)
 GOLD_RSI_LIMITS = (30, 70)
 
+# FAST Mean Reversion: at/ beyond these 15m RSI levels, FAST tier may skip reversal candle / sweep (GOLDEN never).
+FAST_MR_RSI_EXTREME_OVERSOLD = float(os.getenv("FAST_MR_RSI_EXTREME_OVERSOLD", "30"))
+FAST_MR_RSI_EXTREME_OVERBOUGHT = float(os.getenv("FAST_MR_RSI_EXTREME_OVERBOUGHT", "70"))
+
 # Strategy scan defaults: use Fast limits so the engine emits candidates broadly;
 # per-user Gold tier re-validates RSI at execution time in validate_pre_trade().
 MR_RSI_OVERSOLD = FAST_RSI_LIMITS[0]
@@ -122,8 +126,8 @@ MIN_CONFIDENCE       = 67.0
 # - New SIGNAL_* values are selected by SIGNAL_PROFILE and can be adopted gradually.
 SIGNAL_PROFILE = os.getenv("SIGNAL_PROFILE", "FAST").strip().upper()  # FAST | GOLDEN
 
-FAST_MIN_CONFIDENCE = float(os.getenv("FAST_MIN_CONFIDENCE", "55.0"))
-GOLDEN_MIN_CONFIDENCE = float(os.getenv("GOLDEN_MIN_CONFIDENCE", "65.0"))
+FAST_MIN_CONFIDENCE = float(os.getenv("FAST_MIN_CONFIDENCE", "63.0"))
+GOLDEN_MIN_CONFIDENCE = float(os.getenv("GOLDEN_MIN_CONFIDENCE", "67.0"))
 
 FAST_MR_MIN_SCORE = int(os.getenv("FAST_MR_MIN_SCORE", "52"))
 GOLDEN_MR_MIN_SCORE = int(os.getenv("GOLDEN_MR_MIN_SCORE", "62"))

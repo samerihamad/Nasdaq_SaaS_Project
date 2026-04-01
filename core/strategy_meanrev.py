@@ -40,6 +40,8 @@ from config import (
     MARKET_STRUCTURE_NO_TRADE_ZONE_PCT,
     MARKET_STRUCTURE_HTF_LOOKBACK,
     LIQUIDITY_OPENING_RANGE_BARS,
+    FAST_MR_RSI_EXTREME_OVERSOLD,
+    FAST_MR_RSI_EXTREME_OVERBOUGHT,
 )
 from core.market_structure import (
     compute_htf_range,
@@ -247,7 +249,7 @@ def _check_4h_zone(df_4h: pd.DataFrame, direction: str) -> bool:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def analyze(symbol: str, timeframes: dict) -> dict | None:
+def analyze(symbol: str, timeframes: dict, *, signal_profile: str = "FAST") -> dict | None:
     """
     Run the full Mean Reversion analysis.
 
@@ -335,10 +337,27 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
 
     has_sweep = _liquidity_sweep(df_15m, direction)
 
-    if not has_reversal_candle and not has_sweep:
-        rej = "Rejected: No Reversal Candle/Sweep Confirmation"
-        log.info("[MeanRev %s] %s", symbol, rej)
-        return {"rejected": True, "strategy": "MeanRev", "reason": rej}
+    tier = str(signal_profile or "FAST").strip().upper()
+    mr_fast_bypass: bool = False
+    if tier == "GOLDEN":
+        if not has_reversal_candle and not has_sweep:
+            rej = "Rejected: No Reversal Candle/Sweep Confirmation"
+            log.info("[MeanRev %s] %s", symbol, rej)
+            return {"rejected": True, "strategy": "MeanRev", "reason": rej}
+    else:
+        # FAST: deep RSI extreme may proceed without reversal candle or sweep; otherwise require confirmation.
+        extreme_buy = direction == "BUY" and rsi_val <= float(FAST_MR_RSI_EXTREME_OVERSOLD)
+        extreme_sell = direction == "SELL" and rsi_val >= float(FAST_MR_RSI_EXTREME_OVERBOUGHT)
+        if extreme_buy or extreme_sell:
+            mr_fast_bypass = True
+            log.info(
+                "[FAST EXECUTION] RSI Extreme (%.1f) - Bypassing Reversal Confirmation",
+                rsi_val,
+            )
+        elif not has_reversal_candle and not has_sweep:
+            rej = "Rejected: No Reversal Candle/Sweep Confirmation"
+            log.info("[MeanRev %s] %s", symbol, rej)
+            return {"rejected": True, "strategy": "MeanRev", "reason": rej}
 
     # ── Composite scoring ─────────────────────────────────────────────────────
     score = 0
@@ -442,4 +461,6 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
         "stop_loss_pct": stop_pct,
         "ms_score":     (int(ms_ctx.ms_score) if ms_ctx is not None else None),
         "reason":       " | ".join(reasons),
+        "mr_fast_bypass": bool(mr_fast_bypass),
+        "rsi_15m":      rsi_val,
     }

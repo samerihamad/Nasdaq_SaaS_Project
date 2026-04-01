@@ -630,14 +630,27 @@ def _profile_thresholds(profile: str) -> tuple[float, int, int]:
     return float(FAST_MIN_CONFIDENCE), int(FAST_MR_MIN_SCORE), int(FAST_MOM_MIN_SCORE)
 
 
+def _is_mean_reversion_strategy_label(strategy_label: str | None) -> bool:
+    s = (strategy_label or "").strip().lower()
+    return "meanrev" in s or "meanreversion" in s
+
+
 def _passes_profile_gate(
     *,
     profile: str,
     strategy_label: str | None,
     confidence: float,
     signal_score: float | None,
+    mr_fast_bypass: bool = False,
 ) -> tuple[bool, str]:
     """Per-user profile gate used before AUTO/HYBRID dispatch."""
+    p = str(profile or "FAST").strip().upper()
+    if p == "GOLDEN" and mr_fast_bypass and _is_mean_reversion_strategy_label(strategy_label):
+        return (
+            False,
+            "GOLDEN requires full Mean Reversion confirmation (FAST RSI-extreme bypass not allowed)",
+        )
+
     min_conf, mr_min, mom_min = _profile_thresholds(profile)
     if float(confidence) < float(min_conf):
         return False, f"confidence {float(confidence):.1f} < {float(min_conf):.1f}"
@@ -793,7 +806,8 @@ def send_premarket_alert(watchlist_count: int):
 
 def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
                     timeframes: dict = None, stop_loss_pct: float = None, strategy_label: str = None,
-                    ms_score: Optional[float] = None, signal_score: Optional[float] = None):
+                    ms_score: Optional[float] = None, signal_score: Optional[float] = None,
+                    mr_fast_bypass: bool = False, rsi_15m: Optional[float] = None):
     """
     Multi-tenant signal dispatcher.
 
@@ -951,6 +965,7 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
                 strategy_label=strategy_label,
                 confidence=float(confidence),
                 signal_score=(float(signal_score) if signal_score is not None else None),
+                mr_fast_bypass=bool(mr_fast_bypass),
             )
             if not allowed:
                 skipped += 1
@@ -979,6 +994,15 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
                     opened += 1
                     unsupported_for_all = False
                     print(f"[TRADE OPENED] {symbol} {action}")
+                    if (
+                        mr_fast_bypass
+                        and profile == "FAST"
+                        and _is_mean_reversion_strategy_label(strategy_label)
+                        and rsi_15m is not None
+                    ):
+                        print(
+                            f"[FAST EXECUTION] RSI Extreme ({float(rsi_15m):.1f}) - Bypassing Reversal Confirmation"
+                        )
                 elif isinstance(result, str) and result.startswith("Trade rejected:"):
                     skipped += 1
                     unsupported_for_all = False
@@ -1108,8 +1132,15 @@ def run_trading_bot():
     global _watchlist, _last_scan_date, _prev_market_status, _closed_notified, _daily_report_sent, _last_watchlist_refresh_at, _unsupported_all_day, _last_structural_suppression_notice_at
 
     print("🚀 NATB v2.0 — محرك التداول الذكي")
-    active_min_conf = float(SIGNAL_MIN_CONFIDENCE if SIGNAL_MIN_CONFIDENCE is not None else MIN_CONFIDENCE)
-    print(f"   الثقة الدنيا: {active_min_conf}% | فحص كل {CHECK_INTERVAL}s")
+    # Scan uses the looser floor so FAST-tier candidates are not discarded before per-user gates.
+    active_min_conf = min(
+        float(FAST_MIN_CONFIDENCE),
+        float(GOLDEN_MIN_CONFIDENCE),
+    )
+    print(
+        f"   أدنى ثقة للمسح: {active_min_conf}% "
+        f"(FAST≥{float(FAST_MIN_CONFIDENCE):.0f}% GOLDEN≥{float(GOLDEN_MIN_CONFIDENCE):.0f}%) | فحص كل {CHECK_INTERVAL}s"
+    )
     print("-" * 55)
     try:
         ntp_diag = sync_utc_with_ntp()
@@ -1351,6 +1382,10 @@ def run_trading_bot():
                         timeframes=timeframes, stop_loss_pct=best_sl_pct,
                         strategy_label=best_label, ms_score=best_ms_score,
                         signal_score=best_score,
+                        mr_fast_bypass=bool(sig.get("mr_fast_bypass")),
+                        rsi_15m=(
+                            float(sig["rsi_15m"]) if sig.get("rsi_15m") is not None else None
+                        ),
                     )
                     if isinstance(dispatch_result, dict) and dispatch_result.get("status") == "ai_blocked":
                         ai_blocked_count += 1

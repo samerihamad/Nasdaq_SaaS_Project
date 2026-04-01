@@ -281,8 +281,10 @@ def run_scan() -> list[dict]:
 # ── Parallel scanner (no execution) ───────────────────────────────────────────
 
 def _analyze_one_from_timeframes(symbol: str, timeframes: dict, min_confidence: float) -> dict[str, Any] | None:
-    """Strategy stack (sync) given pre-fetched timeframes — tiers/RSI unchanged inside strategies."""
-    candidates: list[tuple[str, float, str, str, float | None, float | None, float | None]] = []
+    """Strategy stack (sync) given pre-fetched timeframes — MeanRev uses FAST profile by default."""
+    candidates: list[
+        tuple[str, float, str, str, float | None, float | None, float | None, bool, float | None]
+    ] = []
     raw_confs: list[float] = []
 
     try:
@@ -292,7 +294,7 @@ def _analyze_one_from_timeframes(symbol: str, timeframes: dict, min_confidence: 
         except Exception:
             pass
         if action and conf >= float(min_confidence):
-            candidates.append((action, float(conf), "RF", str(reason), None, None, None))
+            candidates.append((action, float(conf), "RF", str(reason), None, None, None, False, None))
     except Exception:
         pass
 
@@ -311,8 +313,11 @@ def _analyze_one_from_timeframes(symbol: str, timeframes: dict, min_confidence: 
                 None,
                 None,
                 None,
+                False,
+                None,
             ))
         elif mr and float(mr.get("confidence", 0)) >= float(min_confidence):
+            rsi_v = mr.get("rsi_15m")
             candidates.append((
                 str(mr["action"]),
                 float(mr["confidence"]),
@@ -321,6 +326,8 @@ def _analyze_one_from_timeframes(symbol: str, timeframes: dict, min_confidence: 
                 mr.get("stop_loss_pct"),
                 (float(mr.get("ms_score")) if mr.get("ms_score") is not None else None),
                 (float(mr.get("score")) if mr.get("score") is not None else None),
+                bool(mr.get("mr_fast_bypass")),
+                (float(rsi_v) if rsi_v is not None else None),
             ))
     except Exception:
         pass
@@ -340,6 +347,8 @@ def _analyze_one_from_timeframes(symbol: str, timeframes: dict, min_confidence: 
                 None,
                 None,
                 None,
+                False,
+                None,
             ))
         elif mo and float(mo.get("confidence", 0)) >= float(min_confidence):
             candidates.append((
@@ -350,6 +359,8 @@ def _analyze_one_from_timeframes(symbol: str, timeframes: dict, min_confidence: 
                 mo.get("stop_loss_pct"),
                 (float(mo.get("ms_score")) if mo.get("ms_score") is not None else None),
                 (float(mo.get("score")) if mo.get("score") is not None else None),
+                False,
+                None,
             ))
     except Exception:
         pass
@@ -361,7 +372,7 @@ def _analyze_one_from_timeframes(symbol: str, timeframes: dict, min_confidence: 
 
     accepted = [c for c in candidates if c[0] != "__REJECTED__"]
     if not accepted:
-        _, _, rej_label, rej_reason, _, _, _ = candidates[0]
+        _, _, rej_label, rej_reason, _, _, _, _, _ = candidates[0]
         return {
             "symbol": symbol,
             "action": None,
@@ -375,7 +386,7 @@ def _analyze_one_from_timeframes(symbol: str, timeframes: dict, min_confidence: 
             "rejected": True,
         }
 
-    best_action, best_conf, best_label, best_reason, best_sl_pct, best_ms_score, best_score = max(
+    best_action, best_conf, best_label, best_reason, best_sl_pct, best_ms_score, best_score, best_mr_fast_bypass, best_rsi_15m = max(
         accepted, key=lambda x: x[1]
     )
     print(f"[CANDIDATES] {symbol} | count={len(candidates)} | best_conf={best_conf:.1f}")
@@ -390,6 +401,8 @@ def _analyze_one_from_timeframes(symbol: str, timeframes: dict, min_confidence: 
         "ms_score": best_ms_score,
         "score": best_score,
         "timeframes": timeframes,
+        "mr_fast_bypass": bool(best_mr_fast_bypass),
+        "rsi_15m": best_rsi_15m,
     }
 
 
