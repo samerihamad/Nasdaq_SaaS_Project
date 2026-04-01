@@ -88,8 +88,13 @@ MIN_15M_BARS = int(os.getenv("MIN_15M_BARS", "100"))
 
 # Momentum tier gates on 15m (scanner emits FAST-style signals; GOLDEN re-checked in dispatch).
 FAST_MOM_VOL_RATIO = float(os.getenv("FAST_MOM_VOL_RATIO", "1.0"))
+# When 15m RSI > FAST_MOM_RSI_VOL_TIER_HIGH (BUY), allow volume down to this multiple of MA20.
+FAST_MOM_VOL_RATIO_HIGH_RSI = float(os.getenv("FAST_MOM_VOL_RATIO_HIGH_RSI", "0.8"))
+FAST_MOM_RSI_VOL_TIER_HIGH = float(os.getenv("FAST_MOM_RSI_VOL_TIER_HIGH", "70"))
 GOLDEN_MOM_VOL_RATIO = float(os.getenv("GOLDEN_MOM_VOL_RATIO", str(MOM_VOL_RATIO)))
-FAST_MOM_RSI_BUY_MAX = float(os.getenv("FAST_MOM_RSI_BUY_MAX", "75"))
+FAST_MOM_RSI_BUY_MAX = float(os.getenv("FAST_MOM_RSI_BUY_MAX", "77"))
+# Minimum AI probability (%) for FAST momentum entries using the high-RSI / relaxed-volume path.
+FAST_MOM_LOW_VOL_AI_MIN = float(os.getenv("FAST_MOM_LOW_VOL_AI_MIN", "65"))
 GOLDEN_MOM_RSI_BUY_MAX = float(os.getenv("GOLDEN_MOM_RSI_BUY_MAX", "65"))
 FAST_MOM_RSI_SELL_MIN = float(os.getenv("FAST_MOM_RSI_SELL_MIN", "25"))
 GOLDEN_MOM_RSI_SELL_MIN = float(os.getenv("GOLDEN_MOM_RSI_SELL_MIN", "35"))

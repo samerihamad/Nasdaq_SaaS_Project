@@ -69,6 +69,7 @@ from config import (
     GOLDEN_MOM_VOL_RATIO,
     GOLDEN_MOM_RSI_BUY_MAX,
     GOLDEN_MOM_RSI_SELL_MIN,
+    FAST_MOM_LOW_VOL_AI_MIN,
     CHECK_INTERVAL,
     MAX_WATCHLIST,
     HYBRID_SIGNAL_TTL,
@@ -843,7 +844,8 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
                     timeframes: dict = None, stop_loss_pct: float = None, strategy_label: str = None,
                     ms_score: Optional[float] = None, signal_score: Optional[float] = None,
                     mr_fast_bypass: bool = False, rsi_15m: Optional[float] = None,
-                    mom_rsi_15m: Optional[float] = None, mom_vol_ratio: Optional[float] = None):
+                    mom_rsi_15m: Optional[float] = None, mom_vol_ratio: Optional[float] = None,
+                    mom_low_vol_entry: bool = False):
     """
     Multi-tenant signal dispatcher.
 
@@ -923,6 +925,35 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
                 skipped=0,
                 failed=0,
                 status="ai_blocked",
+            )
+            return {
+                "status": "ai_blocked",
+                "attempted": 0,
+                "opened": 0,
+                "skipped": 0,
+                "failed": 0,
+            }
+
+        # FAST momentum: high-RSI / relaxed-volume entries need stronger AI probability.
+        if (
+            mom_low_vol_entry
+            and strategy_key == "Momentum"
+            and (ai_prob is None or float(ai_prob) < float(FAST_MOM_LOW_VOL_AI_MIN))
+        ):
+            print(
+                f"[AI BLOCK] {symbol} {action} | "
+                f"FAST low-vol momentum requires AI prob >= {float(FAST_MOM_LOW_VOL_AI_MIN):.1f}% "
+                f"(got {float(ai_prob) if ai_prob is not None else 'n/a'})"
+            )
+            _log_execution_audit(
+                symbol=symbol,
+                action=action,
+                strategy=strategy_label,
+                attempted=0,
+                opened=0,
+                skipped=0,
+                failed=0,
+                status="ai_blocked_low_vol_momentum",
             )
             return {
                 "status": "ai_blocked",
@@ -1431,6 +1462,7 @@ def run_trading_bot():
                         mom_vol_ratio=(
                             float(sig["mom_vol_ratio"]) if sig.get("mom_vol_ratio") is not None else None
                         ),
+                        mom_low_vol_entry=bool(sig.get("mom_low_vol_entry")),
                     )
                     if isinstance(dispatch_result, dict) and dispatch_result.get("status") == "ai_blocked":
                         ai_blocked_count += 1

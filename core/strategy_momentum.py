@@ -40,6 +40,8 @@ from config import (
     SIGNAL_MOM_MIN_SCORE,
     MIN_15M_BARS,
     FAST_MOM_VOL_RATIO,
+    FAST_MOM_VOL_RATIO_HIGH_RSI,
+    FAST_MOM_RSI_VOL_TIER_HIGH,
     FAST_MOM_RSI_BUY_MAX,
     FAST_MOM_RSI_SELL_MIN,
     NEWS_API_KEY,
@@ -352,9 +354,26 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
         log.info("[Momentum %s] %s", symbol, rej)
         return {"rejected": True, "strategy": "Momentum", "reason": rej}
 
-    # ── Volume vs MA20 (FAST: ≥ FAST_MOM_VOL_RATIO; GOLDEN checked at dispatch) ─
+    # ── Volume vs MA20 (FAST tiered: high RSI >70 → 0.8x min; else 1.0x on BUY; SELL → 1.0x) ─
     vol_ratio = _volume_ratio(df_15m)
-    vol_min = float(FAST_MOM_VOL_RATIO)
+    if direction == "SELL":
+        vol_min = float(FAST_MOM_VOL_RATIO)
+    elif rsi_15m_val > float(FAST_MOM_RSI_VOL_TIER_HIGH):
+        vol_min = float(FAST_MOM_VOL_RATIO_HIGH_RSI)
+    else:
+        vol_min = float(FAST_MOM_VOL_RATIO)
+    mom_low_vol_entry = (
+        direction == "BUY"
+        and rsi_15m_val > float(FAST_MOM_RSI_VOL_TIER_HIGH)
+        and vol_ratio >= vol_min
+        and vol_ratio < float(FAST_MOM_VOL_RATIO)
+    )
+    if mom_low_vol_entry:
+        log.info(
+            "[FAST MOMENTUM] High RSI (%.1f) - Low Vol Entry | %s",
+            rsi_15m_val,
+            symbol,
+        )
     if vol_ratio < vol_min:
         rej = f"Rejected: Low Volume ({vol_ratio:.1f}x < {vol_min:.1f}x)"
         log.info("[Momentum %s] %s", symbol, rej)
@@ -462,4 +481,5 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
         "reason":        " | ".join(reasons),
         "mom_rsi_15m":   rsi_15m_val,
         "mom_vol_ratio": vol_ratio,
+        "mom_low_vol_entry": bool(mom_low_vol_entry),
     }
