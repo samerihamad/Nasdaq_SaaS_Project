@@ -354,6 +354,10 @@ def analyze(symbol: str, timeframes: dict, *, signal_profile: str = "FAST") -> d
                 "[FAST EXECUTION] RSI Extreme (%.1f) - Bypassing Reversal Confirmation",
                 rsi_val,
             )
+            log.info(
+                "[FAST OPTIMIZATION] Trade triggered by MeanRev RSI Extreme Bypass | %s",
+                symbol,
+            )
         elif not has_reversal_candle and not has_sweep:
             rej = "Rejected: No Reversal Candle/Sweep Confirmation"
             log.info("[MeanRev %s] %s", symbol, rej)

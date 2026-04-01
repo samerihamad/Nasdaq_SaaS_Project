@@ -330,6 +330,22 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
 
     close_val = float(close_15m.iloc[-1])
 
+    # FAST SMA flexibility: require SMA20 alignment only (no SMA50 hard gate).
+    sma20_15m = close_15m.rolling(20).mean()
+    sma50_15m = close_15m.rolling(50).mean()
+    sma20_v = float(sma20_15m.iloc[-1])
+    sma50_v = float(sma50_15m.iloc[-1])
+    if direction == "BUY" and close_val <= sma20_v:
+        rej = f"Rejected: Price not above SMA20 ({close_val:.2f} <= {sma20_v:.2f})"
+        log.info("[Momentum %s] %s", symbol, rej)
+        return {"rejected": True, "strategy": "Momentum", "reason": rej}
+    if direction == "SELL" and close_val >= sma20_v:
+        rej = f"Rejected: Price not below SMA20 ({close_val:.2f} >= {sma20_v:.2f})"
+        log.info("[Momentum %s] %s", symbol, rej)
+        return {"rejected": True, "strategy": "Momentum", "reason": rej}
+    if direction == "BUY" and close_val > sma20_v and close_val <= sma50_v:
+        log.info("[FAST OPTIMIZATION] Trade triggered by Momentum SMA20-only Filter | %s", symbol)
+
     # ── Market structure policy v2 (soft-scoring, no structural hard reject) ─
     htf = None
     liq = None
@@ -352,13 +368,17 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
 
     # ── MACD crossover ────────────────────────────────────────────────────────
     macd_line, signal_line = _macd(close_15m)
-    macd_bypass = direction == "BUY" and rsi_15m_val > float(FAST_MOM_RSI_VOL_TIER_HIGH)
-    if MOM_MACD_CONFIRM and (not macd_bypass) and not _macd_crossover(macd_line, signal_line, direction):
-        rej = "Rejected: No MACD Confirmation"
-        log.info("[Momentum %s] %s", symbol, rej)
-        return {"rejected": True, "strategy": "Momentum", "reason": rej}
-    if MOM_MACD_CONFIRM and macd_bypass:
-        log.info("[Momentum %s] MACD bypass (RSI %.1f > %.1f)", symbol, rsi_15m_val, float(FAST_MOM_RSI_VOL_TIER_HIGH))
+    has_macd_confirm = _macd_crossover(macd_line, signal_line, direction)
+    macd_bypass_rsi = direction == "BUY" and rsi_15m_val > float(FAST_MOM_RSI_VOL_TIER_HIGH)
+    mom_macd_bypassed = False
+    if MOM_MACD_CONFIRM and not has_macd_confirm:
+        mom_macd_bypassed = True
+        if macd_bypass_rsi:
+            log.info("[Momentum %s] MACD bypass (RSI %.1f > %.1f)", symbol, rsi_15m_val, float(FAST_MOM_RSI_VOL_TIER_HIGH))
+            log.info("[FAST OPTIMIZATION] Trade triggered by Momentum RSI MACD Bypass | %s", symbol)
+        else:
+            # Allowed here; final pass depends on AI probability gate in dispatch.
+            log.info("[Momentum %s] MACD missing; pending FAST AI bypass gate", symbol)
 
     # ── Volume vs MA20 (FAST tiered: high RSI >70 → 0.8x min; else 1.0x on BUY; SELL → 1.0x) ─
     vol_ratio = _volume_ratio(df_15m)
@@ -380,6 +400,7 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
             rsi_15m_val,
             symbol,
         )
+        log.info("[FAST OPTIMIZATION] Trade triggered by Momentum High RSI Low Volume | %s", symbol)
     if vol_ratio < vol_min:
         rej = f"Rejected: Low Volume ({vol_ratio:.1f}x < {vol_min:.1f}x)"
         log.info("[Momentum %s] %s", symbol, rej)
@@ -399,8 +420,11 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
         reasons.append("StrongTrend (+5)")
 
     # 2. MACD crossover (20 pts)
-    score += 20
-    reasons.append("MACD_cross (+20)")
+    if has_macd_confirm or macd_bypass_rsi:
+        score += 20
+        reasons.append("MACD_cross/bypass (+20)")
+    elif mom_macd_bypassed:
+        reasons.append("MACD_missing (AI_bypass_pending +0)")
 
     # 3. Volume spike (20 pts, scaled vs FAST floor)
     vol_pts = min(20, int(20 * (vol_ratio - vol_min) / 2.0 + 10))
@@ -489,4 +513,5 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
         "mom_rsi_15m":   rsi_15m_val,
         "mom_vol_ratio": vol_ratio,
         "mom_low_vol_entry": bool(mom_low_vol_entry),
+        "mom_macd_bypassed": bool(mom_macd_bypassed),
     }
