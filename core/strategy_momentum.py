@@ -38,6 +38,10 @@ from config import (
     MOM_MACD_CONFIRM,
     MOM_MIN_SCORE,
     SIGNAL_MOM_MIN_SCORE,
+    MIN_15M_BARS,
+    FAST_MOM_VOL_RATIO,
+    FAST_MOM_RSI_BUY_MAX,
+    FAST_MOM_RSI_SELL_MIN,
     NEWS_API_KEY,
     NEWS_LOOKBACK_HOURS,
     NEWS_QUALITY_SCORE,
@@ -275,11 +279,14 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
     df_4h  = _flatten(timeframes.get("4h",  pd.DataFrame()))
     df_15m = _flatten(timeframes.get("15m", pd.DataFrame()))
 
-    if df_15m.empty or len(df_15m) < 30:
-        log.debug("[Momentum %s] Insufficient 15m data", symbol)
+    min_bars = max(55, int(MIN_15M_BARS))
+    if df_15m.empty or len(df_15m) < min_bars:
+        log.debug("[Momentum %s] Insufficient 15m data (need %d bars)", symbol, min_bars)
         return None
 
     close_15m = df_15m["Close"].squeeze().astype(float)
+    rsi_15m_series = _rsi(close_15m)
+    rsi_15m_val = float(rsi_15m_series.iloc[-1])
 
     # ── ADX ───────────────────────────────────────────────────────────────────
     adx_series, plus_di, minus_di = _adx(df_15m)
@@ -297,6 +304,24 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
         direction = "BUY"
     else:
         direction = "SELL"
+
+    # ── 15m RSI band (FAST tier in-engine; GOLDEN re-validated in dispatch_signal) ─
+    if direction == "BUY":
+        if not (50.0 <= rsi_15m_val <= float(FAST_MOM_RSI_BUY_MAX)):
+            rej = (
+                f"Rejected: 15m RSI {rsi_15m_val:.1f} outside FAST buy band "
+                f"50–{float(FAST_MOM_RSI_BUY_MAX):.0f}"
+            )
+            log.info("[Momentum %s] %s", symbol, rej)
+            return {"rejected": True, "strategy": "Momentum", "reason": rej}
+    else:
+        if not (float(FAST_MOM_RSI_SELL_MIN) <= rsi_15m_val <= 50.0):
+            rej = (
+                f"Rejected: 15m RSI {rsi_15m_val:.1f} outside FAST sell band "
+                f"{float(FAST_MOM_RSI_SELL_MIN):.0f}–50"
+            )
+            log.info("[Momentum %s] %s", symbol, rej)
+            return {"rejected": True, "strategy": "Momentum", "reason": rej}
 
     close_val = float(close_15m.iloc[-1])
 
@@ -327,10 +352,11 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
         log.info("[Momentum %s] %s", symbol, rej)
         return {"rejected": True, "strategy": "Momentum", "reason": rej}
 
-    # ── Volume spike ──────────────────────────────────────────────────────────
+    # ── Volume vs MA20 (FAST: ≥ FAST_MOM_VOL_RATIO; GOLDEN checked at dispatch) ─
     vol_ratio = _volume_ratio(df_15m)
-    if vol_ratio < MOM_VOL_RATIO:
-        rej = f"Rejected: Low Volume ({vol_ratio:.1f}x < {float(MOM_VOL_RATIO):.1f}x)"
+    vol_min = float(FAST_MOM_VOL_RATIO)
+    if vol_ratio < vol_min:
+        rej = f"Rejected: Low Volume ({vol_ratio:.1f}x < {vol_min:.1f}x)"
         log.info("[Momentum %s] %s", symbol, rej)
         return {"rejected": True, "strategy": "Momentum", "reason": rej}
 
@@ -350,8 +376,8 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
     score += 20
     reasons.append("MACD_cross (+20)")
 
-    # 3. Volume spike (20 pts, scaled)
-    vol_pts = min(20, int(20 * (vol_ratio - MOM_VOL_RATIO) / 2.0 + 10))
+    # 3. Volume spike (20 pts, scaled vs FAST floor)
+    vol_pts = min(20, int(20 * (vol_ratio - vol_min) / 2.0 + 10))
     score  += vol_pts
     reasons.append(f"VolRatio={vol_ratio:.1f}x (+{vol_pts})")
 
@@ -434,4 +460,6 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
         "stop_loss_pct": stop_pct,
         "ms_score":      (int(ms_ctx.ms_score) if ms_ctx is not None else None),
         "reason":        " | ".join(reasons),
+        "mom_rsi_15m":   rsi_15m_val,
+        "mom_vol_ratio": vol_ratio,
     }

@@ -83,6 +83,17 @@ MOM_MACD_CONFIRM     = True
 # Minimum composite score (0–100) to emit a momentum signal
 MOM_MIN_SCORE        = 68
 
+# 15m bars: scanner requires at least this many cleaned rows (RSI ~14, SMA50, vol MA20).
+MIN_15M_BARS = int(os.getenv("MIN_15M_BARS", "100"))
+
+# Momentum tier gates on 15m (scanner emits FAST-style signals; GOLDEN re-checked in dispatch).
+FAST_MOM_VOL_RATIO = float(os.getenv("FAST_MOM_VOL_RATIO", "1.0"))
+GOLDEN_MOM_VOL_RATIO = float(os.getenv("GOLDEN_MOM_VOL_RATIO", str(MOM_VOL_RATIO)))
+FAST_MOM_RSI_BUY_MAX = float(os.getenv("FAST_MOM_RSI_BUY_MAX", "75"))
+GOLDEN_MOM_RSI_BUY_MAX = float(os.getenv("GOLDEN_MOM_RSI_BUY_MAX", "65"))
+FAST_MOM_RSI_SELL_MIN = float(os.getenv("FAST_MOM_RSI_SELL_MIN", "25"))
+GOLDEN_MOM_RSI_SELL_MIN = float(os.getenv("GOLDEN_MOM_RSI_SELL_MIN", "35"))
+
 # ── ATR / Stop-Loss ───────────────────────────────────────────────────────────
 
 # Initial stop = entry ± (ATR × this multiplier)

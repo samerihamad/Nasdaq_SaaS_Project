@@ -21,6 +21,7 @@ from config import (
     MARKET_DATA_CAPITAL_PASSWORD,
     MARKET_DATA_CAPITAL_IS_DEMO,
     MIN_ANALYSIS_BARS,
+    MIN_15M_BARS,
     TARGET_ANALYSIS_BARS,
 )
 
@@ -50,9 +51,10 @@ _TF_CONFIG = {
     },
     "15m": {
         "resolutions": ("MINUTE_15", "M15", "MINUTE15"),
-        "max": 800,
+        # Request enough history for 100+ clean bars (RSI, SMA50, volume MA20).
+        "max": max(800, int(os.getenv("CAPITAL_15M_MAX_BARS_REQUEST", "1000"))),
         "step_sec": 900,
-        "min_rows": 80,
+        "min_rows": max(80, int(MIN_15M_BARS)),
     },
 }
 
@@ -798,10 +800,15 @@ async def scan_multi_timeframe_async(
 
         epic = await _resolve_epic_aio(session, semaphore, base_url, headers, symbol)
         if not epic:
-            _append_data_quality_log(symbol, "all", "ERROR", "epic not found on Capital")
+            _append_data_quality_log(
+                symbol,
+                "all",
+                "ERROR",
+                "mapping_error: epic not found on Capital (symbol not mapped)",
+            )
             return None
 
-        df_1d, df_4h, df_15m = await asyncio.gather(
+        raw_1d, raw_4h, raw_15m = await asyncio.gather(
             _fetch_bars_aio(
                 session, semaphore, base_url, headers, epic, "1d", log_symbol=str(symbol)
             ),
@@ -811,16 +818,67 @@ async def scan_multi_timeframe_async(
             _fetch_bars_aio(
                 session, semaphore, base_url, headers, epic, "15m", log_symbol=str(symbol)
             ),
+            return_exceptions=True,
         )
 
-        if any(df is None or df.empty for df in (df_1d, df_4h, df_15m)):
+        def _unwrap(res: object, tf: str) -> pd.DataFrame | None:
+            if isinstance(res, Exception):
+                _append_data_quality_log(
+                    symbol,
+                    tf,
+                    "ERROR",
+                    f"fetch_exception: {res!s}",
+                )
+                return None
+            return res  # type: ignore[return-value]
+
+        df_1d = _unwrap(raw_1d, "1d")
+        df_4h = _unwrap(raw_4h, "4h")
+        df_15m = _unwrap(raw_15m, "15m")
+
+        # 15m is mandatory for intraday strategies; allow partial 1d/4h (e.g. < MIN_ANALYSIS_BARS daily history).
+        if df_15m is None or df_15m.empty:
+            _append_data_quality_log(
+                symbol,
+                "15m",
+                "WARN",
+                "15m empty after primary fetch — retry once",
+            )
+            df_15m = await _fetch_bars_aio(
+                session,
+                semaphore,
+                base_url,
+                headers,
+                epic,
+                "15m",
+                log_symbol=str(symbol),
+            )
+
+        if df_15m is None or df_15m.empty:
             _append_data_quality_log(
                 symbol,
                 "all",
                 "ERROR",
-                "one or more timeframes missing after fetch/clean",
+                "15m_unavailable: no usable 15m data after retry (API limit, no history, or cleaning removed all rows)",
             )
             return None
+
+        if df_1d is None or df_1d.empty:
+            df_1d = pd.DataFrame()
+            _append_data_quality_log(
+                symbol,
+                "1d",
+                "WARN",
+                "1d missing or insufficient — continuing with empty 1d (listing history / MIN_ANALYSIS_BARS)",
+            )
+        if df_4h is None or df_4h.empty:
+            df_4h = pd.DataFrame()
+            _append_data_quality_log(
+                symbol,
+                "4h",
+                "WARN",
+                "4h missing — continuing with empty 4h",
+            )
 
         _append_data_quality_log(
             symbol,
@@ -836,6 +894,50 @@ async def scan_multi_timeframe_async(
         _append_data_quality_log(symbol, "all", "ERROR", f"scan_multi_timeframe exception: {exc}")
         print(f"❌ خطأ في جلب البيانات متعددة الأطر [{symbol}]: {exc}")
         return None
+    finally:
+        if close_local:
+            await session.close()
+
+
+async def fetch_15m_ohlcv_async(
+    symbol: str,
+    session_context: dict | None = None,
+    *,
+    session: aiohttp.ClientSession | None = None,
+    semaphore: asyncio.Semaphore | None = None,
+) -> tuple[pd.DataFrame | None, str | None]:
+    """
+    Epic resolution + 15m bars only (same depth rules as multi-TF scan).
+    For diagnostics and tools that do not need 1d/4h — fewer API calls per symbol.
+
+    Returns (dataframe, None) on success, (None, reason) where reason is one of:
+      mapping_error, session_error, 15m_unavailable
+    """
+    close_local = session is None
+    if session is None:
+        session = aiohttp.ClientSession(timeout=_AIO_TIMEOUT)
+    if semaphore is None:
+        semaphore = _new_http_semaphore()
+    try:
+        base_url, headers = await _get_market_data_session_aio(session, semaphore, session_context)
+        if not base_url or not headers:
+            return None, "session_error"
+        epic = await _resolve_epic_aio(session, semaphore, base_url, headers, symbol)
+        if not epic:
+            return None, "mapping_error"
+        df_15m = await _fetch_bars_aio(
+            session, semaphore, base_url, headers, epic, "15m", log_symbol=str(symbol)
+        )
+        if df_15m is None or df_15m.empty:
+            df_15m = await _fetch_bars_aio(
+                session, semaphore, base_url, headers, epic, "15m", log_symbol=str(symbol)
+            )
+        if df_15m is None or df_15m.empty:
+            return None, "15m_unavailable"
+        return df_15m, None
+    except Exception as exc:
+        _append_data_quality_log(str(symbol), "15m", "ERROR", f"fetch_15m_ohlcv_async: {exc}")
+        return None, "15m_unavailable"
     finally:
         if close_local:
             await session.close()

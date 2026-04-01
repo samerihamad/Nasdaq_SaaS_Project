@@ -66,6 +66,9 @@ from config import (
     GOLDEN_MR_MIN_SCORE,
     FAST_MOM_MIN_SCORE,
     GOLDEN_MOM_MIN_SCORE,
+    GOLDEN_MOM_VOL_RATIO,
+    GOLDEN_MOM_RSI_BUY_MAX,
+    GOLDEN_MOM_RSI_SELL_MIN,
     CHECK_INTERVAL,
     MAX_WATCHLIST,
     HYBRID_SIGNAL_TTL,
@@ -635,6 +638,10 @@ def _is_mean_reversion_strategy_label(strategy_label: str | None) -> bool:
     return "meanrev" in s or "meanreversion" in s
 
 
+def _is_momentum_strategy_label(strategy_label: str | None) -> bool:
+    return "momentum" in (strategy_label or "").strip().lower()
+
+
 def _passes_profile_gate(
     *,
     profile: str,
@@ -642,6 +649,9 @@ def _passes_profile_gate(
     confidence: float,
     signal_score: float | None,
     mr_fast_bypass: bool = False,
+    action: str | None = None,
+    mom_rsi_15m: float | None = None,
+    mom_vol_ratio: float | None = None,
 ) -> tuple[bool, str]:
     """Per-user profile gate used before AUTO/HYBRID dispatch."""
     p = str(profile or "FAST").strip().upper()
@@ -650,6 +660,31 @@ def _passes_profile_gate(
             False,
             "GOLDEN requires full Mean Reversion confirmation (FAST RSI-extreme bypass not allowed)",
         )
+
+    if (
+        p == "GOLDEN"
+        and _is_momentum_strategy_label(strategy_label)
+        and mom_rsi_15m is not None
+        and mom_vol_ratio is not None
+    ):
+        rsi_v = float(mom_rsi_15m)
+        vr = float(mom_vol_ratio)
+        act = str(action or "").strip().upper()
+        gvr = float(GOLDEN_MOM_VOL_RATIO)
+        if act == "BUY":
+            if not (50.0 <= rsi_v <= float(GOLDEN_MOM_RSI_BUY_MAX)) or vr < gvr:
+                return (
+                    False,
+                    f"GOLDEN momentum buy needs RSI 50–{float(GOLDEN_MOM_RSI_BUY_MAX):.0f} "
+                    f"and Vol≥{gvr:.1f}x (got RSI={rsi_v:.1f}, Vol={vr:.2f}x)",
+                )
+        elif act == "SELL":
+            if not (float(GOLDEN_MOM_RSI_SELL_MIN) <= rsi_v <= 50.0) or vr < gvr:
+                return (
+                    False,
+                    f"GOLDEN momentum sell needs RSI {float(GOLDEN_MOM_RSI_SELL_MIN):.0f}–50 "
+                    f"and Vol≥{gvr:.1f}x (got RSI={rsi_v:.1f}, Vol={vr:.2f}x)",
+                )
 
     min_conf, mr_min, mom_min = _profile_thresholds(profile)
     if float(confidence) < float(min_conf):
@@ -807,7 +842,8 @@ def send_premarket_alert(watchlist_count: int):
 def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
                     timeframes: dict = None, stop_loss_pct: float = None, strategy_label: str = None,
                     ms_score: Optional[float] = None, signal_score: Optional[float] = None,
-                    mr_fast_bypass: bool = False, rsi_15m: Optional[float] = None):
+                    mr_fast_bypass: bool = False, rsi_15m: Optional[float] = None,
+                    mom_rsi_15m: Optional[float] = None, mom_vol_ratio: Optional[float] = None):
     """
     Multi-tenant signal dispatcher.
 
@@ -966,6 +1002,9 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
                 confidence=float(confidence),
                 signal_score=(float(signal_score) if signal_score is not None else None),
                 mr_fast_bypass=bool(mr_fast_bypass),
+                action=action,
+                mom_rsi_15m=(float(mom_rsi_15m) if mom_rsi_15m is not None else None),
+                mom_vol_ratio=(float(mom_vol_ratio) if mom_vol_ratio is not None else None),
             )
             if not allowed:
                 skipped += 1
@@ -1385,6 +1424,12 @@ def run_trading_bot():
                         mr_fast_bypass=bool(sig.get("mr_fast_bypass")),
                         rsi_15m=(
                             float(sig["rsi_15m"]) if sig.get("rsi_15m") is not None else None
+                        ),
+                        mom_rsi_15m=(
+                            float(sig["mom_rsi_15m"]) if sig.get("mom_rsi_15m") is not None else None
+                        ),
+                        mom_vol_ratio=(
+                            float(sig["mom_vol_ratio"]) if sig.get("mom_vol_ratio") is not None else None
                         ),
                     )
                     if isinstance(dispatch_result, dict) and dispatch_result.get("status") == "ai_blocked":
