@@ -5,8 +5,8 @@ Runs at the start of every monitoring cycle to fix any discrepancies:
 
   Case 1 — Locally OPEN, not on broker:
     Position was closed externally (TP hit, manual close, margin call).
-    → Mark CLOSED in DB, fetch PnL from broker history, feed into
-      Circuit Breaker state machine.
+    → Mark CLOSED + PENDING_SYNC immediately; broker PnL fetch runs on a
+      daemon thread (does not block the market scanner).
 
   Case 2 — On broker, not tracked locally:
     Position opened manually via the platform UI.
@@ -14,6 +14,7 @@ Runs at the start of every monitoring cycle to fix any discrepancies:
 """
 
 import os
+import queue
 import sqlite3
 import requests
 import re
@@ -51,6 +52,348 @@ FINAL_SYNC_BACKOFF_SEC = [15.0, 30.0, 45.0, 60.0, 60.0, 60.0]
 # Closed trades with missing/zero P&L: extra background attempts (5 min × 12 = 1 h).
 STALLED_PNL_RETRY_INTERVAL_SEC = float(os.getenv("STALLED_PNL_RETRY_INTERVAL_SEC", "300"))
 STALLED_PNL_RETRY_MAX_ROUNDS = int(os.getenv("STALLED_PNL_RETRY_MAX_ROUNDS", "12"))
+
+# Background P&L sync: reconcile enqueues trade_ids; worker runs fetch_closed_deal_final_data
+# (including internal backoff sleeps) off the main / watcher / scanner thread.
+_pnl_sync_queue: queue.Queue = queue.Queue()
+_pnl_sync_lock = threading.Lock()
+_pnl_sync_scheduled: set[int] = set()
+_pnl_sync_worker_started = False
+
+
+def pnl_sync_background_active() -> bool:
+    """True if P&L jobs are queued or a worker run is in progress."""
+    with _pnl_sync_lock:
+        return (not _pnl_sync_queue.empty()) or (len(_pnl_sync_scheduled) > 0)
+
+
+def schedule_trade_pnl_sync(trade_id: int, *, notify: bool = True) -> None:
+    """
+    Queue broker history fetch + finalize for this trade on the P&L daemon thread.
+    Safe to call from reconcile; does not block on Capital history backoff.
+    """
+    tid = int(trade_id)
+    with _pnl_sync_lock:
+        if tid in _pnl_sync_scheduled:
+            return
+        _pnl_sync_scheduled.add(tid)
+    _pnl_sync_queue.put((tid, bool(notify)))
+    _ensure_pnl_sync_worker()
+
+
+def _ensure_pnl_sync_worker() -> None:
+    global _pnl_sync_worker_started
+    with _pnl_sync_lock:
+        if _pnl_sync_worker_started:
+            return
+        _pnl_sync_worker_started = True
+    threading.Thread(target=_pnl_sync_worker_loop, daemon=True, name="pnl_sync_worker").start()
+
+
+def _pnl_sync_worker_loop() -> None:
+    while True:
+        try:
+            item = _pnl_sync_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        tid, notify = item
+        try:
+            _broker_fetch_and_finalize_trade(int(tid), notify=notify)
+        except Exception as exc:
+            print(f"[P&L sync worker] trade_id={tid} error: {exc!s}", flush=True)
+        finally:
+            with _pnl_sync_lock:
+                _pnl_sync_scheduled.discard(int(tid))
+
+
+def _emit_reconcile_close_messages(chat_id: str, trade_id: int) -> None:
+    """Send TP1 / TP2 / generic reconcile Telegram after broker P&L is persisted."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    row = c.execute(
+        "SELECT symbol, direction, entry_price, exit_price, size, pnl, trailing_stop, stop_distance, "
+        "COALESCE(leg_role,''), COALESCE(parent_session,''), COALESCE(pnl_trade_parts,0) "
+        "FROM trades WHERE trade_id=? AND status='CLOSED'",
+        (int(trade_id),),
+    ).fetchone()
+    if not row:
+        conn.close()
+        return
+    (
+        symbol,
+        direction,
+        entry_price,
+        exit_price,
+        size,
+        pnl,
+        trailing_stop,
+        stop_distance,
+        leg_role,
+        parent_session,
+        pnl_trade_parts,
+    ) = row
+    ep = float(entry_price or 0)
+    sz = float(size or 0)
+    ts = float(trailing_stop) if trailing_stop is not None else None
+    sd = stop_distance
+    if sd is None and ts is not None and ep:
+        sd = abs(ep - ts)
+    lr = str(leg_role or "").strip()
+    ps = str(parent_session or "").strip()
+    pnl_f = float(pnl or 0)
+    part_n = int(pnl_trade_parts or 0)
+    agg_parts = int(part_n) if part_n > 1 else None
+
+    if lr == "TP1" and ps:
+        try:
+            c.execute(
+                "UPDATE trades SET target_reached=COALESCE(target_reached,'TARGET_1_HIT') WHERE trade_id=?",
+                (trade_id,),
+            )
+            conn.commit()
+        except Exception:
+            pass
+        tp2_open = c.execute(
+            "SELECT 1 FROM trades WHERE parent_session=? AND status='OPEN' "
+            "AND COALESCE(leg_role,'')='TP2' LIMIT 1",
+            (ps,),
+        ).fetchone()
+        send_reconcile_tp1_hit(
+            chat_id,
+            trade_id=int(trade_id),
+            symbol=symbol,
+            direction=direction,
+            entry_price=ep,
+            exit_price=float(exit_price) if exit_price is not None else None,
+            size=sz,
+            pnl=pnl_f,
+            stop_distance=sd,
+            trailing_stop=ts,
+            tp2_still_open=bool(tp2_open),
+            aggregated_parts=agg_parts,
+        )
+    elif lr == "TP2" and ps:
+        try:
+            c.execute(
+                "UPDATE trades SET target_reached=COALESCE(target_reached,'TRAILING_STOP_EXIT') WHERE trade_id=?",
+                (trade_id,),
+            )
+            conn.commit()
+        except Exception:
+            pass
+        c.execute(
+            "SELECT COALESCE(SUM(pnl),0) FROM trades WHERE parent_session=? AND status='CLOSED'",
+            (ps,),
+        )
+        total_pnl = float(c.fetchone()[0])
+        c.execute(
+            "SELECT COALESCE(SUM(size),0) FROM trades WHERE parent_session=? AND status='CLOSED'",
+            (ps,),
+        )
+        total_qty = float(c.fetchone()[0])
+        c.execute(
+            "SELECT COALESCE(SUM(pnl),0) FROM trades WHERE parent_session=? "
+            "AND COALESCE(leg_role,'')='TP1' AND status='CLOSED'",
+            (ps,),
+        )
+        tp1_pnl = float(c.fetchone()[0])
+        tp2_pnl = pnl_f
+        c.execute(
+            "SELECT symbol, direction, entry_price, stop_distance, trailing_stop "
+            "FROM trades WHERE parent_session=? ORDER BY trade_id LIMIT 1",
+            (ps,),
+        )
+        row0 = c.fetchone()
+        sym0 = row0[0] if row0 else symbol
+        dir0 = row0[1] if row0 else direction
+        ep0 = float(row0[2]) if row0 and row0[2] is not None else ep
+        sd0 = row0[3] if row0 else None
+        ts0 = float(row0[4]) if row0 and row0[4] is not None else ts
+        sd_use = sd0 if sd0 is not None else sd
+        if sd_use is None and ts0 is not None and ep0:
+            sd_use = abs(ep0 - ts0)
+        send_reconcile_tp2_final(
+            chat_id,
+            trade_id=int(trade_id),
+            symbol=sym0,
+            direction=dir0,
+            entry_price=ep0,
+            exit_price=float(exit_price) if exit_price is not None else None,
+            total_qty=total_qty,
+            tp1_pnl=tp1_pnl,
+            tp2_pnl=tp2_pnl,
+            total_pnl=total_pnl,
+            stop_distance=sd_use,
+            trailing_stop=ts0,
+            aggregated_parts=agg_parts,
+        )
+    else:
+        send_reconcile_generic_external(
+            chat_id,
+            trade_id=int(trade_id),
+            symbol=symbol,
+            direction=direction,
+            entry_price=ep,
+            exit_price=float(exit_price) if exit_price is not None else None,
+            size=sz,
+            pnl=pnl_f,
+            stop_distance=sd,
+            trailing_stop=ts,
+            reason_hint="sync",
+            aggregated_parts=agg_parts,
+        )
+    conn.close()
+
+
+def _broker_fetch_and_finalize_trade(trade_id: int, *, notify: bool = True) -> bool:
+    """
+    Auth to Capital, fetch realized P&L from history (may block with internal backoff),
+    persist SYNCED row, risk hooks, and reconcile Telegram. Runs only on the P&L worker thread.
+    """
+    tid = int(trade_id)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    row = c.execute(
+        "SELECT chat_id, deal_id, COALESCE(deal_reference,''), COALESCE(capital_order_id,''), "
+        "symbol, direction, entry_price, size, COALESCE(sync_status,'') "
+        "FROM trades WHERE trade_id=?",
+        (tid,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return False
+    chat_id, deal_id, deal_reference, capital_order_id, symbol, direction, entry_price, size, sync_st = row
+    if not deal_id:
+        return False
+    st = str(sync_st or "").strip()
+    if st == SYNCED:
+        return True
+
+    try:
+        from bot.licensing import safe_decrypt
+
+        conn2 = sqlite3.connect(DB_PATH)
+        creds = conn2.execute(
+            "SELECT api_key, api_password, is_demo, email FROM subscribers WHERE chat_id=?",
+            (str(chat_id),),
+        ).fetchone()
+        conn2.close()
+        if not creds:
+            return False
+        api_key = str(safe_decrypt(creds[0] or "")).strip()
+        password = str(safe_decrypt(creds[1] or "")).strip()
+        is_demo = bool(creds[2])
+        email = str(safe_decrypt(creds[3] or "")).strip()
+    except Exception:
+        return False
+    if not api_key or not password or not email:
+        return False
+
+    base_url = (
+        "https://demo-api-capital.backend-capital.com/api/v1"
+        if is_demo
+        else "https://api-capital.backend-capital.com/api/v1"
+    )
+    headers = {
+        "X-CAP-API-KEY": api_key,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    try:
+        auth_res = requests.post(
+            f"{base_url}/session",
+            json={"identifier": email, "password": password},
+            headers=headers,
+            timeout=20,
+        )
+        if auth_res.status_code != 200:
+            return False
+        session_headers = {
+            **headers,
+            "CST": auth_res.headers.get("CST"),
+            "X-SECURITY-TOKEN": auth_res.headers.get("X-SECURITY-TOKEN"),
+        }
+    except Exception:
+        return False
+
+    dr = str(deal_reference or "").strip()
+    co = str(capital_order_id or "").strip()
+    final = fetch_closed_deal_final_data(
+        base_url,
+        session_headers,
+        str(deal_id),
+        wait_for_realized=True,
+        identifiers=[dr] if dr else None,
+        capital_order_id=co or None,
+        max_wall_sec=RECONCILE_FINAL_SYNC_WALL_SEC,
+        quiet=True,
+    )
+    if not final:
+        try:
+            conn_e = sqlite3.connect(DB_PATH)
+            conn_e.execute(
+                "UPDATE trades SET close_sync_last_error=? WHERE trade_id=?",
+                ("transaction_not_found_or_not_realized", tid),
+            )
+            conn_e.commit()
+            conn_e.close()
+        except Exception:
+            pass
+        return False
+
+    pnl = float(final["actual_pnl"])
+    exit_price = final.get("exit_price")
+    part_n = int(final.get("part_count") or 1)
+    try:
+        ep = float(entry_price or 0.0)
+        qty = float(size or 0.0)
+        side = 1.0 if str(direction).upper() == "BUY" else -1.0
+    except Exception:
+        ep = 0.0
+        qty = 0.0
+        side = 1.0
+    if float(pnl) == 0.0 and exit_price is not None and ep > 0 and qty > 0:
+        pnl = (float(exit_price) - ep) * qty * side
+
+    conn3 = sqlite3.connect(DB_PATH)
+    cur = conn3.execute(
+        "UPDATE trades SET pnl=?, actual_pnl=?, exit_price=?, close_sync_last_error=NULL, sync_status=?, "
+        "pnl_trade_parts=? "
+        "WHERE trade_id=? AND COALESCE(sync_status,'') IN (?, ?)",
+        (
+            float(pnl),
+            float(pnl),
+            float(exit_price) if exit_price is not None else None,
+            SYNCED,
+            int(part_n) if part_n > 1 else None,
+            tid,
+            PENDING_SYNC,
+            PENDING_FINAL,
+        ),
+    )
+    if cur.rowcount != 1:
+        conn3.close()
+        return False
+    conn3.commit()
+    conn3.close()
+
+    conn_ps = sqlite3.connect(DB_PATH)
+    ps_row = conn_ps.execute(
+        "SELECT COALESCE(parent_session,'') FROM trades WHERE trade_id=?",
+        (tid,),
+    ).fetchone()
+    conn_ps.close()
+    ps = str(ps_row[0] or "").strip() if ps_row else ""
+    after_trade_leg_closed(str(chat_id), ps, float(pnl))
+
+    print(
+        f"[PROFIT_FIX] Trade {int(tid)} closed at "
+        f"{('n/a' if exit_price is None else float(exit_price))}. Realized PnL: {float(pnl):.2f}",
+        flush=True,
+    )
+    if notify:
+        _emit_reconcile_close_messages(str(chat_id), tid)
+    return True
 
 
 def spawn_stalled_pnl_retry(trade_id: int) -> None:
@@ -413,11 +756,6 @@ def mark_trade_closed_pending(
     # User-facing "pending sync" close notices are optional and disabled by default.
     if changed and notify and ENABLE_CLOSE_PENDING_NOTIFY:
         _send_pending_close_notice(chat_id, symbol, direction, trade_id)
-    if changed:
-        try:
-            spawn_stalled_pnl_retry(int(trade_id))
-        except Exception:
-            pass
     return changed
 
 
@@ -1001,6 +1339,9 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
     """
     Sync local DB with live Capital.com /positions.
     Should be called once per monitoring cycle before any stop checks.
+
+    Broker history P&L fetch never blocks this function: closed trades are marked
+    PENDING_SYNC and finalized on the P&L daemon thread (see schedule_trade_pnl_sync).
     """
     pos_res = requests.get(f"{base_url}/positions", headers=headers)
     if pos_res.status_code != 200:
@@ -1115,196 +1456,20 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
             )
             conn.commit()
 
-            # Broker realizedPnL can be delayed right after a manual close.
-            # If we read too early, we may incorrectly get 0.0 and send
-            # "Breakeven" to Telegram even though the final realized P&L is > 0.
+            # Mark CLOSED + PENDING_SYNC immediately; broker P&L fetch (with internal backoff
+            # sleeps) runs on the P&L daemon thread so the scanner / main loop is never blocked.
             dr = str(deal_reference or "").strip()
-            co = str(capital_order_id or "").strip()
-            final = fetch_closed_deal_final_data(
-                base_url,
-                headers,
-                str(deal_id),
-                wait_for_realized=True,
-                identifiers=[dr] if dr else None,
-                capital_order_id=co or None,
-                max_wall_sec=RECONCILE_FINAL_SYNC_WALL_SEC,
-                quiet=True,
+            changed = mark_trade_closed_pending(
+                chat_id,
+                int(trade_id),
+                symbol=symbol,
+                direction=direction,
+                deal_reference=dr,
+                reason="awaiting_background_pnl_sync",
+                notify=True,
             )
-            if not final:
-                # Hard check: never mark CLOSED / notify if the broker still lists this leg.
-                if capital_deal_still_open(
-                    base_url,
-                    headers,
-                    str(deal_id),
-                    symbol=str(symbol or ""),
-                    direction=str(direction or ""),
-                    size=sz_f,
-                ):
-                    print(
-                        f"[Capital Sync] ABORT mark_trade_closed_pending: trade_id={trade_id} "
-                        f"deal_id={deal_id} still OPEN at broker (history miss, position present)",
-                        flush=True,
-                    )
-                    continue
-                mark_trade_closed_pending(
-                    chat_id,
-                    int(trade_id),
-                    symbol=symbol,
-                    direction=direction,
-                    deal_reference=dr,
-                    reason="transaction_not_found_or_not_realized",
-                    # Close events are critical and must always notify.
-                    notify=True,
-                )
-                continue
-
-            pnl = float(final["actual_pnl"])
-            exit_price = final.get("exit_price")
-            part_n = int(final.get("part_count") or 1)
-            cur = c.execute(
-                "UPDATE trades SET status='CLOSED', pnl=?, actual_pnl=?, exit_price=?, closed_at=?, "
-                "close_sync_last_error=NULL, sync_status=?, pnl_trade_parts=? "
-                "WHERE trade_id=? AND status='OPEN'",
-                (
-                    pnl,
-                    pnl,
-                    float(exit_price) if exit_price is not None else None,
-                    _now_utc().isoformat(),
-                    SYNCED,
-                    int(part_n) if part_n > 1 else None,
-                    trade_id,
-                ),
-            )
-            # If rowcount is 0, another process updated it before this cycle.
-            if cur.rowcount != 1:
-                continue
-
-            # Persist immediately so Telegram sync messages don't repeat
-            # if anything fails after updating this row.
-            conn.commit()
-
-            ps = str(parent_session or "").strip()
-            pnl_f = float(pnl)
-            # One risk outcome per session (not per leg) for TP1+TP2 splits.
-            after_trade_leg_closed(chat_id, ps, pnl_f)
-
-            # Allow callers (e.g., dashboard UI) to run reconcile silently
-            # to clean up stale DB rows without spamming the user.
-            #
-            # NOTE: Even in maintenance mode we still send close notifications,
-            # because maintenance should block NEW entries, not hide trade exits.
-            # Close notifications are mandatory; do not silence with notify=False.
-
-            ep = float(entry_price or 0)
-            sz = float(size or 0)
-            ts = float(trailing_stop) if trailing_stop is not None else None
-            sd = stop_distance
-            if sd is None and ts is not None and ep:
-                sd = abs(ep - ts)
-            lr = str(leg_role or "").strip()
-            agg_parts = int(part_n) if part_n > 1 else None
-
-            if lr == "TP1" and ps:
-                # Persist milestone for reporting.
-                try:
-                    c.execute(
-                        "UPDATE trades SET target_reached=COALESCE(target_reached,'TARGET_1_HIT') "
-                        "WHERE trade_id=?",
-                        (trade_id,),
-                    )
-                    conn.commit()
-                except Exception:
-                    pass
-                tp2_open = c.execute(
-                    "SELECT 1 FROM trades WHERE parent_session=? AND status='OPEN' "
-                    "AND COALESCE(leg_role,'')='TP2' LIMIT 1",
-                    (ps,),
-                ).fetchone()
-                send_reconcile_tp1_hit(
-                    chat_id,
-                    trade_id=int(trade_id),
-                    symbol=symbol,
-                    direction=direction,
-                    entry_price=ep,
-                    exit_price=float(exit_price) if exit_price is not None else None,
-                    size=sz,
-                    pnl=pnl_f,
-                    stop_distance=sd,
-                    trailing_stop=ts,
-                    tp2_still_open=bool(tp2_open),
-                    aggregated_parts=agg_parts,
-                )
-            elif lr == "TP2" and ps:
-                try:
-                    c.execute(
-                        "UPDATE trades SET target_reached=COALESCE(target_reached,'TRAILING_STOP_EXIT') "
-                        "WHERE trade_id=?",
-                        (trade_id,),
-                    )
-                    conn.commit()
-                except Exception:
-                    pass
-                c.execute(
-                    "SELECT COALESCE(SUM(pnl),0) FROM trades WHERE parent_session=? AND status='CLOSED'",
-                    (ps,),
-                )
-                total_pnl = float(c.fetchone()[0])
-                c.execute(
-                    "SELECT COALESCE(SUM(size),0) FROM trades WHERE parent_session=? AND status='CLOSED'",
-                    (ps,),
-                )
-                total_qty = float(c.fetchone()[0])
-                c.execute(
-                    "SELECT COALESCE(SUM(pnl),0) FROM trades WHERE parent_session=? "
-                    "AND COALESCE(leg_role,'')='TP1' AND status='CLOSED'",
-                    (ps,),
-                )
-                tp1_pnl = float(c.fetchone()[0])
-                tp2_pnl = pnl_f
-                c.execute(
-                    "SELECT symbol, direction, entry_price, stop_distance, trailing_stop "
-                    "FROM trades WHERE parent_session=? ORDER BY trade_id LIMIT 1",
-                    (ps,),
-                )
-                row0 = c.fetchone()
-                sym0 = row0[0] if row0 else symbol
-                dir0 = row0[1] if row0 else direction
-                ep0 = float(row0[2]) if row0 and row0[2] is not None else ep
-                sd0 = row0[3] if row0 else None
-                ts0 = float(row0[4]) if row0 and row0[4] is not None else ts
-                sd_use = sd0 if sd0 is not None else sd
-                if sd_use is None and ts0 is not None and ep0:
-                    sd_use = abs(ep0 - ts0)
-                send_reconcile_tp2_final(
-                    chat_id,
-                    trade_id=int(trade_id),
-                    symbol=sym0,
-                    direction=dir0,
-                    entry_price=ep0,
-                    exit_price=float(exit_price) if exit_price is not None else None,
-                    total_qty=total_qty,
-                    tp1_pnl=tp1_pnl,
-                    tp2_pnl=tp2_pnl,
-                    total_pnl=total_pnl,
-                    stop_distance=sd_use,
-                    trailing_stop=ts0,
-                    aggregated_parts=agg_parts,
-                )
-            else:
-                send_reconcile_generic_external(
-                    chat_id,
-                    trade_id=int(trade_id),
-                    symbol=symbol,
-                    direction=direction,
-                    entry_price=ep,
-                    exit_price=float(exit_price) if exit_price is not None else None,
-                    size=sz,
-                    pnl=pnl_f,
-                    stop_distance=sd,
-                    trailing_stop=ts,
-                    reason_hint="sync",
-                    aggregated_parts=agg_parts,
-                )
+            if changed:
+                schedule_trade_pnl_sync(int(trade_id), notify=notify)
 
     # ── Case 1b: closed pending final sync ───────────────────────────────────
     c.execute(
@@ -1394,139 +1559,7 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
         )
         conn.commit()
 
-        dr = str(deal_reference or "").strip()
-        co = str(capital_order_id or "").strip()
-        final = fetch_closed_deal_final_data(
-            base_url,
-            headers,
-            str(deal_id),
-            wait_for_realized=True,
-            identifiers=[dr] if dr else None,
-            capital_order_id=co or None,
-            max_wall_sec=RECONCILE_FINAL_SYNC_WALL_SEC,
-            quiet=True,
-        )
-        if not final:
-            c.execute(
-                "UPDATE trades SET close_sync_last_error=? WHERE trade_id=?",
-                ("transaction_not_found_or_not_realized", int(trade_id)),
-            )
-            conn.commit()
-            continue
-
-        pnl = float(final["actual_pnl"])
-        exit_price = final.get("exit_price")
-        part_n = int(final.get("part_count") or 1)
-        c.execute(
-            "UPDATE trades SET pnl=?, actual_pnl=?, exit_price=?, close_sync_last_error=NULL, sync_status=?, "
-            "pnl_trade_parts=? "
-            "WHERE trade_id=?",
-            (
-                pnl,
-                pnl,
-                float(exit_price) if exit_price is not None else None,
-                SYNCED,
-                int(part_n) if part_n > 1 else None,
-                int(trade_id),
-            ),
-        )
-        conn.commit()
-
-        ps = str(parent_session or "").strip()
-        pnl_f = float(pnl)
-        after_trade_leg_closed(chat_id, ps, pnl_f)
-
-        # Close notifications are mandatory; do not silence with notify=False.
-        ep = float(entry_price or 0)
-        sz = float(size or 0)
-        ts = float(trailing_stop) if trailing_stop is not None else None
-        sd = stop_distance
-        if sd is None and ts is not None and ep:
-            sd = abs(ep - ts)
-        lr = str(leg_role or "").strip()
-        agg_parts = int(part_n) if part_n > 1 else None
-        if lr == "TP1" and ps:
-            tp2_open = c.execute(
-                "SELECT 1 FROM trades WHERE parent_session=? AND status='OPEN' "
-                "AND COALESCE(leg_role,'')='TP2' LIMIT 1",
-                (ps,),
-            ).fetchone()
-            send_reconcile_tp1_hit(
-                chat_id,
-                trade_id=int(trade_id),
-                symbol=symbol,
-                direction=direction,
-                entry_price=ep,
-                exit_price=float(exit_price) if exit_price is not None else None,
-                size=sz,
-                pnl=pnl_f,
-                stop_distance=sd,
-                trailing_stop=ts,
-                tp2_still_open=bool(tp2_open),
-                aggregated_parts=agg_parts,
-            )
-        elif lr == "TP2" and ps:
-            c.execute(
-                "SELECT COALESCE(SUM(pnl),0) FROM trades WHERE parent_session=? AND status='CLOSED'",
-                (ps,),
-            )
-            total_pnl = float(c.fetchone()[0])
-            c.execute(
-                "SELECT COALESCE(SUM(size),0) FROM trades WHERE parent_session=? AND status='CLOSED'",
-                (ps,),
-            )
-            total_qty = float(c.fetchone()[0])
-            c.execute(
-                "SELECT COALESCE(SUM(pnl),0) FROM trades WHERE parent_session=? "
-                "AND COALESCE(leg_role,'')='TP1' AND status='CLOSED'",
-                (ps,),
-            )
-            tp1_pnl = float(c.fetchone()[0])
-            tp2_pnl = pnl_f
-            c.execute(
-                "SELECT symbol, direction, entry_price, stop_distance, trailing_stop "
-                "FROM trades WHERE parent_session=? ORDER BY trade_id LIMIT 1",
-                (ps,),
-            )
-            row0 = c.fetchone()
-            sym0 = row0[0] if row0 else symbol
-            dir0 = row0[1] if row0 else direction
-            ep0 = float(row0[2]) if row0 and row0[2] is not None else ep
-            sd0 = row0[3] if row0 else None
-            ts0 = float(row0[4]) if row0 and row0[4] is not None else ts
-            sd_use = sd0 if sd0 is not None else sd
-            if sd_use is None and ts0 is not None and ep0:
-                sd_use = abs(ep0 - ts0)
-            send_reconcile_tp2_final(
-                chat_id,
-                trade_id=int(trade_id),
-                symbol=sym0,
-                direction=dir0,
-                entry_price=ep0,
-                exit_price=float(exit_price) if exit_price is not None else None,
-                total_qty=total_qty,
-                tp1_pnl=tp1_pnl,
-                tp2_pnl=tp2_pnl,
-                total_pnl=total_pnl,
-                stop_distance=sd_use,
-                trailing_stop=ts0,
-                aggregated_parts=agg_parts,
-            )
-        else:
-            send_reconcile_generic_external(
-                chat_id,
-                trade_id=int(trade_id),
-                symbol=symbol,
-                direction=direction,
-                entry_price=ep,
-                exit_price=float(exit_price) if exit_price is not None else None,
-                size=sz,
-                pnl=pnl_f,
-                stop_distance=sd,
-                trailing_stop=ts,
-                reason_hint="sync",
-                aggregated_parts=agg_parts,
-            )
+        schedule_trade_pnl_sync(int(trade_id), notify=notify)
 
     # ── Case 2: manually opened, not tracked ─────────────────────────────────
     for p in live_positions:

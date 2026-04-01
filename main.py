@@ -46,6 +46,7 @@ from utils.market_hours import (
 )
 from utils.daily_report import send_daily_reports
 from core.executor import place_trade_for_user, monitor_and_close, process_pending_limit_orders
+from core.sync import pnl_sync_background_active
 from core.watcher import run_watcher, get_all_active_subscribers, get_trading_subscribers
 from core.signal_engine import scan_watchlist_parallel
 from core.strategy_meanrev  import analyze as analyze_meanrev
@@ -1415,6 +1416,11 @@ def run_trading_bot():
 
             # Monitor open positions for ALL active subscribers
             run_watcher()
+            if pnl_sync_background_active():
+                print(
+                    "[SCAN] Resuming market analysis while P&L sync continues in background.",
+                    flush=True,
+                )
 
             print(f"\n[SCAN] {len(_watchlist)} symbols | {len(get_trading_subscribers())} trading / {len(get_all_active_subscribers())} total subscribers")
 
