@@ -207,6 +207,7 @@ def record_open_trade(
     deal_id,
     initial_stop,
     deal_reference=None,
+    capital_order_id=None,
     leg_role=None,
     parent_session=None,
     stop_distance=None,
@@ -216,9 +217,9 @@ def record_open_trade(
     conn = sqlite3.connect(DB_PATH)
     cur = conn.execute(
         '''INSERT INTO trades
-           (chat_id, symbol, direction, entry_price, size, deal_id, deal_reference, trailing_stop, status, opened_at,
+           (chat_id, symbol, direction, entry_price, size, deal_id, deal_reference, capital_order_id, trailing_stop, status, opened_at,
             leg_role, parent_session, stop_distance)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?)''',
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?)''',
         (
             chat_id,
             symbol,
@@ -227,6 +228,7 @@ def record_open_trade(
             size,
             deal_id,
             deal_reference,
+            capital_order_id,
             initial_stop,
             utc_now().isoformat(),
             leg_role,

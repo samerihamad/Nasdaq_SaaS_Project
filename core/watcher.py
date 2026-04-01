@@ -119,6 +119,10 @@ def detect_and_recover_orphans(chat_id: str, base_url: str, headers: dict) -> in
         if sl_init is not None and entry_price:
             sd_or = abs(float(entry_price) - float(sl_init))
 
+        pos = p.get("position") or {}
+        oid = pos.get("orderId") or pos.get("order_id") or p.get("orderId")
+        capital_oid = str(oid).strip() if oid else None
+
         # ── Force-sync: register in local DB ─────────────────────────────────
         record_open_trade(
             chat_id     = chat_id,
@@ -128,6 +132,7 @@ def detect_and_recover_orphans(chat_id: str, base_url: str, headers: dict) -> in
             size        = size,
             deal_id     = deal_id,
             initial_stop= sl_init,
+            capital_order_id=capital_oid,
             leg_role="SINGLE",
             parent_session=None,
             stop_distance=sd_or,

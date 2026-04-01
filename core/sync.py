@@ -46,7 +46,53 @@ FINALIZED_NO_PNL = "FINALIZED_NO_PNL"
 FINAL_SYNC_MAX_WALL_SEC = float(os.getenv("FINAL_SYNC_MAX_WALL_SEC", "300"))
 # Per monitoring-cycle reconcile: avoid blocking the whole loop for the full budget.
 RECONCILE_FINAL_SYNC_WALL_SEC = float(os.getenv("RECONCILE_FINAL_SYNC_WALL_SEC", "300"))
-FINAL_SYNC_BACKOFF_SEC = [5.0, 15.0, 30.0, 60.0]
+# Capital can take ~60s to populate realized rpl in history after close — space retries out.
+FINAL_SYNC_BACKOFF_SEC = [15.0, 30.0, 45.0, 60.0, 60.0, 60.0]
+# Closed trades with missing/zero P&L: extra background attempts (5 min × 12 = 1 h).
+STALLED_PNL_RETRY_INTERVAL_SEC = float(os.getenv("STALLED_PNL_RETRY_INTERVAL_SEC", "300"))
+STALLED_PNL_RETRY_MAX_ROUNDS = int(os.getenv("STALLED_PNL_RETRY_MAX_ROUNDS", "12"))
+
+
+def spawn_stalled_pnl_retry(trade_id: int) -> None:
+    """
+    After a close, if P/L is still null or zero, retry broker history on a fixed interval
+    (default 5 min) for up to 1 hour, then stop.
+    """
+    tid = int(trade_id)
+
+    def _run() -> None:
+        import importlib
+        import time as _time
+
+        sync = importlib.import_module("core.sync")
+        rounds = max(1, int(STALLED_PNL_RETRY_MAX_ROUNDS))
+        interval = max(60.0, float(STALLED_PNL_RETRY_INTERVAL_SEC))
+        for _ in range(rounds):
+            _time.sleep(interval)
+            try:
+                result = sync.try_sync_final_for_trade_id(
+                    tid,
+                    max_wall_sec=120.0,
+                    with_notifications=False,
+                    quiet=True,
+                )
+                if result is not None and float(result.get("actual_pnl", 0.0)) != 0.0:
+                    sync._finalize_trade_close_notifications(tid)
+                    return
+                conn = sqlite3.connect(DB_PATH)
+                row = conn.execute(
+                    "SELECT COALESCE(actual_pnl, pnl, 0) FROM trades WHERE trade_id=?",
+                    (tid,),
+                ).fetchone()
+                conn.close()
+                if row and float(row[0] or 0) != 0.0:
+                    sync._finalize_trade_close_notifications(tid)
+                    return
+            except Exception:
+                pass
+
+    threading.Thread(target=_run, daemon=True, name=f"stalled_pnl_{tid}").start()
+
 
 # After DELETE / manual close, poll /positions before trusting "closed" (2s, 5s, 10s gaps in fetch_closed_deal_final_data).
 VERIFY_CLOSE_MAX_POLLS = int(os.getenv("VERIFY_CLOSE_MAX_POLLS", "10"))
@@ -367,6 +413,11 @@ def mark_trade_closed_pending(
     # User-facing "pending sync" close notices are optional and disabled by default.
     if changed and notify and ENABLE_CLOSE_PENDING_NOTIFY:
         _send_pending_close_notice(chat_id, symbol, direction, trade_id)
+    if changed:
+        try:
+            spawn_stalled_pnl_retry(int(trade_id))
+        except Exception:
+            pass
     return changed
 
 
@@ -377,19 +428,23 @@ def fetch_closed_deal_final_data(
     *,
     wait_for_realized: bool = True,
     identifiers: list[str] | None = None,
+    capital_order_id: str | None = None,
     lookback_max: int = 2000,
     max_wall_sec: float | None = None,
     quiet: bool = True,
 ) -> dict | None:
     """
-    Fetch broker-truth final close data for a dealId from Capital.com history.
+    Fetch broker-truth final close data from Capital.com /history/transactions.
+
+    One logical order can split into multiple trade rows (same Order Id, different Trade Id).
+    We match *all* rows whose dealId or orderId matches any stored hook (dealId,
+    dealReference, capital order id, etc.), sum realized P&L per row (CSV `rpl` / API
+    equivalent), and return one aggregate.
 
     Returns dict:
-      { 'actual_pnl': float, 'exit_price': float|None }
+      { 'actual_pnl': float, 'exit_price': float|None, 'part_count': int }
 
-    Retries with exponential-style backoff (5s, 15s, 30s, 60s, then 60s) until
-    max_wall_sec (default FINAL_SYNC_MAX_WALL_SEC, e.g. 300s). Intermediate errors
-    are logged only if quiet=False; final failure is always logged.
+    Retries with backoff until max_wall_sec (default FINAL_SYNC_MAX_WALL_SEC, e.g. 300s).
 
     Important:
     - We do NOT calculate PnL manually. We only read realized PnL from broker history.
@@ -435,8 +490,11 @@ def fetch_closed_deal_final_data(
         return float(total)
 
     def _parse_pnl(tx: dict) -> float | None:
-        # Prefer net/realized fields first (already include broker costs).
+        # Broker CSV uses `rpl` — treat as primary source of truth when present.
         for k in (
+            "rpl",
+            "Rpl",
+            "RPL",
             "netProfitAndLoss",
             "netPnl",
             "realisedPnl",
@@ -496,11 +554,13 @@ def fetch_closed_deal_final_data(
         wall = min(wall, 45.0)
 
     ids = [str(deal_id)]
+    if capital_order_id and str(capital_order_id).strip():
+        ids.append(str(capital_order_id).strip())
     if identifiers:
         ids.extend([str(x).strip() for x in identifiers if str(x).strip()])
     # De-dup while preserving order
-    seen = set()
-    ids = [x for x in ids if not (x in seen or seen.add(x))]
+    seen_ids: set[str] = set()
+    ids = [x for x in ids if not (x in seen_ids or seen_ids.add(x))]
 
     def _norm_id(v) -> str:
         if v is None:
@@ -527,6 +587,90 @@ def fetch_closed_deal_final_data(
             return float(FINAL_SYNC_BACKOFF_SEC[attempt_idx])
         return 60.0
 
+    def _tx_candidate_strings(tx: dict) -> list[str]:
+        out: list[str] = []
+        if not isinstance(tx, dict):
+            return out
+        for k in (
+            "dealId",
+            "orderId",
+            "order_id",
+            "dealReference",
+            "dealRef",
+            "relatedDealId",
+            "relatedDealReference",
+            "reference",
+            "transactionReference",
+            "openingDealId",
+            "openDealId",
+            "positionId",
+        ):
+            v = tx.get(k)
+            if v is not None:
+                out.append(str(v).strip())
+        pos = tx.get("position")
+        if isinstance(pos, dict):
+            for k in ("dealId", "orderId", "positionId"):
+                v = pos.get(k)
+                if v is not None:
+                    out.append(str(v).strip())
+        return out
+
+    def _tx_matches_any_hook(tx: dict) -> bool:
+        for c in _tx_candidate_strings(tx):
+            for hid in ids:
+                if _id_match(c, hid):
+                    return True
+        return False
+
+    def _collect_merged_transactions() -> tuple[list[dict], str]:
+        seen_keys: set[str] = set()
+        merged: list[dict] = []
+        last_err = ""
+
+        def _add_batch(raw: list) -> None:
+            for tx in raw or []:
+                if not isinstance(tx, dict):
+                    continue
+                key = "|".join(
+                    (
+                        str(tx.get("dealId") or ""),
+                        str(tx.get("orderId") or tx.get("order_id") or ""),
+                        str(tx.get("date") or tx.get("timestamp") or ""),
+                        str(tx.get("level") or tx.get("price") or ""),
+                    )
+                )
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                merged.append(tx)
+
+        ok, txs, st, info = _fetch({"dealId": str(deal_id)})
+        if not ok:
+            last_err = f"history/transactions failed status={st} info={info}"
+        elif txs:
+            _add_batch(txs)
+
+        for oid in ids:
+            if not oid or oid == str(deal_id):
+                continue
+            ok2, txs2, st2, info2 = _fetch({"dealId": str(oid)})
+            if not ok2:
+                last_err = str(last_err or f"history/transactions failed status={st2} info={info2}")
+            elif txs2:
+                _add_batch(txs2)
+            ok3, txs3, _, _ = _fetch({"orderId": str(oid)})
+            if ok3 and txs3:
+                _add_batch(txs3)
+
+        okm, txs_max, st2, info2 = _fetch({"max": int(lookback_max)})
+        if not okm:
+            last_err = str(last_err or f"history/transactions(max) failed status={st2} info={info2}")
+        elif txs_max:
+            _add_batch(txs_max)
+
+        return merged, last_err
+
     t0 = time.monotonic()
     attempt_idx = 0
     last_issue = ""
@@ -536,55 +680,59 @@ def fetch_closed_deal_final_data(
         if elapsed >= wall:
             break
 
-        ok, txs, st, info = _fetch({"dealId": str(deal_id)})
-        if not ok:
-            last_issue = f"history/transactions failed status={st} info={info}"
+        merged, fetch_err = _collect_merged_transactions()
+        if fetch_err and not merged:
+            last_issue = fetch_err
             if not quiet:
                 print("Warning: Could not sync final data from Capital.com", flush=True)
                 print(f"[Capital Sync] {last_issue}", flush=True)
-        elif not txs:
-            ok2, txs2, st2, info2 = _fetch({"max": int(lookback_max)})
-            if not ok2:
-                last_issue = f"history/transactions(max) failed status={st2} info={info2}"
-                if not quiet:
-                    print("Warning: Could not sync final data from Capital.com", flush=True)
-                    print(f"[Capital Sync] {last_issue}", flush=True)
-                txs = []
-            else:
-                txs = txs2
+        elif fetch_err and merged:
+            last_issue = fetch_err
 
-        if ok and txs:
-            found_zero_hold = False
-            for tx in txs:
-                tx_deal = tx.get("dealId")
-                tx_ref = tx.get("dealReference")
-                tx_related = tx.get("relatedDealId") or tx.get("relatedDealReference")
-                tx_reference = tx.get("reference") or tx.get("transactionReference")
-                tx_opening = tx.get("openingDealId") or tx.get("openDealId") or tx.get("positionId")
-                match = False
-                for x in ids:
-                    if (
-                        _id_match(tx_deal, x)
-                        or _id_match(tx_ref, x)
-                        or _id_match(tx_related, x)
-                        or _id_match(tx_reference, x)
-                        or _id_match(tx_opening, x)
-                    ):
-                        match = True
-                        break
-                if not match:
-                    continue
+        matched = [tx for tx in merged if _tx_matches_any_hook(tx)]
+        if not matched:
+            last_issue = last_issue or "no_matching_transactions"
+        if matched:
+            total_pnl = 0.0
+            parsed_rows = 0
+            for tx in matched:
                 pnl = _parse_pnl(tx)
                 if pnl is None:
                     continue
-                if wait_for_realized and float(pnl) == 0.0:
+                total_pnl += float(pnl)
+                parsed_rows += 1
+
+            if parsed_rows == 0:
+                last_issue = "matched_rows_but_no_pnl"
+            else:
+                qty_sum = 0.0
+                px_weighted = 0.0
+                for tx in matched:
+                    q = _parse_float(tx.get("size") or tx.get("quantity") or tx.get("dealSize"))
+                    ep = _parse_exit_price(tx)
+                    if q is not None and q > 0 and ep is not None:
+                        px_weighted += float(q) * float(ep)
+                        qty_sum += float(q)
+                exit_price: float | None = None
+                if qty_sum > 0 and px_weighted > 0:
+                    exit_price = px_weighted / qty_sum
+                else:
+                    for tx in reversed(matched):
+                        ep = _parse_exit_price(tx)
+                        if ep is not None:
+                            exit_price = ep
+                            break
+
+                part_count = len(matched)
+                found_zero_hold = False
+                if wait_for_realized and float(total_pnl) == 0.0:
                     found_zero_hold = True
-                    continue
-                return {
-                    "actual_pnl": float(pnl),
-                    "exit_price": _parse_exit_price(tx),
-                }
-            if wait_for_realized and found_zero_hold:
+                if not found_zero_hold:
+                    return {
+                        "actual_pnl": float(total_pnl),
+                        "exit_price": exit_price,
+                        "part_count": int(part_count),
+                    }
                 last_issue = "pnl_zero_placeholder_retry"
 
         if time.monotonic() - t0 >= wall:
@@ -725,14 +873,14 @@ def try_sync_final_for_trade_id(
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     row = c.execute(
-        "SELECT chat_id, deal_id, COALESCE(deal_reference,''), symbol, direction, "
-        "entry_price, size FROM trades WHERE trade_id=?",
+        "SELECT chat_id, deal_id, COALESCE(deal_reference,''), COALESCE(capital_order_id,''), "
+        "symbol, direction, entry_price, size FROM trades WHERE trade_id=?",
         (tid,),
     ).fetchone()
     if not row:
         conn.close()
         return None
-    chat_id, deal_id, deal_reference, symbol, direction, entry_price, size = row
+    chat_id, deal_id, deal_reference, capital_order_id, symbol, direction, entry_price, size = row
     if not deal_id:
         conn.close()
         return None
@@ -791,12 +939,15 @@ def try_sync_final_for_trade_id(
         wall = min(120.0, max(12.0, float(tries) * max(0.5, float(delay_sec)) * 20.0))
     wait_realized = float(wall) >= 90.0
 
+    dr = str(deal_reference or "").strip()
+    co = str(capital_order_id or "").strip()
     final = fetch_closed_deal_final_data(
         base_url,
         session_headers,
         str(deal_id),
         wait_for_realized=wait_realized,
-        identifiers=[str(deal_reference).strip()] if str(deal_reference or "").strip() else None,
+        identifiers=[dr] if dr else None,
+        capital_order_id=co or None,
         max_wall_sec=wall,
         quiet=quiet,
     )
@@ -805,6 +956,7 @@ def try_sync_final_for_trade_id(
 
     pnl_val = float(final.get("actual_pnl", 0.0))
     exit_price = final.get("exit_price")
+    part_n = int(final.get("part_count") or 1)
     try:
         ep = float(entry_price or 0.0)
         qty = float(size or 0.0)
@@ -821,7 +973,7 @@ def try_sync_final_for_trade_id(
     conn2 = sqlite3.connect(DB_PATH)
     conn2.execute(
         "UPDATE trades SET status='CLOSED', pnl=?, actual_pnl=?, exit_price=COALESCE(?, exit_price), "
-        "sync_status=?, close_sync_last_error=NULL, closed_at=COALESCE(closed_at, ?) "
+        "sync_status=?, close_sync_last_error=NULL, closed_at=COALESCE(closed_at, ?), pnl_trade_parts=? "
         "WHERE trade_id=?",
         (
             float(pnl_val),
@@ -829,6 +981,7 @@ def try_sync_final_for_trade_id(
             float(exit_price) if exit_price is not None else None,
             SYNCED,
             _now_utc().isoformat(),
+            int(part_n) if part_n > 1 else None,
             int(tid),
         ),
     )
@@ -865,7 +1018,8 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
 
     # Fetch locally tracked open trades
     c.execute(
-        "SELECT trade_id, deal_id, COALESCE(deal_reference,''), symbol, direction, entry_price, size, "
+        "SELECT trade_id, deal_id, COALESCE(deal_reference,''), COALESCE(capital_order_id,''), "
+        "symbol, direction, entry_price, size, "
         "COALESCE(leg_role,''), COALESCE(parent_session,''), stop_distance, trailing_stop, "
         "COALESCE(close_sync_notified,0), COALESCE(close_sync_attempts,0), close_sync_last_try_at "
         "FROM trades WHERE chat_id=? AND status='OPEN'",
@@ -875,7 +1029,7 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
     # If TP1 and TP2 both closed on the broker in the same cycle, process TP1 first
     # so TP1 is CLOSED in DB before TP2 final aggregates P&L.
     # local_open tuple layout:
-    # (trade_id, deal_id, deal_reference, symbol, direction, entry_price, size,
+    # (trade_id, deal_id, deal_reference, capital_order_id, symbol, direction, entry_price, size,
     #  leg_role, parent_session, stop_distance, trailing_stop, close_sync_notified,
     #  close_sync_attempts, close_sync_last_try_at)
     # NOTE: `size` (r[6]) is numeric and must NEVER be `.strip()`'d.
@@ -893,6 +1047,7 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
         trade_id,
         deal_id,
         deal_reference,
+        capital_order_id,
         symbol,
         direction,
         entry_price,
@@ -960,12 +1115,14 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
             # If we read too early, we may incorrectly get 0.0 and send
             # "Breakeven" to Telegram even though the final realized P&L is > 0.
             dr = str(deal_reference or "").strip()
+            co = str(capital_order_id or "").strip()
             final = fetch_closed_deal_final_data(
                 base_url,
                 headers,
                 str(deal_id),
                 wait_for_realized=True,
                 identifiers=[dr] if dr else None,
+                capital_order_id=co or None,
                 max_wall_sec=RECONCILE_FINAL_SYNC_WALL_SEC,
                 quiet=True,
             )
@@ -999,9 +1156,10 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
 
             pnl = float(final["actual_pnl"])
             exit_price = final.get("exit_price")
+            part_n = int(final.get("part_count") or 1)
             cur = c.execute(
                 "UPDATE trades SET status='CLOSED', pnl=?, actual_pnl=?, exit_price=?, closed_at=?, "
-                "close_sync_last_error=NULL, sync_status=? "
+                "close_sync_last_error=NULL, sync_status=?, pnl_trade_parts=? "
                 "WHERE trade_id=? AND status='OPEN'",
                 (
                     pnl,
@@ -1009,6 +1167,7 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
                     float(exit_price) if exit_price is not None else None,
                     _now_utc().isoformat(),
                     SYNCED,
+                    int(part_n) if part_n > 1 else None,
                     trade_id,
                 ),
             )
@@ -1039,6 +1198,7 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
             if sd is None and ts is not None and ep:
                 sd = abs(ep - ts)
             lr = (leg_role or "").strip()
+            agg_parts = int(part_n) if part_n > 1 else None
 
             if lr == "TP1" and ps:
                 # Persist milestone for reporting.
@@ -1068,6 +1228,7 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
                     stop_distance=sd,
                     trailing_stop=ts,
                     tp2_still_open=bool(tp2_open),
+                    aggregated_parts=agg_parts,
                 )
             elif lr == "TP2" and ps:
                 try:
@@ -1123,6 +1284,7 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
                     total_pnl=total_pnl,
                     stop_distance=sd_use,
                     trailing_stop=ts0,
+                    aggregated_parts=agg_parts,
                 )
             else:
                 send_reconcile_generic_external(
@@ -1137,11 +1299,13 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
                     stop_distance=sd,
                     trailing_stop=ts,
                     reason_hint="sync",
+                    aggregated_parts=agg_parts,
                 )
 
     # ── Case 1b: closed pending final sync ───────────────────────────────────
     c.execute(
-        "SELECT trade_id, deal_id, COALESCE(deal_reference,''), symbol, direction, entry_price, size, "
+        "SELECT trade_id, deal_id, COALESCE(deal_reference,''), COALESCE(capital_order_id,''), "
+        "symbol, direction, entry_price, size, "
         "COALESCE(leg_role,''), COALESCE(parent_session,''), stop_distance, trailing_stop, "
         "COALESCE(close_sync_attempts,0), close_sync_last_try_at "
         "FROM trades WHERE chat_id=? AND status='CLOSED' AND COALESCE(sync_status,'') IN (?, ?)",
@@ -1152,6 +1316,7 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
         trade_id,
         deal_id,
         deal_reference,
+        capital_order_id,
         symbol,
         direction,
         entry_price,
@@ -1226,12 +1391,14 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
         conn.commit()
 
         dr = str(deal_reference or "").strip()
+        co = str(capital_order_id or "").strip()
         final = fetch_closed_deal_final_data(
             base_url,
             headers,
             str(deal_id),
             wait_for_realized=True,
             identifiers=[dr] if dr else None,
+            capital_order_id=co or None,
             max_wall_sec=RECONCILE_FINAL_SYNC_WALL_SEC,
             quiet=True,
         )
@@ -1245,14 +1412,17 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
 
         pnl = float(final["actual_pnl"])
         exit_price = final.get("exit_price")
+        part_n = int(final.get("part_count") or 1)
         c.execute(
-            "UPDATE trades SET pnl=?, actual_pnl=?, exit_price=?, close_sync_last_error=NULL, sync_status=? "
+            "UPDATE trades SET pnl=?, actual_pnl=?, exit_price=?, close_sync_last_error=NULL, sync_status=?, "
+            "pnl_trade_parts=? "
             "WHERE trade_id=?",
             (
                 pnl,
                 pnl,
                 float(exit_price) if exit_price is not None else None,
                 SYNCED,
+                int(part_n) if part_n > 1 else None,
                 int(trade_id),
             ),
         )
@@ -1270,6 +1440,7 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
         if sd is None and ts is not None and ep:
             sd = abs(ep - ts)
         lr = (leg_role or "").strip()
+        agg_parts = int(part_n) if part_n > 1 else None
         if lr == "TP1" and ps:
             tp2_open = c.execute(
                 "SELECT 1 FROM trades WHERE parent_session=? AND status='OPEN' "
@@ -1288,6 +1459,7 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
                 stop_distance=sd,
                 trailing_stop=ts,
                 tp2_still_open=bool(tp2_open),
+                aggregated_parts=agg_parts,
             )
         elif lr == "TP2" and ps:
             c.execute(
@@ -1334,6 +1506,7 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
                 total_pnl=total_pnl,
                 stop_distance=sd_use,
                 trailing_stop=ts0,
+                aggregated_parts=agg_parts,
             )
         else:
             send_reconcile_generic_external(
@@ -1348,6 +1521,7 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
                 stop_distance=sd,
                 trailing_stop=ts,
                 reason_hint="sync",
+                aggregated_parts=agg_parts,
             )
 
     # ── Case 2: manually opened, not tracked ─────────────────────────────────
@@ -1388,7 +1562,8 @@ def backfill_closed_pnls(chat_id, base_url, headers, lookback: int = 200) -> int
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
-        "SELECT trade_id, deal_id, pnl, direction, entry_price, size FROM trades "
+        "SELECT trade_id, deal_id, COALESCE(deal_reference,''), COALESCE(capital_order_id,''), "
+        "pnl, direction, entry_price, size FROM trades "
         "WHERE chat_id=? AND status='CLOSED' "
         "AND deal_id IS NOT NULL AND TRIM(deal_id) != '' "
         "ORDER BY trade_id DESC LIMIT ?",
@@ -1400,18 +1575,34 @@ def backfill_closed_pnls(chat_id, base_url, headers, lookback: int = 200) -> int
         return 0
 
     updated = 0
-    for trade_id, deal_id, pnl, direction, entry_price, size in rows:
+    for trade_id, deal_id, deal_reference, capital_order_id, pnl, direction, entry_price, size in rows:
         # Backfill only unknown/zero rows.
         if pnl is not None and float(pnl) != 0.0:
             continue
-        final = fetch_closed_deal_final_data(base_url, headers, str(deal_id), wait_for_realized=True)
+        dr = str(deal_reference or "").strip()
+        co = str(capital_order_id or "").strip()
+        final = fetch_closed_deal_final_data(
+            base_url,
+            headers,
+            str(deal_id),
+            wait_for_realized=True,
+            identifiers=[dr] if dr else None,
+            capital_order_id=co or None,
+        )
         if not final:
             continue
         fetched = float(final["actual_pnl"])
         exit_price = final.get("exit_price")
+        part_n = int(final.get("part_count") or 1)
         c.execute(
-            "UPDATE trades SET pnl=?, actual_pnl=?, exit_price=? WHERE trade_id=?",
-            (float(fetched), float(fetched), float(exit_price) if exit_price is not None else None, int(trade_id)),
+            "UPDATE trades SET pnl=?, actual_pnl=?, exit_price=?, pnl_trade_parts=? WHERE trade_id=?",
+            (
+                float(fetched),
+                float(fetched),
+                float(exit_price) if exit_price is not None else None,
+                int(part_n) if part_n > 1 else None,
+                int(trade_id),
+            ),
         )
         if c.rowcount == 1:
             updated += 1

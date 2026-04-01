@@ -167,6 +167,10 @@ def create_db():
         ('stop_distance', "REAL"),
         # Capital order reference (useful for matching history after close).
         ('deal_reference', "TEXT"),
+        # Capital.com order id (groups split fills in history with dealId).
+        ('capital_order_id', "TEXT"),
+        # When P&L is summed from multiple history rows (split order), store count for Telegram.
+        ('pnl_trade_parts', "INTEGER"),
         # UX: if a position is closed manually on the platform, broker history can lag.
         # We send one "pending sync" notification and then wait for realized P&L.
         ('close_sync_notified', "INTEGER DEFAULT 0"),

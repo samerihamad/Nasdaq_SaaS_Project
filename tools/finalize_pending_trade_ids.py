@@ -27,8 +27,8 @@ def main():
     c = conn.cursor()
     for tid in tids:
         row = c.execute(
-            "SELECT chat_id, deal_id, COALESCE(deal_reference,''), symbol, direction, "
-            "entry_price, size, COALESCE(leg_role,''), COALESCE(parent_session,''), "
+            "SELECT chat_id, deal_id, COALESCE(deal_reference,''), COALESCE(capital_order_id,''), "
+            "symbol, direction, entry_price, size, COALESCE(leg_role,''), COALESCE(parent_session,''), "
             "stop_distance, trailing_stop "
             "FROM trades WHERE trade_id=? AND status='CLOSED' "
             "AND COALESCE(sync_status,'')='PENDING_FINAL'",
@@ -41,6 +41,7 @@ def main():
             chat_id,
             deal_id,
             deal_reference,
+            capital_order_id,
             symbol,
             direction,
             entry_price,
@@ -59,25 +60,29 @@ def main():
             print(f"trade_id={tid}: session failed")
             continue
         dr = str(deal_reference or "").strip()
+        co = str(capital_order_id or "").strip()
         final = fetch_closed_deal_final_data(
             base_url,
             headers,
             str(deal_id),
             wait_for_realized=True,
             identifiers=[dr] if dr else None,
+            capital_order_id=co or None,
         )
         if not final:
             print(f"trade_id={tid}: history still empty")
             continue
         pnl = float(final["actual_pnl"])
         exit_price = final.get("exit_price")
+        part_n = int(final.get("part_count") or 1)
         c.execute(
             "UPDATE trades SET pnl=?, actual_pnl=?, exit_price=?, close_sync_last_error=NULL, "
-            "sync_status='SYNCED' WHERE trade_id=?",
+            "sync_status='SYNCED', pnl_trade_parts=? WHERE trade_id=?",
             (
                 pnl,
                 pnl,
                 float(exit_price) if exit_price is not None else None,
+                int(part_n) if part_n > 1 else None,
                 int(tid),
             ),
         )

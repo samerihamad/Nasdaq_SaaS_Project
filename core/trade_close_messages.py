@@ -147,6 +147,14 @@ def _outcome_title_en_with_exception(pnl: float, *, tp1_was_hit: bool, partial: 
     return "⚖️ *Break-even*\n"
 
 
+def _aggregated_pnl_note(aggregated_parts: int | None, lang: str) -> str:
+    if aggregated_parts is None or aggregated_parts <= 1:
+        return ""
+    if lang == "en":
+        return f"\n_(Aggregated from {int(aggregated_parts)} trade parts)._"
+    return f"\n_(مجمّع من {int(aggregated_parts)} أجزاء تنفيذ)._"
+
+
 def send_reconcile_tp1_hit(
     chat_id: str,
     *,
@@ -160,6 +168,7 @@ def send_reconcile_tp1_hit(
     stop_distance: float | None,
     trailing_stop: float | None,
     tp2_still_open: bool,
+    aggregated_parts: int | None = None,
 ) -> None:
     sd = _resolve_stop_distance(stop_distance, entry_price, trailing_stop)
     r_leg = pnl_to_r_multiple(pnl, sd, size)
@@ -179,6 +188,7 @@ def send_reconcile_tp1_hit(
             + f"🎯 *R (this leg)*: *{_fmt_r(r_leg)}*\n"
             + f"📍 *Target*     : *Target 1 Hit*\n"
             + f"━━━━━━━━━━━━━━━━━━━━\n"
+            + _aggregated_pnl_note(aggregated_parts, "en")
         )
         if tp2_still_open:
             body += (
@@ -198,6 +208,7 @@ def send_reconcile_tp1_hit(
             + f"🎯 *R لهذا الحد*    : *{_fmt_r(r_leg)}*\n"
             + f"📍 *تم تحقيق*      : *الهدف الأول (1R)*\n"
             + f"━━━━━━━━━━━━━━━━━━━━\n"
+            + _aggregated_pnl_note(aggregated_parts, "ar")
         )
         if tp2_still_open:
             body += (
@@ -223,6 +234,7 @@ def send_reconcile_tp2_final(
     total_pnl: float,
     stop_distance: float | None,
     trailing_stop: float | None,
+    aggregated_parts: int | None = None,
 ) -> None:
     sd = _resolve_stop_distance(stop_distance, entry_price, trailing_stop)
     total_r = pnl_to_r_multiple(total_pnl, sd, total_qty)
@@ -247,6 +259,7 @@ def send_reconcile_tp2_final(
             + f"🎯 *R*             : *{_fmt_r(total_r)}*\n"
             + f"━━━━━━━━━━━━━━━━━━━━\n"
             + f"📍 *Target*        : *Target 2 Hit*\n"
+            + _aggregated_pnl_note(aggregated_parts, "en")
         )
     else:
         title = _outcome_title_ar(total_pnl, partial=False)
@@ -265,6 +278,7 @@ def send_reconcile_tp2_final(
             + f"🎯 *R*                  : *{_fmt_r(total_r)}*\n"
             + f"━━━━━━━━━━━━━━━━━━━━\n"
             + f"📍 *النتيجة*            : *تحقق الهدف الثاني (2.5%)*\n"
+            + _aggregated_pnl_note(aggregated_parts, "ar")
         )
 
     send_telegram_message(chat_id, body)
@@ -283,6 +297,7 @@ def send_reconcile_generic_external(
     stop_distance: float | None,
     trailing_stop: float | None,
     reason_hint: str = "external_close",
+    aggregated_parts: int | None = None,
 ) -> None:
     """Single-leg / legacy row closed on broker (TP, SL, manual)."""
     sd = _resolve_stop_distance(stop_distance, entry_price, trailing_stop)
@@ -305,6 +320,7 @@ def send_reconcile_generic_external(
             + f"🎯 *R*         : *{_fmt_r(r_mult)}*\n"
             + f"━━━━━━━━━━━━━━━━━━━━\n"
             + f"_Close synced from platform ({reason_hint})._\n"
+            + _aggregated_pnl_note(aggregated_parts, "en")
         )
     else:
         title = _outcome_title_ar(pnl, partial=False)
@@ -320,6 +336,7 @@ def send_reconcile_generic_external(
             + f"🎯 *R*               : *{_fmt_r(r_mult)}*\n"
             + f"━━━━━━━━━━━━━━━━━━━━\n"
             + f"_إغلاق مزامن من المنصة ({reason_hint})._\n"
+            + _aggregated_pnl_note(aggregated_parts, "ar")
         )
 
     send_telegram_message(chat_id, body)
@@ -341,6 +358,7 @@ def send_bot_automated_close(
     sibling_tp2_open: bool,
     leg_role: str,
     target_reached: str | None = None,
+    aggregated_parts: int | None = None,
 ) -> None:
     sd = _resolve_stop_distance(stop_distance, entry_price, trailing_stop)
     r_mult = pnl_to_r_multiple(pnl, sd, size)
@@ -366,6 +384,7 @@ def send_bot_automated_close(
             + f"*Final Realized P&L*: *{_fmt_money_signed(pnl)}*\n"
             + f"🎯 *R*         : *{_fmt_r(r_mult)}*\n"
             + (f"📍 *Target*     : *{target_reached}*\n" if target_reached else "")
+            + _aggregated_pnl_note(aggregated_parts, "en")
         )
         if sibling_tp2_open and leg_role == "TP1":
             body += (
@@ -387,6 +406,7 @@ def send_bot_automated_close(
             + f"*الربح/الخسارة النهائي*: *{_fmt_money_signed(pnl)}*\n"
             + f"🎯 *R*         : *{_fmt_r(r_mult)}*\n"
             + (f"📍 *الهدف*     : *{target_reached}*\n" if target_reached else "")
+            + _aggregated_pnl_note(aggregated_parts, "ar")
         )
         if sibling_tp2_open and leg_role == "TP1":
             body += (
@@ -406,7 +426,7 @@ def send_bot_automated_close_from_db(trade_id: int) -> bool:
     row = conn.execute(
         "SELECT chat_id, symbol, direction, entry_price, exit_price, size, pnl, "
         "trailing_stop, stop_distance, COALESCE(leg_role,''), COALESCE(parent_session,''), "
-        "COALESCE(target_reached,''), COALESCE(close_reason,'') "
+        "COALESCE(target_reached,''), COALESCE(close_reason,''), COALESCE(pnl_trade_parts,0) "
         "FROM trades WHERE trade_id=? AND status='CLOSED'",
         (int(trade_id),),
     ).fetchone()
@@ -427,8 +447,10 @@ def send_bot_automated_close_from_db(trade_id: int) -> bool:
         parent_session,
         target_reached,
         close_reason,
+        pnl_trade_parts,
     ) = row
     tid = int(trade_id)
+    agg_parts = int(pnl_trade_parts) if pnl_trade_parts and int(pnl_trade_parts) > 1 else None
     sibling_tp2_open = False
     if (leg_role or "").strip().upper() == "TP1" and (parent_session or "").strip():
         sibling_tp2_open = (
@@ -461,6 +483,7 @@ def send_bot_automated_close_from_db(trade_id: int) -> bool:
         sibling_tp2_open=sibling_tp2_open,
         leg_role=str(leg_role or "SINGLE"),
         target_reached=str(target_reached or "") or None,
+        aggregated_parts=agg_parts,
     )
     return True
 

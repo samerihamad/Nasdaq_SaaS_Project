@@ -2424,6 +2424,13 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
                 last_err = str(cerr)
                 break
 
+            capital_oid = (
+                payload.get("orderId")
+                or payload.get("order_id")
+                or (payload.get("position") or {}).get("orderId")
+            )
+            if capital_oid is not None:
+                capital_oid = str(capital_oid).strip() or None
             opened_broker_legs.append(
                 {
                     "role": leg_role,
@@ -2431,6 +2438,7 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
                     "tp": float(leg_target),
                     "deal_id": str(deal_id),
                     "deal_reference": (str(deal_ref).strip() if deal_ref else None),
+                    "capital_order_id": capital_oid,
                 }
             )
             ok_sync, info = _sync_protection_to_broker(
@@ -2500,6 +2508,7 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
             str(ob["deal_id"]),
             stop_level,
             deal_reference=ob.get("deal_reference"),
+            capital_order_id=ob.get("capital_order_id"),
             leg_role=str(ob["role"]),
             parent_session=parent_session,
             stop_distance=stop_dist,
