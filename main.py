@@ -55,7 +55,7 @@ from bot.notifier import send_telegram_message
 from bot.dashboard import post_pending_signal, get_signal_status
 from bot.i18n import t
 from database.db_manager import set_trading_enabled
-from database.db_manager import touch_engine_activity
+from database.db_manager import touch_engine_activity, touch_signal_delivered
 from database.db_manager import get_user_signal_profile
 from config import (
     MIN_CONFIDENCE,

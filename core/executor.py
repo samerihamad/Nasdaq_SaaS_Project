@@ -24,7 +24,7 @@ from config import (
     EXECUTION_REJECTION_NOTIFY_COOLDOWN_SEC,
 )
 from utils.market_scanner import scan_multi_timeframe
-from database.db_manager import is_maintenance_mode, get_subscriber_lang, get_user_signal_profile
+from database.db_manager import is_maintenance_mode, get_subscriber_lang, get_user_signal_profile, touch_signal_delivered
 from core.risk_manager import (
     can_open_trade,
     calculate_position_size, STATE_MANUAL_OVERRIDE,
@@ -2603,6 +2603,11 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
         if isinstance(tg_res, dict) and tg_res.get("ok") is False:
             desc = str(tg_res.get("description") or "").strip()
             print(f"[Telegram] Send failed chat_id={chat_id} desc={desc[:220]}", flush=True)
+        elif isinstance(tg_res, dict) and tg_res.get("ok"):
+            try:
+                touch_signal_delivered(str(chat_id))
+            except Exception:
+                pass
     except Exception:
         pass
 

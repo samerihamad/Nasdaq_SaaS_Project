@@ -36,6 +36,7 @@ _SUBSCRIBERS_CANONICAL_COLUMNS = [
     # monitoring / heartbeat
     ("last_bot_activity_at", "TEXT"),
     ("last_engine_activity_at", "TEXT"),
+    ("last_signal_delivered_at", "TEXT"),
 ]
 
 
@@ -115,6 +116,7 @@ def create_db():
         ('signal_profile', "TEXT DEFAULT 'FAST'"),
         ('last_bot_activity_at', "TEXT"),
         ('last_engine_activity_at', "TEXT"),
+        ('last_signal_delivered_at', "TEXT"),
     ]:
         try:
             c.execute(f"ALTER TABLE subscribers ADD COLUMN {col} {definition}")
@@ -499,6 +501,17 @@ def touch_engine_activity(chat_id: str):
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         "UPDATE subscribers SET last_engine_activity_at=? WHERE chat_id=?",
+        (_utc_now_iso(), str(chat_id)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def touch_signal_delivered(chat_id: str):
+    """Record the moment a signal/trade notification was successfully sent to this user."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE subscribers SET last_signal_delivered_at=? WHERE chat_id=?",
         (_utc_now_iso(), str(chat_id)),
     )
     conn.commit()

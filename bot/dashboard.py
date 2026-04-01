@@ -2215,15 +2215,25 @@ def post_pending_signal(chat_id: str, symbol: str, action: str,
     ]])
 
     token = os.getenv('TELEGRAM_BOT_TOKEN', '')
-    requests.post(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        json={
-            "chat_id":      chat_id,
-            "text":         text,
-            "parse_mode":   "Markdown",
-            "reply_markup": keyboard.to_dict(),
-        }
-    )
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={
+                "chat_id":      chat_id,
+                "text":         text,
+                "parse_mode":   "Markdown",
+                "reply_markup": keyboard.to_dict(),
+            },
+            timeout=20,
+        )
+        if resp.ok and resp.json().get("ok"):
+            try:
+                from database.db_manager import touch_signal_delivered
+                touch_signal_delivered(str(chat_id))
+            except Exception:
+                pass
+    except Exception:
+        pass
     return signal_id
 
 

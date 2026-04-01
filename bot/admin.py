@@ -161,8 +161,17 @@ def _parse_iso_ts(s: str) -> datetime | None:
         return None
 
 
-def _build_monitor_panel(window_sec: int = 300) -> str:
+def _build_monitor_panel(window_sec: int = 1800) -> str:
+    """
+    Admin monitor panel.
+
+    Status logic (all comparisons in UTC):
+      - 🟢 Active (Trading) — trading_enabled=1 AND last signal delivered within 1 hour.
+      - 🟢 Online           — any activity (bot / engine / signal) within ``window_sec`` (default 30 min).
+      - 🔴 Offline          — no recent activity.
+    """
     now = datetime.now(timezone.utc)
+    signal_active_sec = 3600  # 1 hour window for "Active (Trading)"
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     try:
@@ -173,12 +182,15 @@ def _build_monitor_panel(window_sec: int = 300) -> str:
 
     has_bot = "last_bot_activity_at" in cols
     has_eng = "last_engine_activity_at" in cols
+    has_sig = "last_signal_delivered_at" in cols
+    has_mode = "mode" in cols
 
-    # Show only real active subscribers (not partial onboarding rows).
     select = (
         "SELECT chat_id, first_name, last_name, payment_status, trading_enabled, "
         + ("last_bot_activity_at, " if has_bot else "NULL AS last_bot_activity_at, ")
-        + ("last_engine_activity_at " if has_eng else "NULL AS last_engine_activity_at ")
+        + ("last_engine_activity_at, " if has_eng else "NULL AS last_engine_activity_at, ")
+        + ("last_signal_delivered_at, " if has_sig else "NULL AS last_signal_delivered_at, ")
+        + ("mode " if has_mode else "NULL AS mode ")
         + "FROM subscribers "
           "WHERE is_active=1 AND payment_status='APPROVED' "
           "AND email IS NOT NULL AND api_key IS NOT NULL "
@@ -188,46 +200,70 @@ def _build_monitor_panel(window_sec: int = 300) -> str:
     rows = c.fetchall() or []
     conn.close()
 
-    online = 0
-    offline = 0
+    active_count = 0
+    online_count = 0
+    offline_count = 0
     lines = []
-    for cid, fn, ln, ps, te, bot_ts, eng_ts in rows:
+    for cid, fn, ln, ps, te, bot_ts, eng_ts, sig_ts, user_mode in rows:
         name = f"{fn or ''} {ln or ''}".strip() or "—"
         bot_dt = _parse_iso_ts(bot_ts)
         eng_dt = _parse_iso_ts(eng_ts)
-        last_dt = None
-        src = ""
-        if bot_dt and eng_dt:
-            last_dt = bot_dt if bot_dt >= eng_dt else eng_dt
-            src = "bot" if last_dt == bot_dt else "engine"
-        elif bot_dt:
-            last_dt = bot_dt
-            src = "bot"
-        elif eng_dt:
-            last_dt = eng_dt
-            src = "engine"
+        sig_dt = _parse_iso_ts(sig_ts)
 
-        is_on = False
+        all_dts = [d for d in (bot_dt, eng_dt, sig_dt) if d is not None]
+        last_dt = max(all_dts) if all_dts else None
+        src = "—"
         if last_dt:
-            age = (now - last_dt).total_seconds()
-            is_on = age <= float(window_sec)
-        if is_on:
-            online += 1
-            icon = "🟢"
-        else:
-            offline += 1
-            icon = "🔴"
+            if last_dt == sig_dt:
+                src = "signal"
+            elif last_dt == eng_dt:
+                src = "engine"
+            else:
+                src = "bot"
 
-        last_s = last_dt.isoformat() if last_dt else "—"
-        ps0 = ps or "NONE"
-        te0 = int(te or 0)
-        lines.append(
-            f"{icon} `{cid}` | {name} | {ps0} | trading={te0} | last={last_s} ({src or '—'})"
+        trading_on = int(te or 0) == 1
+        sig_age = (now - sig_dt).total_seconds() if sig_dt else None
+        any_age = (now - last_dt).total_seconds() if last_dt else None
+
+        is_active_trading = (
+            trading_on
+            and sig_age is not None
+            and sig_age <= float(signal_active_sec)
+        )
+        is_online = (
+            any_age is not None
+            and any_age <= float(window_sec)
         )
 
+        if is_active_trading:
+            active_count += 1
+            icon = "🟢"
+            tag = "Active (Trading)"
+        elif is_online:
+            online_count += 1
+            icon = "🟢"
+            tag = "Online"
+        else:
+            offline_count += 1
+            icon = "🔴"
+            tag = "Offline"
+
+        mode_tag = ""
+        um = str(user_mode or "AUTO").strip().upper()
+        if trading_on:
+            mode_tag = " [Auto-Trading On]" if um == "AUTO" else " [Hybrid On]"
+
+        last_s = last_dt.strftime("%H:%M UTC") if last_dt else "—"
+        lines.append(
+            f"{icon} `{cid}` | {name}{mode_tag} | {tag} | last={last_s} ({src})"
+        )
+
+    total_online = active_count + online_count
     return (
         "*Admin Live Monitor*\n\n"
-        f"Total: *{len(rows)}* | Online (<={int(window_sec/60)}m): *{online}* | Offline: *{offline}*\n\n"
+        f"Total: *{len(rows)}* | "
+        f"Active: *{active_count}* | Online (<={int(window_sec // 60)}m): *{total_online}* | "
+        f"Offline: *{offline_count}*\n\n"
         + ("\n".join(lines) if lines else "_No subscribers._")
     )
 
