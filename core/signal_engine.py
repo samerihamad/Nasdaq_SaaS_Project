@@ -121,6 +121,11 @@ def _analyze_ticker(symbol: str) -> dict | None:
     try:
         sig = analyze_momentum(symbol, timeframes)
         if sig and sig.get("rejected"):
+            log.info(
+                "[%s] REJECTED | strategy=Momentum | Reason: %s",
+                symbol,
+                str(sig.get("reason", "Rejected by market structure filter")),
+            )
             structural_rejections.append({
                 "symbol": symbol,
                 "strategy": sig.get("strategy", "Momentum"),
@@ -355,6 +360,10 @@ def _analyze_one_from_timeframes(symbol: str, timeframes: dict, min_confidence: 
         except Exception:
             pass
         if mo and mo.get("rejected"):
+            print(
+                f"[{symbol}] REJECTED | strategy=Momentum | Reason: "
+                f"{str(mo.get('reason', 'Rejected by market structure filter'))}"
+            )
             candidates.append((
                 "__REJECTED__",
                 -1.0,

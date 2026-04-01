@@ -277,6 +277,7 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
     dict  with keys: action, confidence, score, strategy, stop_loss_pct, reason
     None  if no valid signal found
     """
+    logging.info(f"Checking Momentum for {symbol}")
     df_1d  = _flatten(timeframes.get("1d",  pd.DataFrame()))
     df_4h  = _flatten(timeframes.get("4h",  pd.DataFrame()))
     df_15m = _flatten(timeframes.get("15m", pd.DataFrame()))
