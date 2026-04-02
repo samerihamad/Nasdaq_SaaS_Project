@@ -291,6 +291,8 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
     close_15m = df_15m["Close"].squeeze().astype(float)
     rsi_15m_series = _rsi(close_15m)
     rsi_15m_val = float(rsi_15m_series.iloc[-1])
+    # Mirror of bullish high-RSI volume tier: very low RSI → relaxed vol floor on SELL.
+    bearish_rsi_vol_line = 100.0 - float(FAST_MOM_RSI_VOL_TIER_HIGH)
 
     # ── ADX ───────────────────────────────────────────────────────────────────
     adx_series, plus_di, minus_di = _adx(df_15m)
@@ -310,6 +312,10 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
     else:
         direction = "SELL"
 
+    gap_now = _gap_pct(df_15m)
+    # Downward gap / open pressure: allow slightly higher RSI on shorts (still bearish tape).
+    sell_rsi_ceiling = 55.0 if gap_now <= -float(MOM_GAP_PCT) else 50.0
+
     # ── 15m RSI band (FAST tier in-engine; GOLDEN re-validated in dispatch_signal) ─
     if direction == "BUY":
         if not (50.0 <= rsi_15m_val <= float(FAST_MOM_RSI_BUY_MAX)):
@@ -318,15 +324,16 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
                 f"50–{float(FAST_MOM_RSI_BUY_MAX):.0f}"
             )
             log.info("[Momentum %s] %s", symbol, rej)
-            return {"rejected": True, "strategy": "Momentum", "reason": rej}
+            return {"rejected": True, "strategy": "Momentum", "reason": rej, "action": direction}
     else:
-        if not (float(FAST_MOM_RSI_SELL_MIN) <= rsi_15m_val <= 50.0):
+        if not (float(FAST_MOM_RSI_SELL_MIN) <= rsi_15m_val <= sell_rsi_ceiling):
             rej = (
                 f"Rejected: 15m RSI {rsi_15m_val:.1f} outside FAST sell band "
-                f"{float(FAST_MOM_RSI_SELL_MIN):.0f}–50"
+                f"{float(FAST_MOM_RSI_SELL_MIN):.0f}–{sell_rsi_ceiling:.0f}"
+                + (f" (gap-down relax)" if sell_rsi_ceiling > 50.0 else "")
             )
             log.info("[Momentum %s] %s", symbol, rej)
-            return {"rejected": True, "strategy": "Momentum", "reason": rej}
+            return {"rejected": True, "strategy": "Momentum", "reason": rej, "action": direction}
 
     close_val = float(close_15m.iloc[-1])
 
@@ -338,11 +345,11 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
     if direction == "BUY" and close_val <= sma20_v:
         rej = f"Rejected: Price not above SMA20 ({close_val:.2f} <= {sma20_v:.2f})"
         log.info("[Momentum %s] %s", symbol, rej)
-        return {"rejected": True, "strategy": "Momentum", "reason": rej}
+        return {"rejected": True, "strategy": "Momentum", "reason": rej, "action": direction}
     if direction == "SELL" and close_val >= sma20_v:
         rej = f"Rejected: Price not below SMA20 ({close_val:.2f} >= {sma20_v:.2f})"
         log.info("[Momentum %s] %s", symbol, rej)
-        return {"rejected": True, "strategy": "Momentum", "reason": rej}
+        return {"rejected": True, "strategy": "Momentum", "reason": rej, "action": direction}
     if direction == "BUY" and close_val > sma20_v and close_val <= sma50_v:
         log.info("[FAST OPTIMIZATION] Trade triggered by Momentum SMA20-only Filter | %s", symbol)
 
@@ -369,30 +376,58 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
     # ── MACD crossover ────────────────────────────────────────────────────────
     macd_line, signal_line = _macd(close_15m)
     has_macd_confirm = _macd_crossover(macd_line, signal_line, direction)
-    macd_bypass_rsi = direction == "BUY" and rsi_15m_val > float(FAST_MOM_RSI_VOL_TIER_HIGH)
+    macd_bypass_rsi = (
+        direction == "BUY" and rsi_15m_val > float(FAST_MOM_RSI_VOL_TIER_HIGH)
+    ) or (
+        direction == "SELL" and rsi_15m_val < bearish_rsi_vol_line
+    )
     mom_macd_bypassed = False
     if MOM_MACD_CONFIRM and not has_macd_confirm:
         mom_macd_bypassed = True
         if macd_bypass_rsi:
-            log.info("[Momentum %s] MACD bypass (RSI %.1f > %.1f)", symbol, rsi_15m_val, float(FAST_MOM_RSI_VOL_TIER_HIGH))
+            if direction == "BUY":
+                log.info(
+                    "[Momentum %s] MACD bypass (RSI %.1f > %.1f)",
+                    symbol,
+                    rsi_15m_val,
+                    float(FAST_MOM_RSI_VOL_TIER_HIGH),
+                )
+            else:
+                log.info(
+                    "[Momentum %s] MACD bypass (RSI %.1f < %.1f bearish tier)",
+                    symbol,
+                    rsi_15m_val,
+                    bearish_rsi_vol_line,
+                )
             log.info("[FAST OPTIMIZATION] Trade triggered by Momentum RSI MACD Bypass | %s", symbol)
         else:
             # Allowed here; final pass depends on AI probability gate in dispatch.
             log.info("[Momentum %s] MACD missing; pending FAST AI bypass gate", symbol)
 
-    # ── Volume vs MA20 (FAST tiered: high RSI >70 → 0.8x min; else 1.0x on BUY; SELL → 1.0x) ─
+    # ── Volume vs MA20 (FAST tiered: high RSI >70 buy / very low RSI sell → relaxed floor; else FAST_MOM_VOL_RATIO) ─
     vol_ratio = _volume_ratio(df_15m)
     if direction == "SELL":
-        vol_min = float(FAST_MOM_VOL_RATIO)
+        if rsi_15m_val <= bearish_rsi_vol_line:
+            vol_min = float(FAST_MOM_VOL_RATIO_HIGH_RSI)
+        else:
+            vol_min = float(FAST_MOM_VOL_RATIO)
     elif rsi_15m_val > float(FAST_MOM_RSI_VOL_TIER_HIGH):
         vol_min = float(FAST_MOM_VOL_RATIO_HIGH_RSI)
     else:
         vol_min = float(FAST_MOM_VOL_RATIO)
     mom_low_vol_entry = (
-        direction == "BUY"
-        and rsi_15m_val > float(FAST_MOM_RSI_VOL_TIER_HIGH)
-        and vol_ratio >= vol_min
-        and vol_ratio < float(FAST_MOM_VOL_RATIO)
+        (
+            direction == "BUY"
+            and rsi_15m_val > float(FAST_MOM_RSI_VOL_TIER_HIGH)
+            and vol_ratio >= vol_min
+            and vol_ratio < float(FAST_MOM_VOL_RATIO)
+        )
+        or (
+            direction == "SELL"
+            and rsi_15m_val < bearish_rsi_vol_line
+            and vol_ratio >= vol_min
+            and vol_ratio < float(FAST_MOM_VOL_RATIO)
+        )
     )
     if mom_low_vol_entry:
         log.info(
@@ -404,7 +439,7 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
     if vol_ratio < vol_min:
         rej = f"Rejected: Low Volume ({vol_ratio:.1f}x < {vol_min:.1f}x)"
         log.info("[Momentum %s] %s", symbol, rej)
-        return {"rejected": True, "strategy": "Momentum", "reason": rej}
+        return {"rejected": True, "strategy": "Momentum", "reason": rej, "action": direction}
 
     # ── Composite scoring ─────────────────────────────────────────────────────
     score   = 0
@@ -437,7 +472,7 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
         reasons.append("1D_trend (+15)")
 
     # 5. Gap confirmation (10 pts)
-    gap = _gap_pct(df_15m)
+    gap = gap_now
     gap_confirms = (direction == "BUY" and gap >= MOM_GAP_PCT) or \
                    (direction == "SELL" and gap <= -MOM_GAP_PCT)
     if gap_confirms:
@@ -491,7 +526,7 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
     if score < active_min_score:
         rej = f"Rejected: Low Confidence (Score {int(score)} < {int(active_min_score)})"
         log.info("[Momentum %s] %s", symbol, rej)
-        return {"rejected": True, "strategy": "Momentum", "reason": rej}
+        return {"rejected": True, "strategy": "Momentum", "reason": rej, "action": direction}
 
     # Map score (60–100) to confidence (65–95 %)
     confidence = round(65.0 + (score - active_min_score) / max(1, (100 - active_min_score)) * 30.0, 1)

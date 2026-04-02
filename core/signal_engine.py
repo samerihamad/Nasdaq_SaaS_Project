@@ -57,7 +57,8 @@ _DYNAMIC_CHOPPY_THRESHOLD = 62.0
 def _dynamic_confidence_threshold(timeframes: dict, _symbol: str) -> float:
     """
     Per-symbol minimum confidence: FAST_MIN_CONFIDENCE baseline, 52% if strong trend
-    (ADX > 25 and RSI > 70), 62% if choppy (ADX < 15).
+    (bullish: ADX > 25 and RSI > 70; bearish: ADX > 25 and RSI < 30), 62% if choppy (ADX < 15).
+    Applies to both Long (BUY) and Short (SELL) — threshold is on confidence %, not direction.
     """
     base = float(FAST_MIN_CONFIDENCE)
     df_15m = timeframes.get("15m")
@@ -84,11 +85,29 @@ def _dynamic_confidence_threshold(timeframes: dict, _symbol: str) -> float:
     if adx_val > 25 and rsi_val > 70:
         thr = _DYNAMIC_TREND_THRESHOLD
         log.info(
-            "[DYNAMIC] Adjusted threshold to %.1f%% due to Trend conditions.",
+            "[DYNAMIC] Adjusted threshold to %.1f%% due to Trend (bullish) conditions.",
+            thr,
+        )
+        return thr
+    if adx_val > 25 and rsi_val < 30:
+        thr = _DYNAMIC_TREND_THRESHOLD
+        log.info(
+            "[DYNAMIC] Adjusted threshold to %.1f%% due to Trend (bearish) conditions.",
             thr,
         )
         return thr
     return base
+
+
+def _side_label(action: str | None) -> str:
+    if not action:
+        return "Unknown"
+    a = str(action).upper().strip()
+    if a == "BUY":
+        return "Long"
+    if a == "SELL":
+        return "Short"
+    return a
 
 
 # ── Subscriber helpers ────────────────────────────────────────────────────────
@@ -156,6 +175,7 @@ def _analyze_ticker(symbol: str) -> dict | None:
                 "strategy": sig.get("strategy", "MeanRev"),
                 "reason": sig.get("reason", "Rejected by market structure filter"),
                 "rejected": True,
+                "action": sig.get("action"),
             })
         elif sig:
             signals.append(sig)
@@ -166,9 +186,11 @@ def _analyze_ticker(symbol: str) -> dict | None:
     try:
         sig = analyze_momentum(symbol, timeframes)
         if sig and sig.get("rejected"):
+            _sl = _side_label(sig.get("action"))
             log.info(
-                "[%s] REJECTED | strategy=Momentum | Reason: %s",
+                "[%s] REJECTED | Side: %s | strategy=Momentum | Reason: %s",
                 symbol,
+                _sl,
                 str(sig.get("reason", "Rejected by market structure filter")),
             )
             structural_rejections.append({
@@ -176,6 +198,7 @@ def _analyze_ticker(symbol: str) -> dict | None:
                 "strategy": sig.get("strategy", "Momentum"),
                 "reason": sig.get("reason", "Rejected by market structure filter"),
                 "rejected": True,
+                "action": sig.get("action"),
             })
         elif sig:
             signals.append(sig)
@@ -185,9 +208,10 @@ def _analyze_ticker(symbol: str) -> dict | None:
     if not signals:
         if structural_rejections:
             for rej in structural_rejections:
+                _sl = _side_label(rej.get("action"))
                 log.info(
-                    "[%s] REJECTED | strategy=%s | Reason: %s",
-                    symbol, rej.get("strategy", "Unknown"), rej.get("reason", "Rejected"),
+                    "[%s] REJECTED | Side: %s | strategy=%s | Reason: %s",
+                    symbol, _sl, rej.get("strategy", "Unknown"), rej.get("reason", "Rejected"),
                 )
             # Keep structural rejections as internal logs only in this path.
             return None
@@ -198,8 +222,13 @@ def _analyze_ticker(symbol: str) -> dict | None:
 
     if best["confidence"] < eff_min_conf:
         log.debug(
-            "[%s] Best signal confidence %.1f%% below dynamic threshold %.1f%% — discarded",
-            symbol, best["confidence"], eff_min_conf,
+            "[%s] REJECTED | Side: %s | Reason: Below dynamic threshold "
+            "(conf %.1f%% < %.1f%%) | strategy=%s",
+            symbol,
+            _side_label(best.get("action")),
+            best["confidence"],
+            eff_min_conf,
+            best.get("strategy", "?"),
         )
         return None
 
@@ -362,6 +391,11 @@ def _analyze_one_from_timeframes(
             pass
         if action and conf >= float(eff_min_conf):
             candidates.append((action, float(conf), "RF", str(reason), None, None, None, False, None, None, False, False))
+        elif action and conf < float(eff_min_conf):
+            print(
+                f"[{symbol}] REJECTED | Side: {_side_label(action)} | strategy=RF | "
+                f"Reason: Below dynamic threshold (conf {float(conf):.1f}% < {eff_min_conf:.1f}%)"
+            )
     except Exception:
         pass
 
@@ -373,7 +407,7 @@ def _analyze_one_from_timeframes(
             pass
         if mr and mr.get("rejected"):
             print(
-                f"[{symbol}] REJECTED | strategy=MeanRev | Reason: "
+                f"[{symbol}] REJECTED | Side: {_side_label(mr.get('action'))} | strategy=MeanRev | Reason: "
                 f"{str(mr.get('reason', 'Rejected by market structure filter'))}"
             )
             candidates.append((
@@ -390,6 +424,11 @@ def _analyze_one_from_timeframes(
                 False,
                 False,
             ))
+        elif mr and not mr.get("rejected") and float(mr.get("confidence", 0)) < float(eff_min_conf):
+            print(
+                f"[{symbol}] REJECTED | Side: {_side_label(mr.get('action'))} | strategy=MeanRev | "
+                f"Reason: Below dynamic threshold (conf {float(mr.get('confidence', 0)):.1f}% < {eff_min_conf:.1f}%)"
+            )
         elif mr and float(mr.get("confidence", 0)) >= float(eff_min_conf):
             rsi_v = mr.get("rsi_15m")
             candidates.append((
@@ -417,7 +456,7 @@ def _analyze_one_from_timeframes(
             pass
         if mo and mo.get("rejected"):
             print(
-                f"[{symbol}] REJECTED | strategy=Momentum | Reason: "
+                f"[{symbol}] REJECTED | Side: {_side_label(mo.get('action'))} | strategy=Momentum | Reason: "
                 f"{str(mo.get('reason', 'Rejected by market structure filter'))}"
             )
             candidates.append((
@@ -434,6 +473,11 @@ def _analyze_one_from_timeframes(
                 False,
                 False,
             ))
+        elif mo and not mo.get("rejected") and float(mo.get("confidence", 0)) < float(eff_min_conf):
+            print(
+                f"[{symbol}] REJECTED | Side: {_side_label(mo.get('action'))} | strategy=Momentum | "
+                f"Reason: Below dynamic threshold (conf {float(mo.get('confidence', 0)):.1f}% < {eff_min_conf:.1f}%)"
+            )
         elif mo and float(mo.get("confidence", 0)) >= float(eff_min_conf):
             mrsi = mo.get("mom_rsi_15m")
             mvr = mo.get("mom_vol_ratio")

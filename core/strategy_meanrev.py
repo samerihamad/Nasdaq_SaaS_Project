@@ -279,15 +279,21 @@ def analyze(symbol: str, timeframes: dict, *, signal_profile: str = "FAST") -> d
     close_val = float(close_15m.iloc[-1])
     vwap_val  = float(vwap_15m.iloc[-1])
 
+    tier = str(signal_profile or "FAST").strip().upper()
+    # FAST: shorts require clear overbought (default 75, env FAST_MR_RSI_EXTREME_OVERBOUGHT); LONG uses MR_RSI_OVERSOLD.
+    sell_rsi_floor = (
+        float(FAST_MR_RSI_EXTREME_OVERBOUGHT) if tier == "FAST" else float(MR_RSI_OVERBOUGHT)
+    )
+
     # ── Determine candidate direction from RSI ────────────────────────────────
     if rsi_val <= MR_RSI_OVERSOLD:
         direction = "BUY"
-    elif rsi_val >= MR_RSI_OVERBOUGHT:
+    elif rsi_val >= sell_rsi_floor:
         direction = "SELL"
     else:
         rej = (
             f"Rejected: RSI not extreme ({rsi_val:.1f} not <= {float(MR_RSI_OVERSOLD):.1f} "
-            f"or >= {float(MR_RSI_OVERBOUGHT):.1f})"
+            f"or >= {sell_rsi_floor:.1f})"
         )
         log.info("[MeanRev %s] %s", symbol, rej)
         return {"rejected": True, "strategy": "MeanRev", "reason": rej}
@@ -316,7 +322,7 @@ def analyze(symbol: str, timeframes: dict, *, signal_profile: str = "FAST") -> d
     if _news_trap(df_15m):
         rej = f"Rejected: News Trap (Gap >= {float(MR_NEWS_TRAP_GAP_PCT):.1f}%)"
         log.info("[MeanRev %s] %s", symbol, rej)
-        return {"rejected": True, "strategy": "MeanRev", "reason": rej}
+        return {"rejected": True, "strategy": "MeanRev", "reason": rej, "action": direction}
 
     # ── Reversal candle check (preferred but not mandatory) ──────────────────
     # A reversal candle OR a liquidity sweep is sufficient to proceed.
@@ -337,13 +343,12 @@ def analyze(symbol: str, timeframes: dict, *, signal_profile: str = "FAST") -> d
 
     has_sweep = _liquidity_sweep(df_15m, direction)
 
-    tier = str(signal_profile or "FAST").strip().upper()
     mr_fast_bypass: bool = False
     if tier == "GOLDEN":
         if not has_reversal_candle and not has_sweep:
             rej = "Rejected: No Reversal Candle/Sweep Confirmation"
             log.info("[MeanRev %s] %s", symbol, rej)
-            return {"rejected": True, "strategy": "MeanRev", "reason": rej}
+            return {"rejected": True, "strategy": "MeanRev", "reason": rej, "action": direction}
     else:
         # FAST: deep RSI extreme may proceed without reversal candle or sweep; otherwise require confirmation.
         extreme_buy = direction == "BUY" and rsi_val <= float(FAST_MR_RSI_EXTREME_OVERSOLD)
@@ -361,14 +366,14 @@ def analyze(symbol: str, timeframes: dict, *, signal_profile: str = "FAST") -> d
         elif not has_reversal_candle and not has_sweep:
             rej = "Rejected: No Reversal Candle/Sweep Confirmation"
             log.info("[MeanRev %s] %s", symbol, rej)
-            return {"rejected": True, "strategy": "MeanRev", "reason": rej}
+            return {"rejected": True, "strategy": "MeanRev", "reason": rej, "action": direction}
 
     # ── Composite scoring ─────────────────────────────────────────────────────
     score = 0
     reasons = []
 
     # 1. RSI extreme (25 pts)
-    rsi_dist = (MR_RSI_OVERSOLD - rsi_val) if direction == "BUY" else (rsi_val - MR_RSI_OVERBOUGHT)
+    rsi_dist = (MR_RSI_OVERSOLD - rsi_val) if direction == "BUY" else (rsi_val - sell_rsi_floor)
     rsi_pts  = min(25, int(25 * rsi_dist / 15))   # full 25 pts at 15-unit extreme
     score += rsi_pts
     reasons.append(f"RSI={rsi_val:.1f} (+{rsi_pts})")
@@ -444,7 +449,7 @@ def analyze(symbol: str, timeframes: dict, *, signal_profile: str = "FAST") -> d
     if score < active_min_score:
         rej = f"Rejected: Low Confidence (Score {int(score)} < {int(active_min_score)})"
         log.info("[MeanRev %s] %s", symbol, rej)
-        return {"rejected": True, "strategy": "MeanRev", "reason": rej}
+        return {"rejected": True, "strategy": "MeanRev", "reason": rej, "action": direction}
 
     # Map score (55–100) to confidence (65–95 %)
     confidence = round(65.0 + (score - active_min_score) / max(1, (100 - active_min_score)) * 30.0, 1)
