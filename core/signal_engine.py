@@ -101,7 +101,7 @@ def _dynamic_confidence_threshold(timeframes: dict, _symbol: str) -> float:
 
 def _side_label(action: str | None) -> str:
     if not action:
-        return "Unknown"
+        return "Neutral"
     a = str(action).upper().strip()
     if a == "BUY":
         return "Long"
@@ -168,7 +168,7 @@ def _analyze_ticker(symbol: str) -> dict | None:
 
     # Mean Reversion
     try:
-        sig = analyze_meanrev(symbol, timeframes)
+        sig = analyze_meanrev(symbol, timeframes, min_confidence_floor=eff_min_conf)
         if sig and sig.get("rejected"):
             structural_rejections.append({
                 "symbol": symbol,
@@ -184,7 +184,7 @@ def _analyze_ticker(symbol: str) -> dict | None:
 
     # Momentum
     try:
-        sig = analyze_momentum(symbol, timeframes)
+        sig = analyze_momentum(symbol, timeframes, min_confidence_floor=eff_min_conf)
         if sig and sig.get("rejected"):
             _sl = _side_label(sig.get("action"))
             log.info(
@@ -400,7 +400,7 @@ def _analyze_one_from_timeframes(
         pass
 
     try:
-        mr = analyze_meanrev(symbol, timeframes)
+        mr = analyze_meanrev(symbol, timeframes, min_confidence_floor=eff_min_conf)
         try:
             raw_confs.append(float((mr or {}).get("confidence", 0)))
         except Exception:
@@ -449,7 +449,7 @@ def _analyze_one_from_timeframes(
         pass
 
     try:
-        mo = analyze_momentum(symbol, timeframes)
+        mo = analyze_momentum(symbol, timeframes, min_confidence_floor=eff_min_conf)
         try:
             raw_confs.append(float((mo or {}).get("confidence", 0)))
         except Exception:

@@ -32,7 +32,7 @@ from config import (
     MR_VWAP_DEV_PCT,
     MR_NEWS_TRAP_GAP_PCT,
     MR_SWEEP_LOOKBACK,
-    MR_MIN_SCORE,
+    FAST_MR_MIN_SCORE,
     SIGNAL_MR_MIN_SCORE,
     ENABLE_MARKET_STRUCTURE_FILTERS,
     ENABLE_PREMIUM_DISCOUNT_FILTER,
@@ -53,6 +53,9 @@ from core.market_structure import (
 )
 
 log = logging.getLogger(__name__)
+
+# Daily RSI alignment for MeanRev BUY (not a % confidence gate).
+MR_1D_RSI_BUY_ALIGN_MAX = 68.0
 
 
 # ── Indicator helpers ─────────────────────────────────────────────────────────
@@ -209,7 +212,7 @@ def _liquidity_sweep(df_15m: pd.DataFrame, direction: str) -> bool:
 def _check_1d_alignment(df_1d: pd.DataFrame, direction: str) -> bool:
     """
     1D alignment check — daily RSI must not be sharply contrary to our direction.
-    BUY : daily RSI <= 68 (allows oversold and mid-range; rejects only overbought)
+    BUY : daily RSI <= MR_1D_RSI_BUY_ALIGN_MAX (allows oversold and mid-range; rejects only overbought)
     SELL: daily RSI >= 32 (allows overbought and mid-range; rejects only oversold)
     """
     if df_1d is None or df_1d.empty:
@@ -220,7 +223,7 @@ def _check_1d_alignment(df_1d: pd.DataFrame, direction: str) -> bool:
 
     if direction == "BUY":
         # Allow oversold (RSI < 35) — those are prime mean-reversion candidates
-        return val <= 68
+        return val <= MR_1D_RSI_BUY_ALIGN_MAX
     else:
         # Allow overbought (RSI > 65) — those are prime short candidates
         return val >= 32
@@ -249,7 +252,13 @@ def _check_4h_zone(df_4h: pd.DataFrame, direction: str) -> bool:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def analyze(symbol: str, timeframes: dict, *, signal_profile: str = "FAST") -> dict | None:
+def analyze(
+    symbol: str,
+    timeframes: dict,
+    *,
+    signal_profile: str = "FAST",
+    min_confidence_floor: float | None = None,
+) -> dict | None:
     """
     Run the full Mean Reversion analysis.
 
@@ -291,12 +300,14 @@ def analyze(symbol: str, timeframes: dict, *, signal_profile: str = "FAST") -> d
     elif rsi_val >= sell_rsi_floor:
         direction = "SELL"
     else:
+        _mid = (float(MR_RSI_OVERSOLD) + float(sell_rsi_floor)) / 2.0
+        _dir_log = "BUY" if rsi_val < _mid else "SELL"
         rej = (
             f"Rejected: RSI not extreme ({rsi_val:.1f} not <= {float(MR_RSI_OVERSOLD):.1f} "
             f"or >= {sell_rsi_floor:.1f})"
         )
         log.info("[MeanRev %s] %s", symbol, rej)
-        return {"rejected": True, "strategy": "MeanRev", "reason": rej}
+        return {"rejected": True, "strategy": "MeanRev", "reason": rej, "action": _dir_log}
 
     # ── Market structure policy v2 (soft-scoring, no structural hard reject) ─
     htf = None
@@ -445,7 +456,7 @@ def analyze(symbol: str, timeframes: dict, *, signal_profile: str = "FAST") -> d
         symbol, direction, score, " | ".join(reasons),
     )
 
-    active_min_score = int(SIGNAL_MR_MIN_SCORE or MR_MIN_SCORE)
+    active_min_score = int(SIGNAL_MR_MIN_SCORE if SIGNAL_MR_MIN_SCORE is not None else FAST_MR_MIN_SCORE)
     if score < active_min_score:
         rej = f"Rejected: Low Confidence (Score {int(score)} < {int(active_min_score)})"
         log.info("[MeanRev %s] %s", symbol, rej)
@@ -454,6 +465,14 @@ def analyze(symbol: str, timeframes: dict, *, signal_profile: str = "FAST") -> d
     # Map score (55–100) to confidence (65–95 %)
     confidence = round(65.0 + (score - active_min_score) / max(1, (100 - active_min_score)) * 30.0, 1)
     confidence = min(95.0, confidence)
+
+    if min_confidence_floor is not None and float(confidence) < float(min_confidence_floor):
+        rej = (
+            f"Rejected: Mapped confidence {float(confidence):.1f}% below dynamic floor "
+            f"{float(min_confidence_floor):.1f}%"
+        )
+        log.info("[MeanRev %s] %s", symbol, rej)
+        return {"rejected": True, "strategy": "MeanRev", "reason": rej, "action": direction}
 
     # ATR-based stop distance as a % of entry price (used by calculate_position_size)
     # We target 1× ATR from entry; the executor will refine with the live ATR.

@@ -31,15 +31,13 @@ import numpy as np
 import pandas as pd
 
 from config import (
-    MOM_ADX_THRESHOLD,
     MOM_ADX_STRONG,
     MOM_VOL_RATIO,
     MOM_GAP_PCT,
     MOM_MACD_CONFIRM,
-    MOM_MIN_SCORE,
     SIGNAL_MOM_MIN_SCORE,
     MIN_15M_BARS,
-    FAST_MOM_ADX_THRESHOLD,
+    FAST_MOM_MIN_SCORE,
     FAST_MOM_VOL_RATIO,
     FAST_MOM_VOL_RATIO_HIGH_RSI,
     FAST_MOM_RSI_VOL_TIER_HIGH,
@@ -65,6 +63,10 @@ from core.market_structure import (
 )
 
 log = logging.getLogger(__name__)
+
+# FAST tier floors (ops): relaxed ADX; minimum volume vs MA20 for long/short.
+_FAST_MOM_ADX_MIN = 15.0
+_FAST_MOM_VOL_RATIO_FLOOR = 0.7
 
 
 # ── Indicator helpers ─────────────────────────────────────────────────────────
@@ -264,7 +266,12 @@ def _news_quality_score(symbol: str, direction: str) -> int:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def analyze(symbol: str, timeframes: dict) -> dict | None:
+def analyze(
+    symbol: str,
+    timeframes: dict,
+    *,
+    min_confidence_floor: float | None = None,
+) -> dict | None:
     """
     Run the full Momentum analysis.
 
@@ -300,17 +307,17 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
     plus_di_val  = float(plus_di.iloc[-1])
     minus_di_val = float(minus_di.iloc[-1])
 
-    active_adx_min = float(FAST_MOM_ADX_THRESHOLD or MOM_ADX_THRESHOLD)
-    if adx_val < active_adx_min:
-        rej = f"Rejected: Weak Trend (ADX {adx_val:.1f} < {float(active_adx_min):.1f})"
-        log.info("[Momentum %s] %s", symbol, rej)
-        return {"rejected": True, "strategy": "Momentum", "reason": rej}
-
-    # Determine direction from DI lines
+    # Direction first so every rejection can log Long/Short consistently.
     if plus_di_val > minus_di_val:
         direction = "BUY"
     else:
         direction = "SELL"
+
+    active_adx_min = float(_FAST_MOM_ADX_MIN)
+    if adx_val < active_adx_min:
+        rej = f"Rejected: Weak Trend (ADX {adx_val:.1f} < {float(active_adx_min):.1f})"
+        log.info("[Momentum %s] %s", symbol, rej)
+        return {"rejected": True, "strategy": "Momentum", "reason": rej, "action": direction}
 
     gap_now = _gap_pct(df_15m)
     # Downward gap / open pressure: allow slightly higher RSI on shorts (still bearish tape).
@@ -404,17 +411,17 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
             # Allowed here; final pass depends on AI probability gate in dispatch.
             log.info("[Momentum %s] MACD missing; pending FAST AI bypass gate", symbol)
 
-    # ── Volume vs MA20 (FAST tiered: high RSI >70 buy / very low RSI sell → relaxed floor; else FAST_MOM_VOL_RATIO) ─
+    # ── Volume vs MA20 (FAST tiered + global floor _FAST_MOM_VOL_RATIO_FLOOR for long/short) ─
     vol_ratio = _volume_ratio(df_15m)
     if direction == "SELL":
         if rsi_15m_val <= bearish_rsi_vol_line:
-            vol_min = float(FAST_MOM_VOL_RATIO_HIGH_RSI)
+            vol_min = max(_FAST_MOM_VOL_RATIO_FLOOR, float(FAST_MOM_VOL_RATIO_HIGH_RSI))
         else:
-            vol_min = float(FAST_MOM_VOL_RATIO)
+            vol_min = max(_FAST_MOM_VOL_RATIO_FLOOR, float(FAST_MOM_VOL_RATIO))
     elif rsi_15m_val > float(FAST_MOM_RSI_VOL_TIER_HIGH):
-        vol_min = float(FAST_MOM_VOL_RATIO_HIGH_RSI)
+        vol_min = max(_FAST_MOM_VOL_RATIO_FLOOR, float(FAST_MOM_VOL_RATIO_HIGH_RSI))
     else:
-        vol_min = float(FAST_MOM_VOL_RATIO)
+        vol_min = max(_FAST_MOM_VOL_RATIO_FLOOR, float(FAST_MOM_VOL_RATIO))
     mom_low_vol_entry = (
         (
             direction == "BUY"
@@ -522,7 +529,7 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
         symbol, direction, score, " | ".join(reasons),
     )
 
-    active_min_score = int(SIGNAL_MOM_MIN_SCORE or MOM_MIN_SCORE)
+    active_min_score = int(SIGNAL_MOM_MIN_SCORE if SIGNAL_MOM_MIN_SCORE is not None else FAST_MOM_MIN_SCORE)
     if score < active_min_score:
         rej = f"Rejected: Low Confidence (Score {int(score)} < {int(active_min_score)})"
         log.info("[Momentum %s] %s", symbol, rej)
@@ -531,6 +538,14 @@ def analyze(symbol: str, timeframes: dict) -> dict | None:
     # Map score (60–100) to confidence (65–95 %)
     confidence = round(65.0 + (score - active_min_score) / max(1, (100 - active_min_score)) * 30.0, 1)
     confidence = min(95.0, confidence)
+
+    if min_confidence_floor is not None and float(confidence) < float(min_confidence_floor):
+        rej = (
+            f"Rejected: Mapped confidence {float(confidence):.1f}% below dynamic floor "
+            f"{float(min_confidence_floor):.1f}%"
+        )
+        log.info("[Momentum %s] %s", symbol, rej)
+        return {"rejected": True, "strategy": "Momentum", "reason": rej, "action": direction}
 
     # Estimate stop distance from recent ATR proxy (15m range)
     avg_range   = float((df_15m["High"] - df_15m["Low"]).tail(14).mean())
