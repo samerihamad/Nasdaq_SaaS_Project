@@ -43,6 +43,8 @@ from utils.market_hours import (
     UAE,
     synchronized_utc_now,
     sync_utc_with_ntp,
+    next_utc_occurrence,
+    seconds_until_utc,
 )
 from utils.daily_report import send_daily_reports
 from core.executor import place_trade_for_user, monitor_and_close, process_pending_limit_orders
@@ -147,6 +149,18 @@ _last_structural_rejection_sent_at: dict[str, float] = {}
 _last_structural_suppression_notice_at: float = 0.0
 _autotrain_manager: Optional[AutonomousTrainingManager] = None
 _market_open_last_alert_date: str | None = None
+
+# ── Triple-timezone scheduler (UAE/Finland/NY) — fixed UTC deadlines ───────────
+# Priority Alpha: 13:00 UTC (17:00 Dubai) pre-market alert
+# Daily scan start: 12:40 UTC (16:40 Dubai)
+# Zero hour: 13:30:01 UTC (17:30:01 Dubai)
+_TRIPLE_TZ_SCHED_ENABLED = True
+_scan_lock = threading.Lock()
+_scan_in_progress = False
+_scan_cached_watchlist_count = 0
+_scan_cached_utc = ""
+_zero_hour_event = threading.Event()
+_triple_tz_threads_started = False
 
 # File paths
 _market_open_state_file = os.path.join(LOG_ROOT, "market_open_state.json")
@@ -791,6 +805,25 @@ def run_daily_scan():
     return watchlist
 
 
+def _run_daily_scan_cached() -> list[str]:
+    """
+    Wrapper around run_daily_scan() that maintains a cache for the 13:00 UTC alert.
+    Never raises; scan happens in a dedicated background thread.
+    """
+    global _scan_in_progress, _scan_cached_watchlist_count, _scan_cached_utc
+    with _scan_lock:
+        _scan_in_progress = True
+    try:
+        wl = run_daily_scan() or []
+        with _scan_lock:
+            _scan_cached_watchlist_count = int(len(wl))
+            _scan_cached_utc = synchronized_utc_now().strftime("%Y-%m-%d %H:%M:%S UTC")
+        return wl
+    finally:
+        with _scan_lock:
+            _scan_in_progress = False
+
+
 def pretrain_models(watchlist):
     global _autotrain_manager
     print(f"\n🤖 تجهيز نماذج RF لـ {len(watchlist)} سهم...")
@@ -813,7 +846,7 @@ def pretrain_models(watchlist):
 
 # ── Pre-market alert ──────────────────────────────────────────────────────────
 
-def send_premarket_alert(watchlist_count: int):
+def send_premarket_alert(watchlist_count: int, *, extra_note: str | None = None):
     """Broadcast pre-market alert to all active subscribers (per-user language)."""
     global _premarket_sent
     from core.watcher import get_all_active_subscribers
@@ -831,6 +864,8 @@ def send_premarket_alert(watchlist_count: int):
             watchlist_count=watchlist_count,
             mode=mode_label,
         )
+        if extra_note:
+            msg = f"{msg}\n{str(extra_note)}"
         try:
             send_telegram_message(chat_id, msg)
         except Exception:
@@ -838,6 +873,91 @@ def send_premarket_alert(watchlist_count: int):
 
     _premarket_sent = utc_today()
     print("Pre-market alert sent to all subscribers (localized).")
+
+
+def _alpha_alert_thread() -> None:
+    """
+    Priority Alpha: MUST fire exactly at 13:00 UTC (17:00 Dubai).
+    Runs independently from daily scan and the main engine loop.
+    """
+    global _premarket_sent
+    while True:
+        try:
+            target = next_utc_occurrence(hour=13, minute=0, second=0)
+            time.sleep(seconds_until_utc(target))
+
+            today = utc_today()
+            if _premarket_sent == today:
+                # already sent today (fallback path / manual send)
+                time.sleep(1.0)
+                continue
+
+            with _scan_lock:
+                in_prog = bool(_scan_in_progress)
+                cached_n = int(_scan_cached_watchlist_count or 0)
+                cached_at = str(_scan_cached_utc or "").strip()
+                live_n = int(len(_watchlist or []))
+
+            if in_prog:
+                note = f"⏳ Scan in progress... (cached={cached_n} at {cached_at})" if cached_at else f"⏳ Scan in progress... (cached={cached_n})"
+                send_premarket_alert(int(cached_n or live_n), extra_note=note)
+            else:
+                send_premarket_alert(int(live_n or cached_n))
+        except Exception as exc:
+            print(f"[ALPHA ALERT] error: {exc!s}", flush=True)
+            time.sleep(2.0)
+
+
+def _daily_scan_thread() -> None:
+    """
+    Pre-market daily scan must start at 12:40 UTC (16:40 Dubai) and never block Alpha alert.
+    """
+    global _watchlist, _last_scan_date, _unsupported_all_day, _last_watchlist_refresh_at
+    while True:
+        try:
+            target = next_utc_occurrence(hour=12, minute=40, second=0)
+            time.sleep(seconds_until_utc(target))
+
+            today = utc_today()
+            if _last_scan_date == today:
+                time.sleep(1.0)
+                continue
+
+            wl = _run_daily_scan_cached()
+            _watchlist = wl
+            _last_scan_date = today
+            _unsupported_all_day.clear()
+            if _watchlist:
+                pretrain_models(_watchlist)
+            _last_watchlist_refresh_at = synchronized_utc_now()
+        except Exception as exc:
+            print(f"[DAILY SCAN THREAD] error: {exc!s}", flush=True)
+            time.sleep(2.0)
+
+
+def _zero_hour_thread() -> None:
+    """
+    Market Opening (Zero Hour): 13:30:01 UTC (17:30:01 Dubai).
+    Sets an event the main loop can use to start the high-frequency cycle at the exact second.
+    """
+    while True:
+        try:
+            target = next_utc_occurrence(hour=13, minute=30, second=1)
+            time.sleep(seconds_until_utc(target))
+            _zero_hour_event.set()
+            # keep it set for the rest of the day; reset next cycle
+            time.sleep(2.0)
+        except Exception as exc:
+            print(f"[ZERO HOUR] error: {exc!s}", flush=True)
+            time.sleep(2.0)
+
+
+def _start_triple_tz_scheduler_threads() -> None:
+    if not _TRIPLE_TZ_SCHED_ENABLED:
+        return
+    threading.Thread(target=_daily_scan_thread, daemon=True, name="daily_scan_1240utc").start()
+    threading.Thread(target=_alpha_alert_thread, daemon=True, name="alpha_alert_1300utc").start()
+    threading.Thread(target=_zero_hour_thread, daemon=True, name="zero_hour_133001utc").start()
 
 
 # ── Signal dispatch ───────────────────────────────────────────────────────────
@@ -1281,6 +1401,13 @@ def run_trading_bot():
 
     while True:
         try:
+            # Triple-timezone scheduler: do not block Alpha alert / daily scan / zero-hour.
+            # Threads are idempotent (daemon) and safe to call once per process.
+            if _TRIPLE_TZ_SCHED_ENABLED:
+                global _triple_tz_threads_started
+                if not _triple_tz_threads_started:
+                    _start_triple_tz_scheduler_threads()
+                    _triple_tz_threads_started = True
             now_utc       = synchronized_utc_now()
             today         = utc_today()
             market_status = get_market_status()
@@ -1328,7 +1455,7 @@ def run_trading_bot():
 
                 # Build watchlist before open (once daily) so pre-market alert
                 # has a real count and models are warm.
-                if (_last_scan_date != today
+                if (not _TRIPLE_TZ_SCHED_ENABLED) and (_last_scan_date != today
                         and 0 < mins <= PREMARKET_ALERT_WINDOW_MIN):
                     _watchlist = run_daily_scan()
                     _last_scan_date = today
@@ -1338,7 +1465,7 @@ def run_trading_bot():
 
                 # If scan failed earlier and we are still inside alert window,
                 # one lazy retry allows alert dispatch in PRE_MARKET as well.
-                if (_premarket_sent != today
+                if (not _TRIPLE_TZ_SCHED_ENABLED) and (_premarket_sent != today
                         and 0 < mins <= PREMARKET_ALERT_WINDOW_MIN
                         and not _watchlist
                         and _last_scan_date != today):
@@ -1350,7 +1477,7 @@ def run_trading_bot():
                 # DST-safe pre-market alert window.
                 # Ensure the alert is dispatched once even if Level3 produced
                 # an empty watchlist (we fill in run_daily_scan()).
-                if (_premarket_sent != today
+                if (not _TRIPLE_TZ_SCHED_ENABLED) and (_premarket_sent != today
                         and 0 < mins <= PREMARKET_ALERT_WINDOW_MIN
                         and (_watchlist or _last_scan_date == today)):
                     if not _watchlist:
@@ -1378,7 +1505,12 @@ def run_trading_bot():
                     print(f"[MARKET] Closed — opens in ~{mins} min")
 
                 run_watcher()   # monitors all users' open positions
-                time.sleep(300)
+                # Never sleep past fixed UTC deadlines (Alpha alert / scan / zero-hour).
+                if _TRIPLE_TZ_SCHED_ENABLED:
+                    # wake frequently; scheduler threads handle the deadlines, but this keeps state fresh
+                    time.sleep(5)
+                else:
+                    time.sleep(300)
                 continue
 
             # ── PRE_MARKET / AFTER_HOURS: monitor only, no new signals ────────
@@ -1389,6 +1521,11 @@ def run_trading_bot():
                 continue
 
             # ── Market is OPEN ────────────────────────────────────────────────
+            # Zero-hour gate (strict UTC): do not start high-frequency cycle before 13:30:01 UTC.
+            # This keeps the engine "primed" but ensures first scan/dispatch aligns with the deadline.
+            if _TRIPLE_TZ_SCHED_ENABLED and not _zero_hour_event.is_set():
+                time.sleep(0.2)
+                continue
 
             # Fallback: if pre-open scan did not run for any reason,
             # run once after open.

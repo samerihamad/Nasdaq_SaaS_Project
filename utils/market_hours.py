@@ -97,6 +97,41 @@ def synchronized_utc_now() -> datetime:
     return datetime.now(timezone.utc) + timedelta(seconds=float(_NTP_OFFSET_SECONDS))
 
 
+def next_utc_occurrence(
+    *,
+    hour: int,
+    minute: int,
+    second: int = 0,
+    now: datetime | None = None,
+) -> datetime:
+    """
+    Next occurrence of a fixed UTC wall-clock time (HH:MM:SS) as an aware UTC datetime.
+
+    This helper intentionally uses UTC only (no DST), for fixed UTC deadlines like:
+    - 13:00 UTC (17:00 Dubai)
+    - 12:40 UTC (16:40 Dubai)
+    - 13:30:01 UTC (17:30:01 Dubai)
+    """
+    base = now if now is not None else synchronized_utc_now()
+    if base.tzinfo is None:
+        base = base.replace(tzinfo=timezone.utc)
+    base = base.astimezone(timezone.utc)
+    target = base.replace(hour=int(hour), minute=int(minute), second=int(second), microsecond=0)
+    if target <= base:
+        target = target + timedelta(days=1)
+    return target
+
+
+def seconds_until_utc(dt_utc: datetime, *, now: datetime | None = None) -> float:
+    """Seconds until an aware UTC datetime (0 when passed)."""
+    base = now if now is not None else synchronized_utc_now()
+    if base.tzinfo is None:
+        base = base.replace(tzinfo=timezone.utc)
+    base = base.astimezone(timezone.utc)
+    t = dt_utc.astimezone(timezone.utc)
+    return max(0.0, (t - base).total_seconds())
+
+
 def sync_utc_with_ntp(
     ntp_servers: list[str] | None = None,
     timeout_sec: float = 2.5,
