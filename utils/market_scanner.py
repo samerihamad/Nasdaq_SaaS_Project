@@ -39,6 +39,9 @@ BULK_HTTP_REQUEST_TIMEOUT_SEC = float(os.getenv("BULK_HTTP_REQUEST_TIMEOUT_SEC",
 BULK_CAPITAL_CLIENT_TIMEOUT = aiohttp.ClientTimeout(total=BULK_HTTP_REQUEST_TIMEOUT_SEC)
 # Upper bound for one Level-2 gap check (fetch + parse), slightly above HTTP timeout.
 BULK_GAP_ONE_TIMEOUT_SEC = float(os.getenv("BULK_GAP_ONE_TIMEOUT_SEC", "8.0"))
+# Level 2/3: parallel batch size + pause between batches (anti-429).
+BULK_PARALLEL_BATCH_SIZE = max(1, int(os.getenv("BULK_PARALLEL_BATCH_SIZE", "5")))
+BULK_BATCH_GAP_SLEEP_SEC = float(os.getenv("BULK_BATCH_GAP_SLEEP_SEC", "0.5"))
 
 _SESSION_CACHE: dict[str, dict] = {}
 _EPIC_CACHE: dict[str, str] = {}

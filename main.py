@@ -161,6 +161,8 @@ _scan_cached_watchlist_count = 0
 _scan_cached_utc = ""
 _zero_hour_event = threading.Event()
 _triple_tz_threads_started = False
+# Background hourly watchlist refresh (does not block watcher / signal scans).
+_hourly_refresh_thread: Optional[threading.Thread] = None
 
 
 def _is_market_hours_utc(now_utc: datetime) -> bool:
@@ -826,7 +828,7 @@ def _auto_resume_trading_at_open():
 
 # ── Daily scan ────────────────────────────────────────────────────────────────
 
-def run_daily_scan():
+def run_daily_scan(hourly_refresh: bool = False):
     print("=" * 55)
     print(f"🌅 المسح اليومي الشامل — {synchronized_utc_now().strftime('%Y-%m-%d %H:%M UTC')}")
 
@@ -836,7 +838,14 @@ def run_daily_scan():
         return []
 
     print(f"📋 إجمالي أسهم ناسداك: {len(tickers)}")
-    level1 = level1_filter(tickers, top_n=300)
+    # Hourly refresh: cap Level 1 to top-N by volume (fast) instead of scanning the full universe depth.
+    l1_top = int(os.getenv("HOURLY_LEVEL1_TOP_N", "500")) if hourly_refresh else 300
+    if hourly_refresh:
+        print(
+            f"[SCAN] Hourly refresh: Level 1 limited to top {l1_top} by volume (sorted in level1_filter).",
+            flush=True,
+        )
+    level1 = level1_filter(tickers, top_n=l1_top)
     level2 = level2_filter(level1)
     level3 = level3_filter(level2)
 
@@ -865,7 +874,7 @@ def run_daily_scan():
     return watchlist
 
 
-def _run_daily_scan_cached() -> Optional[list[str]]:
+def _run_daily_scan_cached(hourly_refresh: bool = False) -> Optional[list[str]]:
     """
     Wrapper around run_daily_scan() that maintains a cache for the 13:00 UTC alert.
     Never raises. Returns None if another scan is already running (exclusive lock).
@@ -876,7 +885,7 @@ def _run_daily_scan_cached() -> Optional[list[str]]:
         return None
     try:
         _scan_in_progress = True
-        wl = run_daily_scan() or []
+        wl = run_daily_scan(hourly_refresh=hourly_refresh) or []
         _scan_cached_watchlist_count = int(len(wl))
         _scan_cached_utc = synchronized_utc_now().strftime("%Y-%m-%d %H:%M:%S UTC")
         return wl
@@ -1415,7 +1424,7 @@ def _notify_structural_rejection(symbol: str, strategy: str, reason: str) -> boo
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def run_trading_bot():
-    global _watchlist, _last_scan_date, _prev_market_status, _closed_notified, _daily_report_sent, _last_watchlist_refresh_at, _unsupported_all_day, _last_structural_suppression_notice_at
+    global _watchlist, _last_scan_date, _prev_market_status, _closed_notified, _daily_report_sent, _last_watchlist_refresh_at, _unsupported_all_day, _last_structural_suppression_notice_at, _hourly_refresh_thread
 
     print("🚀 NATB v2.0 — محرك التداول الذكي")
     # Scan uses the looser floor so FAST-tier candidates are not discarded before per-user gates.
@@ -1611,16 +1620,33 @@ def run_trading_bot():
                         pretrain_models(_watchlist)
                     _last_watchlist_refresh_at = now_utc
 
-            # Hourly in-session refresh: captures intraday liquidity/volatility shifts.
+            # Hourly in-session refresh: background thread so watcher + signal scans never pause for scan.
             if (_last_watchlist_refresh_at is None
                     or (now_utc - _last_watchlist_refresh_at).total_seconds() >= WATCHLIST_REFRESH_SECONDS):
-                print("[WATCHLIST] Hourly refresh during open session...")
-                wl = _run_daily_scan_cached()
-                if wl is not None:
-                    _watchlist = wl
-                    if _watchlist:
-                        pretrain_models(_watchlist)
+                if _hourly_refresh_thread is None or not _hourly_refresh_thread.is_alive():
+                    print(
+                        "[WATCHLIST] Hourly refresh scheduled (background) — watcher continues on current list.",
+                        flush=True,
+                    )
                     _last_watchlist_refresh_at = now_utc
+
+                    def _hourly_refresh_worker() -> None:
+                        global _watchlist
+                        try:
+                            wl = _run_daily_scan_cached(hourly_refresh=True)
+                            if wl is not None:
+                                _watchlist = wl
+                                if _watchlist:
+                                    pretrain_models(_watchlist)
+                        except Exception as exc:
+                            print(f"[HOUR REFRESH] error: {exc!s}", flush=True)
+
+                    _hourly_refresh_thread = threading.Thread(
+                        target=_hourly_refresh_worker,
+                        daemon=True,
+                        name="hourly_watchlist_refresh",
+                    )
+                    _hourly_refresh_thread.start()
 
             if not _watchlist:
                 print("⏳ في انتظار المسح اليومي...")

@@ -9,11 +9,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from utils.market_scanner import (
     scan_market,
     scan_market_async,
+    BULK_BATCH_GAP_SLEEP_SEC,
     BULK_CAPITAL_CLIENT_TIMEOUT,
     BULK_GAP_ONE_TIMEOUT_SEC,
+    BULK_PARALLEL_BATCH_SIZE,
     CAPITAL_HTTP_CONCURRENCY,
-    sleep_between_bulk_tickers,
-    sleep_between_bulk_tickers_sync,
 )
 from config import EARNINGS_TIMEOUT_SEC, EARNINGS_CACHE_TTL_SEC, FMP_API_KEY
 
@@ -427,6 +427,10 @@ def level1_filter(tickers: list[str], top_n: int = 300) -> list[str]:
                     except Exception:
                         continue
 
+        qualified.sort(
+            key=lambda s: float(_screener_cache.get(s, {}).get("avg_volume", 0) or 0),
+            reverse=True,
+        )
         print(f"✅ المستوى 1: اجتاز {len(qualified)} سهم (من بيانات الـ API — بدون تنزيل إضافي)")
         return qualified[:top_n]
 
@@ -463,6 +467,10 @@ def level1_filter(tickers: list[str], top_n: int = 300) -> list[str]:
 
     if unresolved:
         print(f"   ({unresolved} سهم تعذر جلب القيمة السوقية له — تم تمريره بدون عقوبة)")
+    final.sort(
+        key=lambda s: float(_screener_cache.get(s, {}).get("avg_volume", 0) or 0),
+        reverse=True,
+    )
     print(f"✅ المستوى 1: اجتاز {len(final)} سهم")
     return final[:top_n]
 
@@ -493,7 +501,7 @@ async def _fetch_daily_async(
 async def level2_filter_async(tickers: list[str]) -> list[str]:
     """
     Level 2 — Stability filter (async).
-    Gap checks run with shared aiohttp + bounded concurrency (CAPITAL_HTTP_CONCURRENCY).
+    Gap checks use one shared ClientSession + batches of BULK_PARALLEL_BATCH_SIZE with BULK_BATCH_GAP_SLEEP_SEC.
     Earnings remain bulk calendar fetch (not per symbol).
     """
     print(f"📊 المستوى 2: تصفية {len(tickers)} سهم (أخبار وفجوات) [async Capital]...")
@@ -505,8 +513,9 @@ async def level2_filter_async(tickers: list[str]) -> list[str]:
         return []
 
     gap_ok: set[str] = set()
-    sem = asyncio.Semaphore(CAPITAL_HTTP_CONCURRENCY)
+    sem = asyncio.Semaphore(BULK_PARALLEL_BATCH_SIZE)
 
+    print(f"[LEVEL 2] Processing 0/{n}", flush=True)
     async with aiohttp.ClientSession(timeout=BULK_CAPITAL_CLIENT_TIMEOUT) as session:
 
         async def _gap_one(sym: str) -> None:
@@ -532,12 +541,13 @@ async def level2_filter_async(tickers: list[str]) -> list[str]:
             except Exception:
                 gap_ok.add(sym)
 
-        for i, sym in enumerate(syms):
-            if i > 0:
-                await sleep_between_bulk_tickers()
-            if (i + 1) % 50 == 0 or i == 0:
-                print(f"[LEVEL 2] Processing {i + 1}/{n}", flush=True)
-            await _gap_one(sym)
+        for batch_start in range(0, n, BULK_PARALLEL_BATCH_SIZE):
+            batch = syms[batch_start : batch_start + BULK_PARALLEL_BATCH_SIZE]
+            done = min(batch_start + len(batch), n)
+            print(f"[LEVEL 2] Processing {done}/{n}", flush=True)
+            await asyncio.gather(*[_gap_one(s) for s in batch])
+            if batch_start + BULK_PARALLEL_BATCH_SIZE < n:
+                await asyncio.sleep(BULK_BATCH_GAP_SLEEP_SEC)
 
     candidates = [s for s in syms if s in gap_ok]
 
@@ -565,6 +575,94 @@ def level2_filter(tickers: list[str]) -> list[str]:
     return asyncio.run(level2_filter_async(tickers))
 
 
+def _level3_passes_from_hist(hist: pd.DataFrame | None) -> bool:
+    """Daily-range / price gate from a daily OHLCV frame (shared by L3 async + tests)."""
+    try:
+        if hist is None or hist.empty or len(hist) < DAILY_RANGE_LOOKBACK_DAYS:
+            return False
+        if not all(col in hist.columns for col in ("High", "Low", "Close")):
+            return False
+        hist = hist.dropna(subset=["High", "Low", "Close"])
+        if hist.empty or len(hist) < DAILY_RANGE_LOOKBACK_DAYS:
+            return False
+
+        last = hist.iloc[-1]
+        close_last = float(last["Close"]) if last["Close"] is not None else 0.0
+        if close_last <= 0:
+            return False
+        if close_last < MIN_PRICE:
+            return False
+
+        tail = hist.tail(DAILY_RANGE_LOOKBACK_DAYS)
+        ranges = []
+        for _, row in tail.iterrows():
+            c = float(row["Close"])
+            if c <= 0:
+                continue
+            r = (float(row["High"]) - float(row["Low"])) / c * 100.0
+            if r >= 0:
+                ranges.append(r)
+        if not ranges:
+            return False
+
+        avg_range = sum(ranges) / len(ranges)
+        last_range = ranges[-1]
+        return (
+            MIN_DAILY_RANGE_PCT <= avg_range <= MAX_DAILY_RANGE_PCT
+            and MIN_DAILY_RANGE_PCT <= last_range <= MAX_DAILY_RANGE_PCT
+        )
+    except Exception:
+        return False
+
+
+async def level3_filter_async(tickers: list[str]) -> list[str]:
+    """
+    Level 3 — async batches of BULK_PARALLEL_BATCH_SIZE with one shared ClientSession.
+    """
+    print(f"📊 المستوى 3: تصفية {len(tickers)} سهم (نطاق حركة 0.2%-5%)...")
+    if not tickers:
+        return []
+
+    qualified: list[str] = []
+    sem = asyncio.Semaphore(BULK_PARALLEL_BATCH_SIZE)
+    n = len(tickers)
+
+    print(f"[LEVEL 3] Processing 0/{n}", flush=True)
+    async with aiohttp.ClientSession(timeout=BULK_CAPITAL_CLIENT_TIMEOUT) as session:
+
+        async def _l3_one(sym: str) -> tuple[str, bool]:
+            async def _run() -> bool:
+                hist = await _fetch_daily_async(session, sem, sym, 5)
+                return _level3_passes_from_hist(hist)
+
+            try:
+                ok = await asyncio.wait_for(_run(), timeout=BULK_GAP_ONE_TIMEOUT_SEC)
+                return sym, bool(ok)
+            except asyncio.TimeoutError:
+                print(
+                    f"[LEVEL 3] Range check exceeded {BULK_GAP_ONE_TIMEOUT_SEC:.0f}s for {sym}",
+                    flush=True,
+                )
+                return sym, False
+            except Exception:
+                return sym, False
+
+        for batch_start in range(0, n, BULK_PARALLEL_BATCH_SIZE):
+            batch = tickers[batch_start : batch_start + BULK_PARALLEL_BATCH_SIZE]
+            done = min(batch_start + len(batch), n)
+            print(f"[LEVEL 3] Processing {done}/{n}", flush=True)
+            pairs = await asyncio.gather(*[_l3_one(s) for s in batch])
+            for sym, ok in pairs:
+                if ok:
+                    qualified.append(sym)
+            if batch_start + BULK_PARALLEL_BATCH_SIZE < n:
+                await asyncio.sleep(BULK_BATCH_GAP_SLEEP_SEC)
+
+    qualified = list(dict.fromkeys(qualified))
+    print(f"✅ المستوى 3: اجتاز {len(qualified)} سهم")
+    return qualified
+
+
 def level3_filter(tickers: list[str]) -> list[str]:
     """
     Level 3 — Price & Daily Range filter.
@@ -578,64 +676,4 @@ def level3_filter(tickers: list[str]) -> list[str]:
     This aims to select stocks that are liquid yet not extremely volatile,
     so targets/SL distances behave more predictably.
     """
-    print(f"📊 المستوى 3: تصفية {len(tickers)} سهم (نطاق حركة 0.2%-5%)...")
-    if not tickers:
-        return []
-
-    qualified: list[str] = []
-
-    def _pass_level3(sym: str) -> bool:
-        try:
-            hist = _fetch_daily(sym, 5)
-            if hist is None or hist.empty or len(hist) < DAILY_RANGE_LOOKBACK_DAYS:
-                return False
-            if not all(col in hist.columns for col in ("High", "Low", "Close")):
-                return False
-            hist = hist.dropna(subset=["High", "Low", "Close"])
-            if hist.empty or len(hist) < DAILY_RANGE_LOOKBACK_DAYS:
-                return False
-
-            last = hist.iloc[-1]
-            close_last = float(last["Close"]) if last["Close"] is not None else 0.0
-            if close_last <= 0:
-                return False
-            if close_last < MIN_PRICE:
-                return False
-
-            tail = hist.tail(DAILY_RANGE_LOOKBACK_DAYS)
-            ranges = []
-            for _, row in tail.iterrows():
-                c = float(row["Close"])
-                if c <= 0:
-                    continue
-                r = (float(row["High"]) - float(row["Low"])) / c * 100.0
-                if r >= 0:
-                    ranges.append(r)
-            if not ranges:
-                return False
-
-            avg_range = sum(ranges) / len(ranges)
-            last_range = ranges[-1]
-            return (
-                MIN_DAILY_RANGE_PCT <= avg_range <= MAX_DAILY_RANGE_PCT
-                and MIN_DAILY_RANGE_PCT <= last_range <= MAX_DAILY_RANGE_PCT
-            )
-        except Exception:
-            return False
-
-    n = len(tickers)
-    for i, sym in enumerate(tickers):
-        if i > 0:
-            sleep_between_bulk_tickers_sync()
-        if (i + 1) % 50 == 0 or i == 0:
-            print(f"[LEVEL 3] Processing {i + 1}/{n}", flush=True)
-        try:
-            if _pass_level3(sym):
-                qualified.append(sym)
-        except Exception:
-            continue
-
-    # Deduplicate in case symbols appear in multiple batches
-    qualified = list(dict.fromkeys(qualified))
-    print(f"✅ المستوى 3: اجتاز {len(qualified)} سهم")
-    return qualified
+    return asyncio.run(level3_filter_async(tickers))
