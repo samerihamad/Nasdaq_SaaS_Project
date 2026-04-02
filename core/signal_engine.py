@@ -27,11 +27,13 @@ from config import (
     WATCHLIST,
     MIN_CONFIDENCE,
     SIGNAL_MIN_CONFIDENCE,
+    FAST_MIN_CONFIDENCE,
     MAX_DAILY_TRADES,
     SCAN_INTERVAL_SEC,
 )
 from core.strategy_meanrev  import analyze as analyze_meanrev
 from core.strategy_momentum import analyze as analyze_momentum
+from core.strategy_momentum import _adx, _rsi, _flatten as _mr_flatten
 from core.risk_manager      import can_open_trade
 from core.executor          import place_trade_for_user
 from utils.market_scanner import (
@@ -46,6 +48,47 @@ DB_PATH = "database/trading_saas.db"
 
 log = logging.getLogger(__name__)
 ACTIVE_MIN_CONFIDENCE = float(SIGNAL_MIN_CONFIDENCE if SIGNAL_MIN_CONFIDENCE is not None else MIN_CONFIDENCE)
+
+# Dynamic gate (15m ADX/RSI): bonus / choppy targets; neutral uses FAST_MIN_CONFIDENCE from .env.
+_DYNAMIC_TREND_THRESHOLD = 52.0
+_DYNAMIC_CHOPPY_THRESHOLD = 62.0
+
+
+def _dynamic_confidence_threshold(timeframes: dict, _symbol: str) -> float:
+    """
+    Per-symbol minimum confidence: FAST_MIN_CONFIDENCE baseline, 52% if strong trend
+    (ADX > 25 and RSI > 70), 62% if choppy (ADX < 15).
+    """
+    base = float(FAST_MIN_CONFIDENCE)
+    df_15m = timeframes.get("15m")
+    if df_15m is None or getattr(df_15m, "empty", True):
+        return base
+    try:
+        df = _mr_flatten(df_15m)
+        if len(df) < 30 or not all(c in df.columns for c in ("High", "Low", "Close")):
+            return base
+        adx_series, _, _ = _adx(df)
+        adx_val = float(adx_series.iloc[-1])
+        close = df["Close"].squeeze().astype(float)
+        rsi_val = float(_rsi(close).iloc[-1])
+    except Exception:
+        return base
+
+    if adx_val < 15:
+        thr = _DYNAMIC_CHOPPY_THRESHOLD
+        log.info(
+            "[DYNAMIC] Adjusted threshold to %.1f%% due to Choppy conditions.",
+            thr,
+        )
+        return thr
+    if adx_val > 25 and rsi_val > 70:
+        thr = _DYNAMIC_TREND_THRESHOLD
+        log.info(
+            "[DYNAMIC] Adjusted threshold to %.1f%% due to Trend conditions.",
+            thr,
+        )
+        return thr
+    return base
 
 
 # ── Subscriber helpers ────────────────────────────────────────────────────────
@@ -99,6 +142,8 @@ def _analyze_ticker(symbol: str) -> dict | None:
         log.warning("[%s] Could not fetch timeframe data — skipped", symbol)
         return None
 
+    eff_min_conf = _dynamic_confidence_threshold(timeframes, symbol)
+
     signals = []
     structural_rejections = []
 
@@ -151,10 +196,10 @@ def _analyze_ticker(symbol: str) -> dict | None:
     # Pick the signal with the highest score; filter by confidence
     best = max(signals, key=lambda s: s["score"])
 
-    if best["confidence"] < ACTIVE_MIN_CONFIDENCE:
+    if best["confidence"] < eff_min_conf:
         log.debug(
-            "[%s] Best signal confidence %.1f%% below MIN_CONFIDENCE %.1f%% — discarded",
-            symbol, best["confidence"], ACTIVE_MIN_CONFIDENCE,
+            "[%s] Best signal confidence %.1f%% below dynamic threshold %.1f%% — discarded",
+            symbol, best["confidence"], eff_min_conf,
         )
         return None
 
@@ -285,8 +330,12 @@ def run_scan() -> list[dict]:
 
 # ── Parallel scanner (no execution) ───────────────────────────────────────────
 
-def _analyze_one_from_timeframes(symbol: str, timeframes: dict, min_confidence: float) -> dict[str, Any] | None:
+def _analyze_one_from_timeframes(
+    symbol: str, timeframes: dict, _min_confidence: float
+) -> dict[str, Any] | None:
     """Strategy stack (sync) given pre-fetched timeframes — MeanRev uses FAST profile by default."""
+    # Confidence gate uses FAST_MIN_CONFIDENCE-based dynamic threshold (see _dynamic_confidence_threshold).
+    eff_min_conf = _dynamic_confidence_threshold(timeframes, symbol)
     candidates: list[
         tuple[
             str,
@@ -311,7 +360,7 @@ def _analyze_one_from_timeframes(symbol: str, timeframes: dict, min_confidence: 
             raw_confs.append(float(conf))
         except Exception:
             pass
-        if action and conf >= float(min_confidence):
+        if action and conf >= float(eff_min_conf):
             candidates.append((action, float(conf), "RF", str(reason), None, None, None, False, None, None, False, False))
     except Exception:
         pass
@@ -341,7 +390,7 @@ def _analyze_one_from_timeframes(symbol: str, timeframes: dict, min_confidence: 
                 False,
                 False,
             ))
-        elif mr and float(mr.get("confidence", 0)) >= float(min_confidence):
+        elif mr and float(mr.get("confidence", 0)) >= float(eff_min_conf):
             rsi_v = mr.get("rsi_15m")
             candidates.append((
                 str(mr["action"]),
@@ -385,7 +434,7 @@ def _analyze_one_from_timeframes(symbol: str, timeframes: dict, min_confidence: 
                 False,
                 False,
             ))
-        elif mo and float(mo.get("confidence", 0)) >= float(min_confidence):
+        elif mo and float(mo.get("confidence", 0)) >= float(eff_min_conf):
             mrsi = mo.get("mom_rsi_15m")
             mvr = mo.get("mom_vol_ratio")
             candidates.append((

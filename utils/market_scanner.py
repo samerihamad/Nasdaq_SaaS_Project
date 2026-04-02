@@ -3,6 +3,7 @@ Capital.com OHLCV via aiohttp. Watchlist Level 2 gap filter calls `scan_market_a
 with a shared session and `CAPITAL_HTTP_CONCURRENCY` (see utils.filters.level2_filter_async).
 """
 import os
+import time
 import asyncio
 from datetime import datetime, timezone
 
@@ -31,6 +32,8 @@ _LOG_ROOT = os.getenv("ENGINE_LOG_ROOT", "logs")
 _CAPITAL_PRICES_MAX_BARS_CAP = int(os.getenv("CAPITAL_PRICES_MAX_BARS_CAP", "1000"))
 _DAILY_PRICES_MAX = min(1000, max(50, _CAPITAL_PRICES_MAX_BARS_CAP))
 CAPITAL_HTTP_CONCURRENCY = max(1, int(os.getenv("CAPITAL_HTTP_CONCURRENCY", "3")))
+# Pause between per-ticker Capital calls in bulk filters (Level 2/3) to reduce HTTP 429.
+BULK_TICKER_REQUEST_SLEEP_SEC = float(os.getenv("BULK_TICKER_REQUEST_SLEEP_SEC", "0.2"))
 
 _SESSION_CACHE: dict[str, dict] = {}
 _EPIC_CACHE: dict[str, str] = {}
@@ -65,6 +68,16 @@ CAPITAL_CLIENT_TIMEOUT = _AIO_TIMEOUT
 
 def _new_http_semaphore() -> asyncio.Semaphore:
     return asyncio.Semaphore(CAPITAL_HTTP_CONCURRENCY)
+
+
+async def sleep_between_bulk_tickers() -> None:
+    """Throttle bulk NASDAQ filter scans (async)."""
+    await asyncio.sleep(BULK_TICKER_REQUEST_SLEEP_SEC)
+
+
+def sleep_between_bulk_tickers_sync() -> None:
+    """Throttle bulk NASDAQ filter scans (sync / thread workers)."""
+    time.sleep(BULK_TICKER_REQUEST_SLEEP_SEC)
 
 
 def clear_local_price_caches() -> None:
@@ -157,8 +170,9 @@ async def _aio_get(
     headers: dict,
     params: dict | None = None,
 ) -> tuple[int, dict | list | None]:
-    """GET JSON with semaphore + one retry on failure. Returns (status, body or None)."""
-    for attempt in range(2):
+    """GET JSON with semaphore, extra backoff on 429, and a short retry on transient errors."""
+    max_attempts = 5
+    for attempt in range(max_attempts):
         async with sem:
             try:
                 async with session.get(
@@ -171,6 +185,9 @@ async def _aio_get(
                         except Exception:
                             data = None
                         return status, data
+                    if status == 429 and attempt < max_attempts - 1:
+                        await asyncio.sleep(min(3.0, 0.4 + attempt * 0.35))
+                        continue
                     if attempt == 0:
                         await asyncio.sleep(0.12)
                         continue

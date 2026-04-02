@@ -11,6 +11,8 @@ from utils.market_scanner import (
     scan_market_async,
     CAPITAL_CLIENT_TIMEOUT,
     CAPITAL_HTTP_CONCURRENCY,
+    sleep_between_bulk_tickers,
+    sleep_between_bulk_tickers_sync,
 )
 from config import EARNINGS_TIMEOUT_SEC, EARNINGS_CACHE_TTL_SEC, FMP_API_KEY
 
@@ -515,11 +517,12 @@ async def level2_filter_async(tickers: list[str]) -> list[str]:
             except Exception:
                 gap_ok.add(sym)
 
-        for batch_start in range(0, n, 20):
-            batch = syms[batch_start : batch_start + 20]
-            done = min(batch_start + len(batch), n)
-            print(f"[LEVEL 2] Processing {done}/{n}", flush=True)
-            await asyncio.gather(*[_gap_one(s) for s in batch])
+        for i, sym in enumerate(syms):
+            if i > 0:
+                await sleep_between_bulk_tickers()
+            if (i + 1) % 50 == 0 or i == 0:
+                print(f"[LEVEL 2] Processing {i + 1}/{n}", flush=True)
+            await _gap_one(sym)
 
     candidates = [s for s in syms if s in gap_ok]
 
@@ -605,15 +608,17 @@ def level3_filter(tickers: list[str]) -> list[str]:
         except Exception:
             return False
 
-    with ThreadPoolExecutor(max_workers=20) as pool:
-        futures = {pool.submit(_pass_level3, sym): sym for sym in tickers}
-        for fut in as_completed(futures):
-            sym = futures[fut]
-            try:
-                if fut.result():
-                    qualified.append(sym)
-            except Exception:
-                continue
+    n = len(tickers)
+    for i, sym in enumerate(tickers):
+        if i > 0:
+            sleep_between_bulk_tickers_sync()
+        if (i + 1) % 50 == 0 or i == 0:
+            print(f"[LEVEL 3] Processing {i + 1}/{n}", flush=True)
+        try:
+            if _pass_level3(sym):
+                qualified.append(sym)
+        except Exception:
+            continue
 
     # Deduplicate in case symbols appear in multiple batches
     qualified = list(dict.fromkeys(qualified))
