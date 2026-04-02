@@ -437,6 +437,19 @@ def spawn_stalled_pnl_retry(trade_id: int) -> None:
     threading.Thread(target=_run, daemon=True, name=f"stalled_pnl_{tid}").start()
 
 
+def _pending_sync_retry_cooldown_sec() -> float:
+    """
+    Closed trades pending broker P&L should retry slowly (Capital can take time to finalize rpl).
+    Default: 5 minutes.
+    """
+    return max(60.0, float(STALLED_PNL_RETRY_INTERVAL_SEC))
+
+
+def _pending_sync_max_attempts() -> int:
+    """Retry for ~1 hour (5 min × 12 by default)."""
+    return max(1, int(STALLED_PNL_RETRY_MAX_ROUNDS))
+
+
 # After DELETE / manual close, poll /positions before trusting "closed" (2s, 5s, 10s gaps in fetch_closed_deal_final_data).
 VERIFY_CLOSE_MAX_POLLS = int(os.getenv("VERIFY_CLOSE_MAX_POLLS", "10"))
 VERIFY_CLOSE_POLL_SEC = float(os.getenv("VERIFY_CLOSE_POLL_SEC", "0.6"))
@@ -1420,42 +1433,6 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
                 size=sz_f,
             ):
                 continue
-            # Prevent hot-loop hammering when Capital history lags.
-            # Retry with cooldown and bounded attempt tracking per trade.
-            try:
-                attempts_i = int(close_sync_attempts or 0)
-            except Exception:
-                attempts_i = 0
-            if attempts_i >= SYNC_MAX_ATTEMPTS:
-                if attempts_i == SYNC_MAX_ATTEMPTS:
-                    print(
-                        f"[Capital Sync] max attempts reached trade_id={trade_id} deal_id={deal_id}",
-                        flush=True,
-                    )
-                    c.execute(
-                        "UPDATE trades SET close_sync_attempts=?, close_sync_last_error=? WHERE trade_id=?",
-                        (attempts_i + 1, "max_attempts_reached", int(trade_id)),
-                    )
-                    conn.commit()
-                continue
-            if close_sync_last_try_at:
-                try:
-                    last_try = _parse_iso_utc(str(close_sync_last_try_at))
-                    if last_try is None:
-                        raise ValueError("invalid close_sync_last_try_at")
-                    delta = (_now_utc() - last_try).total_seconds()
-                    if delta < max(1, SYNC_RETRY_COOLDOWN_SEC):
-                        continue
-                except Exception:
-                    pass
-
-            c.execute(
-                "UPDATE trades SET close_sync_attempts=COALESCE(close_sync_attempts,0)+1, "
-                "close_sync_last_try_at=? WHERE trade_id=? AND status='OPEN'",
-                (_now_utc().isoformat(), int(trade_id)),
-            )
-            conn.commit()
-
             # Mark CLOSED + PENDING_SYNC immediately; broker P&L fetch (with internal backoff
             # sleeps) runs on the P&L daemon thread so the scanner / main loop is never blocked.
             dr = str(deal_reference or "").strip()
@@ -1503,7 +1480,9 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
             attempts_i = int(close_sync_attempts or 0)
         except Exception:
             attempts_i = 0
-        if attempts_i >= SYNC_MAX_ATTEMPTS:
+        # Do NOT finalize "P&L unavailable" until the 1-hour pending-sync retry budget is exhausted.
+        max_attempts_pending = _pending_sync_max_attempts()
+        if attempts_i >= max_attempts_pending:
             if FINAL_SYNC_FALLBACK_ENABLED:
                 try:
                     sz_pf = float(size) if size is not None else None
@@ -1548,7 +1527,7 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
                 last_try = _parse_iso_utc(str(close_sync_last_try_at))
                 if last_try is None:
                     raise ValueError("invalid close_sync_last_try_at")
-                if (_now_utc() - last_try).total_seconds() < max(1, SYNC_RETRY_COOLDOWN_SEC):
+                if (_now_utc() - last_try).total_seconds() < _pending_sync_retry_cooldown_sec():
                     continue
             except Exception:
                 pass
