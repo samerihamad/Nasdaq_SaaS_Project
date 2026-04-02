@@ -162,6 +162,64 @@ _scan_cached_utc = ""
 _zero_hour_event = threading.Event()
 _triple_tz_threads_started = False
 
+
+def _is_market_hours_utc(now_utc: datetime) -> bool:
+    """
+    Mid-session restart safety:
+    If the engine starts after zero-hour, open gates immediately so the scanner resumes.
+    Market-hours window (strict per ops): 13:30–20:00 UTC.
+    """
+    try:
+        t = now_utc.astimezone(timezone.utc).time()
+    except Exception:
+        t = synchronized_utc_now().astimezone(timezone.utc).time()
+    return (t >= datetime(2000, 1, 1, 13, 30, 0, tzinfo=timezone.utc).time()) and (
+        t <= datetime(2000, 1, 1, 20, 0, 0, tzinfo=timezone.utc).time()
+    )
+
+
+def _boot_open_gates_and_maybe_scan(now_utc: datetime) -> None:
+    """
+    On startup during market hours:
+    - Open the zero-hour gate immediately (avoid waiting until tomorrow).
+    - If watchlist is empty, trigger one daily scan immediately (non-blocking).
+    """
+    global _watchlist, _last_scan_date, _unsupported_all_day, _last_watchlist_refresh_at
+    global _scan_in_progress
+
+    if not _TRIPLE_TZ_SCHED_ENABLED:
+        return
+    if not _is_market_hours_utc(now_utc):
+        return
+
+    print(
+        "[BOOT] Detected active market hours. Opening gates and initiating immediate session scan.",
+        flush=True,
+    )
+    _zero_hour_event.set()
+    with _scan_lock:
+        _scan_in_progress = False
+
+    if _watchlist:
+        return
+
+    def _boot_scan() -> None:
+        try:
+            wl = _run_daily_scan_cached() or []
+            if wl:
+                _watchlist = wl
+                _last_scan_date = utc_today()
+                _unsupported_all_day.clear()
+                try:
+                    pretrain_models(_watchlist)
+                except Exception:
+                    pass
+                _last_watchlist_refresh_at = synchronized_utc_now()
+        except Exception as exc:
+            print(f"[BOOT SCAN] error: {exc!s}", flush=True)
+
+    threading.Thread(target=_boot_scan, daemon=True, name="boot_scan_now").start()
+
 # File paths
 _market_open_state_file = os.path.join(LOG_ROOT, "market_open_state.json")
 
@@ -1408,6 +1466,9 @@ def run_trading_bot():
                 if not _triple_tz_threads_started:
                     _start_triple_tz_scheduler_threads()
                     _triple_tz_threads_started = True
+                    # Mid-session restart safety: if we're already past zero-hour, open gates now
+                    # and (if needed) kick off a boot scan immediately.
+                    _boot_open_gates_and_maybe_scan(synchronized_utc_now())
             now_utc       = synchronized_utc_now()
             today         = utc_today()
             market_status = get_market_status()
