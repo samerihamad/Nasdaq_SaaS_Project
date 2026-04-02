@@ -9,7 +9,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from utils.market_scanner import (
     scan_market,
     scan_market_async,
-    CAPITAL_CLIENT_TIMEOUT,
+    BULK_CAPITAL_CLIENT_TIMEOUT,
+    BULK_GAP_ONE_TIMEOUT_SEC,
     CAPITAL_HTTP_CONCURRENCY,
     sleep_between_bulk_tickers,
     sleep_between_bulk_tickers_sync,
@@ -94,7 +95,12 @@ def _fetch_daily(symbol: str, days: int = 5) -> pd.DataFrame | None:
     """
     period = "5d" if int(days) <= 5 else "1mo"
     try:
-        df = scan_market(symbol, period=period, interval="1d")
+        df = scan_market(
+            symbol,
+            period=period,
+            interval="1d",
+            client_timeout=BULK_CAPITAL_CLIENT_TIMEOUT,
+        )
         if df is None or df.empty:
             return None
         return df
@@ -501,10 +507,10 @@ async def level2_filter_async(tickers: list[str]) -> list[str]:
     gap_ok: set[str] = set()
     sem = asyncio.Semaphore(CAPITAL_HTTP_CONCURRENCY)
 
-    async with aiohttp.ClientSession(timeout=CAPITAL_CLIENT_TIMEOUT) as session:
+    async with aiohttp.ClientSession(timeout=BULK_CAPITAL_CLIENT_TIMEOUT) as session:
 
         async def _gap_one(sym: str) -> None:
-            try:
+            async def _run_gap() -> None:
                 hist = await _fetch_daily_async(session, sem, sym, 5)
                 if hist is None or len(hist) < 2:
                     gap_ok.add(sym)
@@ -513,6 +519,15 @@ async def level2_filter_async(tickers: list[str]) -> list[str]:
                 curr_open = float(hist["Open"].iloc[-1])
                 if prev_close > 0 and abs(curr_open - prev_close) / prev_close > MAX_GAP_PCT:
                     return
+                gap_ok.add(sym)
+
+            try:
+                await asyncio.wait_for(_run_gap(), timeout=BULK_GAP_ONE_TIMEOUT_SEC)
+            except asyncio.TimeoutError:
+                print(
+                    f"[LEVEL 2] Gap check exceeded {BULK_GAP_ONE_TIMEOUT_SEC:.0f}s for {sym} — accepting (degraded)",
+                    flush=True,
+                )
                 gap_ok.add(sym)
             except Exception:
                 gap_ok.add(sym)

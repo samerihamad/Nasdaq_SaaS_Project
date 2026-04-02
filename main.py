@@ -197,15 +197,17 @@ def _boot_open_gates_and_maybe_scan(now_utc: datetime) -> None:
         flush=True,
     )
     _zero_hour_event.set()
-    with _scan_lock:
-        _scan_in_progress = False
 
     if _watchlist:
         return
 
     def _boot_scan() -> None:
+        global _watchlist, _last_scan_date, _unsupported_all_day, _last_watchlist_refresh_at
         try:
-            wl = _run_daily_scan_cached() or []
+            wl = _run_daily_scan_cached()
+            if wl is None:
+                print("[BOOT SCAN] Skipped: another scan is already in progress.", flush=True)
+                return
             if wl:
                 _watchlist = wl
                 _last_scan_date = utc_today()
@@ -863,23 +865,24 @@ def run_daily_scan():
     return watchlist
 
 
-def _run_daily_scan_cached() -> list[str]:
+def _run_daily_scan_cached() -> Optional[list[str]]:
     """
     Wrapper around run_daily_scan() that maintains a cache for the 13:00 UTC alert.
-    Never raises; scan happens in a dedicated background thread.
+    Never raises. Returns None if another scan is already running (exclusive lock).
     """
     global _scan_in_progress, _scan_cached_watchlist_count, _scan_cached_utc
-    with _scan_lock:
-        _scan_in_progress = True
+    if not _scan_lock.acquire(blocking=False):
+        print("[SCAN] Skipped: another scan is already in progress.", flush=True)
+        return None
     try:
+        _scan_in_progress = True
         wl = run_daily_scan() or []
-        with _scan_lock:
-            _scan_cached_watchlist_count = int(len(wl))
-            _scan_cached_utc = synchronized_utc_now().strftime("%Y-%m-%d %H:%M:%S UTC")
+        _scan_cached_watchlist_count = int(len(wl))
+        _scan_cached_utc = synchronized_utc_now().strftime("%Y-%m-%d %H:%M:%S UTC")
         return wl
     finally:
-        with _scan_lock:
-            _scan_in_progress = False
+        _scan_in_progress = False
+        _scan_lock.release()
 
 
 def pretrain_models(watchlist):
@@ -950,11 +953,10 @@ def _alpha_alert_thread() -> None:
                 time.sleep(1.0)
                 continue
 
-            with _scan_lock:
-                in_prog = bool(_scan_in_progress)
-                cached_n = int(_scan_cached_watchlist_count or 0)
-                cached_at = str(_scan_cached_utc or "").strip()
-                live_n = int(len(_watchlist or []))
+            in_prog = bool(_scan_in_progress)
+            cached_n = int(_scan_cached_watchlist_count or 0)
+            cached_at = str(_scan_cached_utc or "").strip()
+            live_n = int(len(_watchlist or []))
 
             if in_prog:
                 note = f"⏳ Scan in progress... (cached={cached_n} at {cached_at})" if cached_at else f"⏳ Scan in progress... (cached={cached_n})"
@@ -982,6 +984,9 @@ def _daily_scan_thread() -> None:
                 continue
 
             wl = _run_daily_scan_cached()
+            if wl is None:
+                time.sleep(1.0)
+                continue
             _watchlist = wl
             _last_scan_date = today
             _unsupported_all_day.clear()
@@ -1518,11 +1523,13 @@ def run_trading_bot():
                 # has a real count and models are warm.
                 if (not _TRIPLE_TZ_SCHED_ENABLED) and (_last_scan_date != today
                         and 0 < mins <= PREMARKET_ALERT_WINDOW_MIN):
-                    _watchlist = run_daily_scan()
-                    _last_scan_date = today
-                    _unsupported_all_day.clear()
-                    if _watchlist:
-                        pretrain_models(_watchlist)
+                    wl = _run_daily_scan_cached()
+                    if wl is not None:
+                        _watchlist = wl
+                        _last_scan_date = today
+                        _unsupported_all_day.clear()
+                        if _watchlist:
+                            pretrain_models(_watchlist)
 
                 # If scan failed earlier and we are still inside alert window,
                 # one lazy retry allows alert dispatch in PRE_MARKET as well.
@@ -1530,10 +1537,12 @@ def run_trading_bot():
                         and 0 < mins <= PREMARKET_ALERT_WINDOW_MIN
                         and not _watchlist
                         and _last_scan_date != today):
-                    _watchlist = run_daily_scan()
-                    _last_scan_date = today
-                    if _watchlist:
-                        pretrain_models(_watchlist)
+                    wl = _run_daily_scan_cached()
+                    if wl is not None:
+                        _watchlist = wl
+                        _last_scan_date = today
+                        if _watchlist:
+                            pretrain_models(_watchlist)
 
                 # DST-safe pre-market alert window.
                 # Ensure the alert is dispatched once even if Level3 produced
@@ -1543,7 +1552,9 @@ def run_trading_bot():
                         and (_watchlist or _last_scan_date == today)):
                     if not _watchlist:
                         # Last-resort: build a watchlist right before sending.
-                        _watchlist = run_daily_scan()
+                        wl = _run_daily_scan_cached()
+                        if wl is not None:
+                            _watchlist = wl
                     send_premarket_alert(len(_watchlist))
 
             # ── Market CLOSED: notify once, run watcher for all users ─────────
@@ -1591,21 +1602,25 @@ def run_trading_bot():
             # Fallback: if pre-open scan did not run for any reason,
             # run once after open.
             if _last_scan_date != today:
-                _watchlist      = run_daily_scan()
-                _last_scan_date = today
-                _unsupported_all_day.clear()
-                if _watchlist:
-                    pretrain_models(_watchlist)
-                _last_watchlist_refresh_at = now_utc
+                wl = _run_daily_scan_cached()
+                if wl is not None:
+                    _watchlist = wl
+                    _last_scan_date = today
+                    _unsupported_all_day.clear()
+                    if _watchlist:
+                        pretrain_models(_watchlist)
+                    _last_watchlist_refresh_at = now_utc
 
             # Hourly in-session refresh: captures intraday liquidity/volatility shifts.
             if (_last_watchlist_refresh_at is None
                     or (now_utc - _last_watchlist_refresh_at).total_seconds() >= WATCHLIST_REFRESH_SECONDS):
                 print("[WATCHLIST] Hourly refresh during open session...")
-                _watchlist = run_daily_scan()
-                if _watchlist:
-                    pretrain_models(_watchlist)
-                _last_watchlist_refresh_at = now_utc
+                wl = _run_daily_scan_cached()
+                if wl is not None:
+                    _watchlist = wl
+                    if _watchlist:
+                        pretrain_models(_watchlist)
+                    _last_watchlist_refresh_at = now_utc
 
             if not _watchlist:
                 print("⏳ في انتظار المسح اليومي...")

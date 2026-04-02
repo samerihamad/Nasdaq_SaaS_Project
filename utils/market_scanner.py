@@ -33,7 +33,12 @@ _CAPITAL_PRICES_MAX_BARS_CAP = int(os.getenv("CAPITAL_PRICES_MAX_BARS_CAP", "100
 _DAILY_PRICES_MAX = min(1000, max(50, _CAPITAL_PRICES_MAX_BARS_CAP))
 CAPITAL_HTTP_CONCURRENCY = max(1, int(os.getenv("CAPITAL_HTTP_CONCURRENCY", "3")))
 # Pause between per-ticker Capital calls in bulk filters (Level 2/3) to reduce HTTP 429.
-BULK_TICKER_REQUEST_SLEEP_SEC = float(os.getenv("BULK_TICKER_REQUEST_SLEEP_SEC", "0.2"))
+BULK_TICKER_REQUEST_SLEEP_SEC = float(os.getenv("BULK_TICKER_REQUEST_SLEEP_SEC", "0.1"))
+# Hard cap per HTTP request during bulk NASDAQ filters (Level 2/3) so one slow call cannot stall the batch.
+BULK_HTTP_REQUEST_TIMEOUT_SEC = float(os.getenv("BULK_HTTP_REQUEST_TIMEOUT_SEC", "5.0"))
+BULK_CAPITAL_CLIENT_TIMEOUT = aiohttp.ClientTimeout(total=BULK_HTTP_REQUEST_TIMEOUT_SEC)
+# Upper bound for one Level-2 gap check (fetch + parse), slightly above HTTP timeout.
+BULK_GAP_ONE_TIMEOUT_SEC = float(os.getenv("BULK_GAP_ONE_TIMEOUT_SEC", "8.0"))
 
 _SESSION_CACHE: dict[str, dict] = {}
 _EPIC_CACHE: dict[str, str] = {}
@@ -175,9 +180,7 @@ async def _aio_get(
     for attempt in range(max_attempts):
         async with sem:
             try:
-                async with session.get(
-                    url, headers=headers, params=params, timeout=_AIO_TIMEOUT
-                ) as resp:
+                async with session.get(url, headers=headers, params=params) as resp:
                     status = int(resp.status)
                     if status == 200:
                         try:
@@ -186,7 +189,12 @@ async def _aio_get(
                             data = None
                         return status, data
                     if status == 429 and attempt < max_attempts - 1:
-                        await asyncio.sleep(min(3.0, 0.4 + attempt * 0.35))
+                        sleep_s = min(3.0, 0.4 + attempt * 0.35)
+                        print(
+                            f"[API] Rate limit hit. Sleeping for {sleep_s:.2f} seconds.",
+                            flush=True,
+                        )
+                        await asyncio.sleep(sleep_s)
                         continue
                     if attempt == 0:
                         await asyncio.sleep(0.12)
@@ -216,7 +224,6 @@ async def _aio_post_json(
                     url,
                     headers=headers,
                     json=json_body,
-                    timeout=_AIO_TIMEOUT,
                 ) as resp:
                     status = int(resp.status)
                     try:
@@ -655,6 +662,7 @@ async def scan_market_async(
     *,
     session: aiohttp.ClientSession | None = None,
     semaphore: asyncio.Semaphore | None = None,
+    client_timeout: aiohttp.ClientTimeout | None = None,
 ) -> pd.DataFrame | None:
     interval_map = {
         "15m": ("MINUTE_15", 900),
@@ -682,7 +690,7 @@ async def scan_market_async(
 
     close_local = session is None
     if session is None:
-        session = aiohttp.ClientSession(timeout=_AIO_TIMEOUT)
+        session = aiohttp.ClientSession(timeout=(client_timeout or _AIO_TIMEOUT))
     if semaphore is None:
         semaphore = _new_http_semaphore()
 
@@ -775,11 +783,19 @@ async def scan_market_async(
             await session.close()
 
 
-def scan_market(ticker_symbol, period="1d", interval="5m", session_context: dict | None = None):
+def scan_market(
+    ticker_symbol,
+    period="1d",
+    interval="5m",
+    session_context: dict | None = None,
+    *,
+    client_timeout: aiohttp.ClientTimeout | None = None,
+):
     """Sync wrapper: async Capital.com OHLCV fetch with aiohttp (concurrency capped internally)."""
 
     async def _run():
-        async with aiohttp.ClientSession(timeout=_AIO_TIMEOUT) as sess:
+        to = client_timeout if client_timeout is not None else _AIO_TIMEOUT
+        async with aiohttp.ClientSession(timeout=to) as sess:
             sem = _new_http_semaphore()
             return await scan_market_async(
                 ticker_symbol,
