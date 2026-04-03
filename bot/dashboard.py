@@ -51,6 +51,7 @@ from core.trade_session_finalize import after_trade_leg_closed
 from bot.admin import admin_handler, limits_handler, monitor_handler, audit_sync_handler
 from database.db_manager import (
     create_db, get_bank_details,
+    DB_PATH,
     get_trading_enabled, set_trading_enabled,
     apply_subscription_cancellation, get_preferred_leverage,
     set_preferred_leverage, infer_subscription_start, is_maintenance_mode,
@@ -74,8 +75,6 @@ try:
     sys.stderr.reconfigure(encoding='utf-8')
 except Exception:
     pass
-
-DB_PATH = 'database/trading_saas.db'
 
 # Ensure schema exists/was migrated before any SQL queries.
 create_db()

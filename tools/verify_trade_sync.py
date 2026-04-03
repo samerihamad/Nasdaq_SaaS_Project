@@ -1,8 +1,8 @@
 import sqlite3
 from pathlib import Path
+from database.db_manager import DB_PATH as _DB_PATH
 
-
-DB_PATH = Path("database/trading_saas.db")
+DB_PATH = Path(_DB_PATH)
 
 
 def _table_columns(cursor: sqlite3.Cursor, table: str) -> set[str]:

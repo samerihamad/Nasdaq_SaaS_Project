@@ -36,6 +36,7 @@ from core.strategy_momentum import analyze as analyze_momentum
 from core.strategy_momentum import _adx, _rsi, _flatten as _mr_flatten
 from core.risk_manager      import can_open_trade
 from core.executor          import place_trade_for_user
+from database.db_manager import DB_PATH
 from utils.market_scanner import (
     scan_multi_timeframe,
     scan_multi_timeframe_async,
@@ -43,8 +44,6 @@ from utils.market_scanner import (
     CAPITAL_HTTP_CONCURRENCY,
 )
 from utils.ai_model         import analyze_multi_timeframe
-
-DB_PATH = "database/trading_saas.db"
 
 log = logging.getLogger(__name__)
 ACTIVE_MIN_CONFIDENCE = float(SIGNAL_MIN_CONFIDENCE if SIGNAL_MIN_CONFIDENCE is not None else MIN_CONFIDENCE)

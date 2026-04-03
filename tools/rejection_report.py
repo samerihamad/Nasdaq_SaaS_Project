@@ -1,6 +1,5 @@
 import sqlite3
-
-DB_PATH = "database/trading_saas.db"
+from database.db_manager import DB_PATH
 
 
 def main():

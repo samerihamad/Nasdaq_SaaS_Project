@@ -19,8 +19,7 @@ import sqlite3
 from datetime import date, timedelta
 from cryptography.fernet import Fernet, InvalidToken
 from utils.market_hours import utc_today
-
-DB_PATH = 'database/trading_saas.db'
+from database.db_manager import DB_PATH
 
 
 # ── Encryption ────────────────────────────────────────────────────────────────

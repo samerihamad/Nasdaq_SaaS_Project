@@ -15,9 +15,10 @@ python-telegram-bot[job-queue]>=21.0
 cryptography>=41.0.0
 
 # ── Trading stack (AI model, strategies, market data) ───────────────────────
-numpy>=1.24.0
+numpy>=1.24.0,<2.0.0
 pandas>=2.0.0
 scikit-learn>=1.3.0
+torch>=2.0.0
 
 # ── Market hours & calendars ────────────────────────────────────────────────
 pytz>=2023.3

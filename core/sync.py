@@ -29,11 +29,9 @@ from core.trade_close_messages import (
     send_reconcile_tp1_hit,
     send_reconcile_tp2_final,
 )
-from database.db_manager import get_subscriber_lang
+from database.db_manager import get_subscriber_lang, DB_PATH
 from config import FINAL_SYNC_FALLBACK_ENABLED
 from utils.market_hours import utc_now
-
-DB_PATH = 'database/trading_saas.db'
 ENABLE_CLOSE_PENDING_NOTIFY = (os.getenv("ENABLE_CLOSE_PENDING_NOTIFY", "false").strip().lower() == "true")
 SYNC_RETRY_COOLDOWN_SEC = int(os.getenv("CLOSE_SYNC_RETRY_COOLDOWN_SEC", "30"))
 SYNC_MAX_ATTEMPTS = int(os.getenv("CLOSE_SYNC_MAX_ATTEMPTS", "120"))

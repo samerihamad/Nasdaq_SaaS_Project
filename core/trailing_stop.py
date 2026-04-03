@@ -14,10 +14,10 @@ import pandas as pd
 import numpy as np
 import sqlite3
 from utils.market_scanner import scan_market
+from database.db_manager import DB_PATH
 
 ATR_PERIOD     = 14
 ATR_MULTIPLIER = 2.0
-DB_PATH        = 'database/trading_saas.db'
 
 
 # ── ATR calculation ───────────────────────────────────────────────────────────

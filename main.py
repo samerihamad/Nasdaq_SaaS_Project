@@ -60,6 +60,7 @@ from bot.i18n import t
 from database.db_manager import set_trading_enabled
 from database.db_manager import touch_engine_activity, touch_signal_delivered
 from database.db_manager import get_user_signal_profile
+from database.db_manager import DB_PATH
 from config import (
     MIN_CONFIDENCE,
     SIGNAL_MIN_CONFIDENCE,
@@ -287,7 +288,7 @@ def _log_structural_rejection(symbol: str, strategy: str, reason: str, notified:
     )
     # Keep structural rejections auditable in DB without Telegram noise.
     try:
-        conn = sqlite3.connect("database/trading_saas.db")
+        conn = sqlite3.connect(DB_PATH)
         conn.execute(
             "INSERT INTO trade_rejections (created_at, chat_id, symbol, action, stage, reason, details) "
             "VALUES (datetime('now'), ?, ?, ?, ?, ?, ?)",
@@ -415,7 +416,7 @@ def _hybrid_approval_loop():
     """
     while True:
         try:
-            db_path = 'database/trading_saas.db'
+            db_path = DB_PATH
 
             # ── Execute approved signals ──────────────────────────────────────
             conn = sqlite3.connect(db_path)
@@ -687,7 +688,7 @@ def _start_background_threads():
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _get_user_lang(chat_id: str) -> str:
-    conn = sqlite3.connect('database/trading_saas.db')
+    conn = sqlite3.connect(DB_PATH)
     c    = conn.cursor()
     c.execute("SELECT lang FROM subscribers WHERE chat_id=?", (chat_id,))
     row  = c.fetchone()
@@ -696,7 +697,7 @@ def _get_user_lang(chat_id: str) -> str:
 
 
 def _get_user_mode(chat_id: str) -> str:
-    conn = sqlite3.connect('database/trading_saas.db')
+    conn = sqlite3.connect(DB_PATH)
     c    = conn.cursor()
     c.execute("SELECT mode FROM subscribers WHERE chat_id=?", (chat_id,))
     row  = c.fetchone()
@@ -779,7 +780,7 @@ def _passes_profile_gate(
 
 def _is_license_valid_for_user(chat_id: str) -> bool:
     """Lightweight license check for engine auto-enable decisions."""
-    conn = sqlite3.connect('database/trading_saas.db')
+    conn = sqlite3.connect(DB_PATH)
     c    = conn.cursor()
     c.execute(
         "SELECT payment_status, expiry_date FROM subscribers WHERE chat_id=?",

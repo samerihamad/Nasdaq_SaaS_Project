@@ -34,10 +34,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from utils.autonomous_training import load_autonomous_training_status
 from utils.market_hours import utc_today
+from database.db_manager import DB_PATH
 
 load_dotenv()
-
-DB_PATH        = "database/trading_saas.db"
 ADMIN_API_KEY  = os.getenv("ADMIN_API_SECRET", "")
 LOG_ROOT       = os.getenv("ENGINE_LOG_ROOT", "logs")
 

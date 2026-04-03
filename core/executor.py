@@ -24,7 +24,13 @@ from config import (
     EXECUTION_REJECTION_NOTIFY_COOLDOWN_SEC,
 )
 from utils.market_scanner import scan_multi_timeframe
-from database.db_manager import is_maintenance_mode, get_subscriber_lang, get_user_signal_profile, touch_signal_delivered
+from database.db_manager import (
+    DB_PATH,
+    is_maintenance_mode,
+    get_subscriber_lang,
+    get_user_signal_profile,
+    touch_signal_delivered,
+)
 from core.risk_manager import (
     can_open_trade,
     calculate_position_size, STATE_MANUAL_OVERRIDE,
@@ -51,7 +57,6 @@ from utils.market_hours import synchronized_utc_now, sync_utc_with_ntp
 _EPIC_CACHE = {}
 _SESSION_CACHE = {}
 SESSION_TTL_SECONDS = 45
-DB_PATH = 'database/trading_saas.db'
 LOG_ROOT = os.getenv("ENGINE_LOG_ROOT", "logs")
 _REJECTION_NOTIFY_CACHE: dict[str, float] = {}
 
@@ -108,7 +113,7 @@ def _log_trade_rejection(chat_id, symbol, action, stage: str, reason: str, detai
     Persist expected rejections for audit without spamming Telegram.
     """
     try:
-        conn = sqlite3.connect('database/trading_saas.db')
+        conn = sqlite3.connect(DB_PATH)
         conn.execute(
             "INSERT INTO trade_rejections (created_at, chat_id, symbol, action, stage, reason, details) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -587,7 +592,7 @@ def process_pending_limit_orders():
 
 def get_user_credentials(chat_id):
     """Fetch and decrypt user credentials from DB."""
-    conn = sqlite3.connect('database/trading_saas.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
         "SELECT api_key, api_password, is_demo, email FROM subscribers WHERE chat_id=?",

@@ -20,8 +20,8 @@ import traceback
 from bot.notifier import send_telegram_message
 from bot.licensing import safe_decrypt
 from core.trailing_stop import record_open_trade
+from database.db_manager import DB_PATH
 
-DB_PATH       = 'database/trading_saas.db'
 ADMIN_CHAT_ID = os.getenv('ADMIN_CHAT_ID', '')
 
 

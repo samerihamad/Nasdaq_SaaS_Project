@@ -33,6 +33,7 @@ from config import (
     GOLD_SL_RELAX_MULTIPLIER,
 )
 from database.db_manager import (
+    DB_PATH,
     is_master_kill_switch, get_user_kill_switch, get_user_risk_params,
     get_preferred_leverage, set_trading_enabled, get_user_signal_profile,
 )
@@ -44,7 +45,6 @@ STATE_HARD_BLOCK      = 'HARD_BLOCK'
 STATE_USER_DAY_HALT   = 'USER_DAY_HALT'
 
 CONSECUTIVE_LOSS_LIMIT = 2
-DB_PATH = 'database/trading_saas.db'
 
 # Risk scaling: confidence 70% → 1.0% risk, 100% → 2.0% risk  (hard cap at 2%)
 MIN_CONF, MAX_CONF = 70.0, 100.0

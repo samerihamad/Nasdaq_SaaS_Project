@@ -1,8 +1,12 @@
+import os
 import sqlite3
 from datetime import date, timedelta
 from utils.market_hours import utc_today
 
-DB_PATH = 'database/trading_saas.db'
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Use an absolute DB path so it works regardless of the current working directory
+# (Windows vs Linux, and folder naming differences).
+DB_PATH = os.path.join(BASE_DIR, 'database', 'trading_saas.db')
 
 _SUBSCRIBERS_CANONICAL_COLUMNS = [
     # identity

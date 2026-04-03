@@ -15,8 +15,7 @@ from __future__ import annotations
 import sqlite3
 
 from core.risk_manager import record_trade_result
-
-DB_PATH = "database/trading_saas.db"
+from database.db_manager import DB_PATH
 
 
 def after_trade_leg_closed(

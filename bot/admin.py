@@ -28,6 +28,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from database.db_manager import (
+    DB_PATH,
     is_maintenance_mode, set_maintenance_mode,
     is_master_kill_switch, set_master_kill_switch,
     get_user_kill_switch, set_user_kill_switch,
@@ -58,7 +59,6 @@ from config import (
 )
 
 ADMIN_CHAT_ID = os.getenv('ADMIN_CHAT_ID', '')
-DB_PATH       = 'database/trading_saas.db'
 LOG_ROOT      = os.getenv("ENGINE_LOG_ROOT", "logs")
 
 

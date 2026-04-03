@@ -9,9 +9,7 @@ import sqlite3
 from typing import Any
 
 from bot.notifier import send_telegram_message
-from database.db_manager import get_subscriber_lang
-
-DB_PATH = "database/trading_saas.db"
+from database.db_manager import DB_PATH, get_subscriber_lang
 
 
 def _emergency_refresh_final_close(

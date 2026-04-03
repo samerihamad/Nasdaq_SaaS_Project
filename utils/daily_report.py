@@ -16,8 +16,7 @@ from collections import defaultdict
 
 from bot.notifier import send_telegram_message
 from utils.market_hours import utc_today
-
-DB_PATH = 'database/trading_saas.db'
+from database.db_manager import DB_PATH
 
 
 # ── Bilingual report strings ──────────────────────────────────────────────────
