@@ -1,10 +1,11 @@
 """
 Capital.com OHLCV via aiohttp. Watchlist Level 2 gap filter calls `scan_market_async`
-with a shared session and `CAPITAL_HTTP_CONCURRENCY` (see utils.filters.level2_filter_async).
+with a shared session and `CAPITAL_HTTP_CONCURRENCY` (max 5; see utils.filters.level2_filter_async).
 """
 import os
 import time
 import asyncio
+import threading
 from datetime import datetime, timezone
 
 import aiohttp
@@ -31,7 +32,12 @@ _SESSION_TTL_SEC = int(os.getenv("MARKET_DATA_SESSION_TTL_SEC", "45"))
 _LOG_ROOT = os.getenv("ENGINE_LOG_ROOT", "logs")
 _CAPITAL_PRICES_MAX_BARS_CAP = int(os.getenv("CAPITAL_PRICES_MAX_BARS_CAP", "1000"))
 _DAILY_PRICES_MAX = min(1000, max(50, _CAPITAL_PRICES_MAX_BARS_CAP))
-CAPITAL_HTTP_CONCURRENCY = max(1, int(os.getenv("CAPITAL_HTTP_CONCURRENCY", "3")))
+# Hard cap 5 concurrent Capital.com HTTP calls (proven safe for this platform).
+CAPITAL_HTTP_CONCURRENCY = max(1, min(5, int(os.getenv("CAPITAL_HTTP_CONCURRENCY", "5"))))
+# After this many successful Capital.com responses, pause 1s ("breathing") to reduce throttling.
+_CAPITAL_SUCCESS_BREATH_EVERY = 20
+_CAPITAL_SUCCESS_COUNT = 0
+_CAPITAL_SUCCESS_LOCK = threading.Lock()
 # Pause between per-ticker Capital calls in bulk filters (Level 2/3) to reduce HTTP 429.
 BULK_TICKER_REQUEST_SLEEP_SEC = float(os.getenv("BULK_TICKER_REQUEST_SLEEP_SEC", "0.1"))
 # Hard cap per HTTP request during bulk NASDAQ filters (Level 2/3) so one slow call cannot stall the batch.
@@ -76,6 +82,18 @@ CAPITAL_CLIENT_TIMEOUT = _AIO_TIMEOUT
 
 def _new_http_semaphore() -> asyncio.Semaphore:
     return asyncio.Semaphore(CAPITAL_HTTP_CONCURRENCY)
+
+
+async def _after_capital_success() -> None:
+    """Every N successful Capital.com HTTP responses, sleep 1s to let the API connection breathe."""
+    global _CAPITAL_SUCCESS_COUNT
+    do_breathe = False
+    with _CAPITAL_SUCCESS_LOCK:
+        _CAPITAL_SUCCESS_COUNT += 1
+        if _CAPITAL_SUCCESS_COUNT % _CAPITAL_SUCCESS_BREATH_EVERY == 0:
+            do_breathe = True
+    if do_breathe:
+        await asyncio.sleep(1.0)
 
 
 async def sleep_between_bulk_tickers() -> None:
@@ -190,14 +208,15 @@ async def _aio_get(
                             data = await resp.json()
                         except Exception:
                             data = None
+                        await _after_capital_success()
                         return status, data
                     if status == 429 and attempt < max_attempts - 1:
-                        sleep_s = min(3.0, 0.4 + attempt * 0.35)
                         print(
-                            f"[API] Rate limit hit. Sleeping for {sleep_s:.2f} seconds.",
+                            "[API] HTTP 429 Too Many Requests (Capital.com GET) — "
+                            "rate limited; cooling down 20.0s before retry.",
                             flush=True,
                         )
-                        await asyncio.sleep(sleep_s)
+                        await asyncio.sleep(20.0)
                         continue
                     if attempt == 0:
                         await asyncio.sleep(0.12)
@@ -220,7 +239,8 @@ async def _aio_post_json(
     json_body: dict,
 ) -> tuple[int, CIMultiDictProxy | dict, dict | None]:
     """POST JSON; returns (status, response_headers, body or None)."""
-    for attempt in range(2):
+    max_attempts = 5
+    for attempt in range(max_attempts):
         async with sem:
             try:
                 async with session.post(
@@ -233,6 +253,17 @@ async def _aio_post_json(
                         data = await resp.json() if status == 200 else None
                     except Exception:
                         data = None
+                    if status == 200:
+                        await _after_capital_success()
+                        return status, resp.headers, data
+                    if status == 429 and attempt < max_attempts - 1:
+                        print(
+                            "[API] HTTP 429 Too Many Requests (Capital.com POST) — "
+                            "rate limited; cooling down 20.0s before retry.",
+                            flush=True,
+                        )
+                        await asyncio.sleep(20.0)
+                        continue
                     return status, resp.headers, data
             except Exception:
                 if attempt == 0:
