@@ -40,8 +40,11 @@ from database.db_manager import DB_PATH
 from utils.market_scanner import (
     scan_multi_timeframe,
     scan_multi_timeframe_async,
+    chunked_parallel_gather,
     CAPITAL_CLIENT_TIMEOUT,
     CAPITAL_HTTP_CONCURRENCY,
+    CHUNKED_SCAN_BATCH_SIZE,
+    CHUNKED_SCAN_INTER_BATCH_SLEEP_SEC,
 )
 from utils.ai_model         import analyze_multi_timeframe
 
@@ -566,8 +569,9 @@ async def scan_watchlist_parallel_async(
     max_workers: int = 8,
 ) -> list[dict[str, Any]]:
     """
-    Async batch scan: one aiohttp session, global semaphore (default 3 concurrent Capital requests).
-    Processes symbols in groups of three for clean progress logs.
+    Async batch scan: one aiohttp session, bounded Capital HTTP concurrency.
+    Symbols run in chunks of CHUNKED_SCAN_BATCH_SIZE (default 5) via chunked_parallel_gather
+    in utils.market_scanner — gather only per chunk, micro-pause between chunks.
     """
     del max_workers  # retained for API compatibility; concurrency is HTTP-only
 
@@ -577,25 +581,29 @@ async def scan_watchlist_parallel_async(
 
     results: list[dict[str, Any]] = []
     sem = asyncio.Semaphore(CAPITAL_HTTP_CONCURRENCY)
-    n_batches = (len(wl) + 2) // 3
 
     async with aiohttp.ClientSession(timeout=CAPITAL_CLIENT_TIMEOUT) as session:
-        for bi in range(0, len(wl), 3):
-            batch = wl[bi : bi + 3]
-            bnum = bi // 3 + 1
-            print(
-                f"[SCAN BATCH] {bnum}/{n_batches} tickers={batch} "
-                f"(Capital HTTP concurrency≤{CAPITAL_HTTP_CONCURRENCY})",
-                flush=True,
-            )
-            tasks = [_analyze_one_async(session, sem, sym, float(min_confidence)) for sym in batch]
-            rows = await asyncio.gather(*tasks, return_exceptions=True)
-            for sym, row in zip(batch, rows):
-                if isinstance(row, Exception):
-                    log.warning("[%s] analyze error: %s", sym, row)
-                    continue
-                if row:
-                    results.append(row)
+
+        def _task_factory(sym: str):
+            async def _run():
+                return await _analyze_one_async(session, sem, sym, float(min_confidence))
+
+            return _run
+
+        factories = [_task_factory(s) for s in wl]
+        rows = await chunked_parallel_gather(
+            factories,
+            chunk_labels=wl,
+            chunk_size=CHUNKED_SCAN_BATCH_SIZE,
+            inter_chunk_sleep_sec=CHUNKED_SCAN_INTER_BATCH_SLEEP_SEC,
+            return_exceptions=True,
+        )
+        for sym, row in zip(wl, rows):
+            if isinstance(row, Exception):
+                log.warning("[%s] analyze error: %s", sym, row)
+                continue
+            if row:
+                results.append(row)
     return results
 
 

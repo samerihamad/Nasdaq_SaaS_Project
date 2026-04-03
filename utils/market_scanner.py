@@ -1,12 +1,18 @@
 """
 Capital.com OHLCV via aiohttp. Watchlist Level 2 gap filter calls `scan_market_async`
 with a shared session and `CAPITAL_HTTP_CONCURRENCY` (max 5; see utils.filters.level2_filter_async).
+
+Multi-symbol watchlist scans use `chunked_parallel_gather` (default batch 5, 200ms pause
+between batches) so `asyncio.gather` is never applied to the full symbol list at once.
+Per-request 429 handling remains in `_aio_get` / `_aio_post_json`.
 """
 import os
 import time
 import asyncio
 import threading
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime, timezone
+from typing import Any
 
 import aiohttp
 from multidict import CIMultiDictProxy
@@ -48,6 +54,9 @@ BULK_GAP_ONE_TIMEOUT_SEC = float(os.getenv("BULK_GAP_ONE_TIMEOUT_SEC", "8.0"))
 # Level 2/3: parallel batch size + pause between batches (anti-429).
 BULK_PARALLEL_BATCH_SIZE = max(1, int(os.getenv("BULK_PARALLEL_BATCH_SIZE", "5")))
 BULK_BATCH_GAP_SLEEP_SEC = float(os.getenv("BULK_BATCH_GAP_SLEEP_SEC", "0.5"))
+# Watchlist / multi-symbol scans: strict chunk size for asyncio.gather; micro-pause between chunks (anti-burst).
+CHUNKED_SCAN_BATCH_SIZE = max(1, min(5, int(os.getenv("CHUNKED_SCAN_BATCH_SIZE", "5"))))
+CHUNKED_SCAN_INTER_BATCH_SLEEP_SEC = float(os.getenv("CHUNKED_SCAN_INTER_BATCH_SLEEP_SEC", "0.2"))
 
 _SESSION_CACHE: dict[str, dict] = {}
 _EPIC_CACHE: dict[str, str] = {}
@@ -110,6 +119,62 @@ def clear_local_price_caches() -> None:
     _SESSION_CACHE.clear()
     _EPIC_CACHE.clear()
     _UNSUPPORTED_CACHE.clear()
+
+
+async def chunked_parallel_gather(
+    task_factories: Sequence[Callable[[], Awaitable[Any]]],
+    *,
+    chunk_size: int | None = None,
+    inter_chunk_sleep_sec: float | None = None,
+    return_exceptions: bool = True,
+    chunk_labels: Sequence[str] | None = None,
+    log_prefix: str = "[SCAN CHUNK]",
+) -> list[Any]:
+    """
+    Run awaitable factories in strict batches: only ``asyncio.gather`` within each batch
+    (never on the full symbol list). After each batch completes, ``await asyncio.sleep``
+    for *inter_chunk_sleep_sec* so the broker does not see a single large burst.
+
+    Per-request HTTP 429 handling (e.g. 20s cooldown) remains in ``_aio_get`` / ``_aio_post_json``.
+    """
+    cs = CHUNKED_SCAN_BATCH_SIZE if chunk_size is None else max(1, int(chunk_size))
+    pause = (
+        CHUNKED_SCAN_INTER_BATCH_SLEEP_SEC
+        if inter_chunk_sleep_sec is None
+        else float(inter_chunk_sleep_sec)
+    )
+    factories = list(task_factories)
+    n = len(factories)
+    if n == 0:
+        return []
+    labels = list(chunk_labels) if chunk_labels is not None else None
+    if labels is not None and len(labels) != n:
+        labels = None
+
+    out: list[Any] = []
+    total_chunks = (n + cs - 1) // cs
+    chunk_num = 0
+    lo = 0
+    while lo < n:
+        hi = min(lo + cs, n)
+        chunk_num += 1
+        batch = factories[lo:hi]
+        if log_prefix:
+            extra = ""
+            if labels is not None:
+                extra = f" tickers={labels[lo:hi]}"
+            print(
+                f"{log_prefix} {chunk_num}/{total_chunks}{extra} "
+                f"(batch={hi - lo}, gather≤{cs})",
+                flush=True,
+            )
+        tasks = [f() for f in batch]
+        part = await asyncio.gather(*tasks, return_exceptions=return_exceptions)
+        out.extend(part)
+        lo = hi
+        if lo < n:
+            await asyncio.sleep(pause)
+    return out
 
 
 def _max_bar_attempts(base_max: int) -> list[int]:
