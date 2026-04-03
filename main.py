@@ -18,7 +18,7 @@ import time
 import sqlite3
 import threading
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timezone, time as dt_time
 from collections import Counter
 from typing import Optional
 
@@ -165,6 +165,15 @@ _zero_hour_event = threading.Event()
 _triple_tz_threads_started = False
 # Background hourly watchlist refresh (does not block watcher / signal scans).
 _hourly_refresh_thread: Optional[threading.Thread] = None
+
+
+def _in_premarket_utc_preparation_window(now_utc: datetime) -> bool:
+    """True if now_utc falls in [12:40, 13:30) UTC (scan + premarket alert window)."""
+    try:
+        u = now_utc.astimezone(timezone.utc).time()
+    except Exception:
+        u = synchronized_utc_now().astimezone(timezone.utc).time()
+    return dt_time(12, 40, 0) <= u < dt_time(13, 30, 0)
 
 
 def _is_market_hours_utc(now_utc: datetime) -> bool:
@@ -1036,8 +1045,7 @@ def _zero_hour_thread() -> None:
 def _start_triple_tz_scheduler_threads() -> None:
     if not _TRIPLE_TZ_SCHED_ENABLED:
         return
-    threading.Thread(target=_daily_scan_thread, daemon=True, name="daily_scan_1240utc").start()
-    threading.Thread(target=_alpha_alert_thread, daemon=True, name="alpha_alert_1300utc").start()
+    # 12:40 UTC daily scan and 13:00 UTC premarket alert run in run_trading_bot (unified main loop).
     threading.Thread(target=_zero_hour_thread, daemon=True, name="zero_hour_133001utc").start()
 
 
@@ -1532,6 +1540,27 @@ def run_trading_bot():
                     print(f"   🔍 تم استرداد {orphans} صفقة يتيمة.")
                 time.sleep(CHECK_INTERVAL)
                 continue
+
+            # ── Pre-market preparation (UTC): scan + pretrain + 13:00 alert before CLOSED branch ──
+            if _TRIPLE_TZ_SCHED_ENABLED and _in_premarket_utc_preparation_window(now_utc):
+                now_et = now_utc.astimezone(ET)
+                if _is_trading_day(now_et):
+                    if _last_scan_date != today:
+                        wl = _run_daily_scan_cached()
+                        if wl is not None:
+                            _watchlist = wl
+                            _last_scan_date = today
+                            _unsupported_all_day.clear()
+                            if _watchlist:
+                                pretrain_models(_watchlist)
+                            _last_watchlist_refresh_at = synchronized_utc_now()
+                    t_utc = now_utc.astimezone(timezone.utc).time()
+                    if (
+                        t_utc.hour == 13
+                        and t_utc.minute == 0
+                        and _premarket_sent != today
+                    ):
+                        send_premarket_alert(len(_watchlist or []))
 
             # ── Market CLOSED: notify once, run watcher for all users ─────────
             if market_status == STATUS_CLOSED:
