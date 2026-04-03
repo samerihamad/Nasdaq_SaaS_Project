@@ -408,7 +408,7 @@ def _format_manage_trade_card(card: dict, lang: str) -> str:
             f"💵 *Amount*      : *${total_amount:,.2f}*\n"
             f"🔴 *Stop*        : *{stop_s}*\n"
             f"🎯 *TP1*         : *${tp1:,.2f}*  (+1.00%)\n"
-            f"🏆 *TP2*         : *${tp2:,.2f}*  (+1.50%)\n"
+            f"🏆 *TP2*         : *${tp2:,.2f}*  (+2.50%)\n"
         )
     return (
         f"📋 *صفقة #{card['trade_id']} — {symbol}*\n"
@@ -418,7 +418,7 @@ def _format_manage_trade_card(card: dict, lang: str) -> str:
         f"💵 *إجمالي المبلغ*: *${total_amount:,.2f}*\n"
         f"🔴 *وقف الخسارة*  : *{stop_s}*\n"
         f"🎯 *الهدف 1*      : *${tp1:,.2f}*  (+1.00%)\n"
-        f"🏆 *الهدف 2*      : *${tp2:,.2f}*  (+1.50%)\n"
+        f"🏆 *الهدف 2*      : *${tp2:,.2f}*  (+2.50%)\n"
     )
 
 

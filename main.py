@@ -34,6 +34,7 @@ from utils.ai_model import (
 from utils.autonomous_training import AutonomousTrainingManager
 from utils.market_hours import (
     get_market_status,
+    is_market_open,
     minutes_to_open,
     STATUS_OPEN,
     STATUS_CLOSED,
@@ -45,6 +46,7 @@ from utils.market_hours import (
     sync_utc_with_ntp,
     next_utc_occurrence,
     seconds_until_utc,
+    _is_trading_day,
 )
 from utils.daily_report import send_daily_reports
 from core.executor import place_trade_for_user, monitor_and_close, process_pending_limit_orders
@@ -81,7 +83,6 @@ from config import (
     HEARTBEAT_INTERVAL,
     BACKUP_INTERVAL,
     HEARTBEAT_FILE,
-    PREMARKET_ALERT_WINDOW_MIN,
     WATCHLIST_REFRESH_SECONDS,
     AI_MIN_PROB_RF,
     AI_MIN_PROB_MOMENTUM,
@@ -592,6 +593,9 @@ def _market_open_alert_loop():
                 and 30 <= now_ny.minute <= 35
             )
             if is_open_window and _market_open_last_alert_date != ny_date:
+                if not (is_market_open() or _is_trading_day(now_ny)):
+                    time.sleep(30)
+                    continue
                 tz_map = get_current_timezones(now_utc)
                 snapshot = _compute_open_snapshot(now_utc)
                 ny_clock = now_ny.strftime("%Y-%m-%d %H:%M:%S ET")
@@ -921,6 +925,10 @@ def send_premarket_alert(watchlist_count: int, *, extra_note: str | None = None)
     """Broadcast pre-market alert to all active subscribers (per-user language)."""
     global _premarket_sent
     from core.watcher import get_all_active_subscribers
+
+    now_et = synchronized_utc_now().astimezone(ET)
+    if not (is_market_open() or _is_trading_day(now_et)):
+        return
 
     for row in get_all_active_subscribers():
         chat_id = str(row[0])
@@ -1524,48 +1532,6 @@ def run_trading_bot():
                     print(f"   🔍 تم استرداد {orphans} صفقة يتيمة.")
                 time.sleep(CHECK_INTERVAL)
                 continue
-
-            # ── Pre-open prep/alerts (works in CLOSED and PRE_MARKET) ─────────
-            if market_status != STATUS_OPEN:
-                mins = minutes_to_open()
-
-                # Build watchlist before open (once daily) so pre-market alert
-                # has a real count and models are warm.
-                if (not _TRIPLE_TZ_SCHED_ENABLED) and (_last_scan_date != today
-                        and 0 < mins <= PREMARKET_ALERT_WINDOW_MIN):
-                    wl = _run_daily_scan_cached()
-                    if wl is not None:
-                        _watchlist = wl
-                        _last_scan_date = today
-                        _unsupported_all_day.clear()
-                        if _watchlist:
-                            pretrain_models(_watchlist)
-
-                # If scan failed earlier and we are still inside alert window,
-                # one lazy retry allows alert dispatch in PRE_MARKET as well.
-                if (not _TRIPLE_TZ_SCHED_ENABLED) and (_premarket_sent != today
-                        and 0 < mins <= PREMARKET_ALERT_WINDOW_MIN
-                        and not _watchlist
-                        and _last_scan_date != today):
-                    wl = _run_daily_scan_cached()
-                    if wl is not None:
-                        _watchlist = wl
-                        _last_scan_date = today
-                        if _watchlist:
-                            pretrain_models(_watchlist)
-
-                # DST-safe pre-market alert window.
-                # Ensure the alert is dispatched once even if Level3 produced
-                # an empty watchlist (we fill in run_daily_scan()).
-                if (not _TRIPLE_TZ_SCHED_ENABLED) and (_premarket_sent != today
-                        and 0 < mins <= PREMARKET_ALERT_WINDOW_MIN
-                        and (_watchlist or _last_scan_date == today)):
-                    if not _watchlist:
-                        # Last-resort: build a watchlist right before sending.
-                        wl = _run_daily_scan_cached()
-                        if wl is not None:
-                            _watchlist = wl
-                    send_premarket_alert(len(_watchlist))
 
             # ── Market CLOSED: notify once, run watcher for all users ─────────
             if market_status == STATUS_CLOSED:
