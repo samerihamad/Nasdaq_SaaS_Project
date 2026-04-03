@@ -2,7 +2,7 @@
 Capital.com OHLCV via aiohttp. Watchlist Level 2 gap filter calls `scan_market_async`
 with a shared session and `CAPITAL_HTTP_CONCURRENCY` (max 5; see utils.filters.level2_filter_async).
 
-Multi-symbol watchlist scans use `chunked_parallel_gather` (default batch 5, 200ms pause
+Multi-symbol watchlist scans use `chunked_parallel_gather` (default batch 3, 200ms pause
 between batches) so `asyncio.gather` is never applied to the full symbol list at once.
 Per-request 429 handling remains in `_aio_get` / `_aio_post_json`.
 """
@@ -55,7 +55,7 @@ BULK_GAP_ONE_TIMEOUT_SEC = float(os.getenv("BULK_GAP_ONE_TIMEOUT_SEC", "8.0"))
 BULK_PARALLEL_BATCH_SIZE = max(1, int(os.getenv("BULK_PARALLEL_BATCH_SIZE", "5")))
 BULK_BATCH_GAP_SLEEP_SEC = float(os.getenv("BULK_BATCH_GAP_SLEEP_SEC", "0.5"))
 # Watchlist / multi-symbol scans: strict chunk size for asyncio.gather; micro-pause between chunks (anti-burst).
-CHUNKED_SCAN_BATCH_SIZE = max(1, min(5, int(os.getenv("CHUNKED_SCAN_BATCH_SIZE", "5"))))
+CHUNKED_SCAN_BATCH_SIZE = max(1, min(3, int(os.getenv("CHUNKED_SCAN_BATCH_SIZE", "3"))))
 CHUNKED_SCAN_INTER_BATCH_SLEEP_SEC = float(os.getenv("CHUNKED_SCAN_INTER_BATCH_SLEEP_SEC", "0.2"))
 
 _SESSION_CACHE: dict[str, dict] = {}
