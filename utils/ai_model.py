@@ -3,20 +3,21 @@ AI Model — NATB v2.0
 
 Role: GATEKEEPER, not observer.
 
-Architecture:
-  1. Technical strategies (MeanRev, Momentum, RF) generate a candidate signal.
-  2. validate_signal() scores that specific direction using the RF model.
-     If probability < AI_PROBABILITY_THRESHOLD (65%), the trade is BLOCKED.
-  3. detect_regime() classifies market context (TRENDING / RANGING / VOLATILE).
-     A VOLATILE regime applies a probability penalty.
-  4. analyze_multi_timeframe() supports optional deep inference fallback chain:
-     Deep -> RF -> rule-based (RF path remains default).
+Architecture (three logical layers):
+  1. Feature engineering — build_features() and indicator helpers.
+  2. Inference — RF / rule-based direction probabilities per timeframe.
+  3. Post-processing — regime detection, weighted blend, MS integration,
+     volatility penalty, threshold gate.
 
-Key public API:
-  validate_signal(symbol, direction, timeframes) -> (approved, probability, regime)
-  detect_regime(df)                              -> dict
-  analyze_multi_timeframe(timeframes, symbol)    -> (action, confidence, reason)
-  load_or_train_model(symbol, timeframe)         -> (model, scaler)
+Primary contract:
+  evaluate_symbol(symbol, timeframe_data) -> dict
+    Keys: ai_score, direction, confidence, regime, is_approved
+    (timeframe_data must include OHLCV keys '1d','4h','15m' and 'direction' BUY|SELL.)
+
+validate_signal() remains the compatibility entry for executor/main:
+  it delegates to evaluate_symbol() and returns (approved, probability, regime).
+
+analyze_multi_timeframe() — optional multi-TF signal generator (unchanged contract).
 
 MODEL_VERSION is embedded in saved .pkl files. A version mismatch triggers
 automatic retraining so stale models with different feature sets never silently
@@ -24,6 +25,7 @@ produce wrong scores.
 """
 
 import os
+import json
 import pickle
 import logging
 from datetime import datetime, timedelta, timezone
@@ -65,6 +67,13 @@ LABEL_BUY  =  1
 LABEL_SELL = -1
 LABEL_HOLD =  0
 
+# Per-timeframe weights for gatekeeper probability blend (unchanged).
+_GATEKEEPER_TF_WEIGHTS = {"1d": 0.20, "4h": 0.35, "15m": 0.45}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ZONE 1 — FEATURE ENGINEERING LAYER
+# ═══════════════════════════════════════════════════════════════════════════════
 
 # ── Indicator helpers ─────────────────────────────────────────────────────────
 
@@ -259,6 +268,10 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     return features
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# ZONE 2 — MODEL PERSISTENCE, TRAINING & INFERENCE PRIMITIVES
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def _make_labels(df: pd.DataFrame) -> pd.Series:
     """Label each bar BUY / SELL / HOLD based on future price movement."""
     close         = _col_series(df, 'Close')
@@ -383,6 +396,10 @@ def load_or_train_model(symbol: str, timeframe: str = "1d"):
     return model, scaler
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# ZONE 3 — REGIME, POST-PROCESSING & AI CONTRACT (evaluate_symbol / validate_signal)
+# ═══════════════════════════════════════════════════════════════════════════════
+
 # ── Regime detection ──────────────────────────────────────────────────────────
 
 def detect_regime(df: pd.DataFrame) -> dict:
@@ -431,98 +448,7 @@ def detect_regime(df: pd.DataFrame) -> dict:
     }
 
 
-# ── Core gatekeeper ───────────────────────────────────────────────────────────
-
-def validate_signal(
-    symbol: str,
-    direction: str,
-    timeframes: dict,
-    *,
-    min_probability: float | None = None,
-    ms_score: float | None = None,
-) -> tuple:
-    """
-    AI Gatekeeper — the single mandatory checkpoint before every trade.
-
-    Scores the PROPOSED direction (not generating its own) using the RF model.
-    Applies a volatility penalty in VOLATILE regime.
-
-    Parameters
-    ----------
-    symbol     : ticker string
-    direction  : 'BUY' or 'SELL'
-    timeframes : dict with '1d', '4h', '15m' DataFrames
-
-    Returns
-    -------
-    (approved: bool, probability: float, regime: str)
-      approved is True ONLY if probability >= AI_PROBABILITY_THRESHOLD.
-    """
-    df_15m = timeframes.get("15m")
-    df_4h = timeframes.get("4h")
-    df_1d = timeframes.get("1d")
-
-    if not any(df is not None and not df.empty for df in (df_15m, df_4h, df_1d)):
-        log.warning("[AI Gate %s] No data for validation — blocking", symbol)
-        return False, 0.0, 'UNKNOWN'
-
-    # Regime from fastest available timeframe.
-    regime_df = df_15m if (df_15m is not None and not df_15m.empty) else (df_4h if (df_4h is not None and not df_4h.empty) else df_1d)
-    regime = detect_regime(_flatten(regime_df))
-
-    # Probability blend by timeframe model to match strategy inputs.
-    probs: dict[str, float] = {}
-    weights = {"1d": 0.20, "4h": 0.35, "15m": 0.45}
-    for tf, df in (("1d", df_1d), ("4h", df_4h), ("15m", df_15m)):
-        if df is None or df.empty:
-            continue
-        frame = _flatten(df)
-        model, scaler = load_or_train_model(symbol, timeframe=tf)
-        if model and scaler:
-            probs[tf] = _direction_probability(frame, model, scaler, direction)
-        else:
-            probs[tf] = _rule_based_probability(frame, direction)
-
-    if not probs:
-        return False, 0.0, regime["type"]
-
-    weight_sum = sum(weights[tf] for tf in probs.keys())
-    probability = sum(probs[tf] * weights[tf] for tf in probs.keys()) / max(weight_sum, 1e-9)
-    probability = round(float(probability), 1)
-
-    # Optional market-structure context adjustment (soft, bounded).
-    if ENABLE_MS_SCORE_AI_INTEGRATION and ms_score is not None:
-        try:
-            ms_val = float(ms_score)
-            if np.isfinite(ms_val):
-                delta = (ms_val - float(MS_SCORE_AI_NEUTRAL)) * float(MS_SCORE_AI_SCALE)
-                cap = abs(float(MS_SCORE_AI_MAX_IMPACT))
-                delta = max(-cap, min(cap, delta))
-                probability = probability + delta
-        except Exception:
-            pass
-
-    # Regime penalty: high volatility = uncertain environment
-    if regime['type'] == 'VOLATILE':
-        probability = round(probability * 0.90, 1)   # reduced penalty in volatile regimes
-        log.info(
-            "[AI Gate %s] VOLATILE regime penalty applied → probability=%.1f%%",
-            symbol, probability,
-        )
-    else:
-        probability = round(float(probability), 1)
-
-    min_prob = AI_PROBABILITY_THRESHOLD if min_probability is None else float(min_probability)
-    approved = probability >= min_prob
-
-    log.info(
-        "[AI Gate %s] direction=%s | probability=%.1f%% | regime=%s | %s",
-        symbol, direction, probability, regime['type'],
-        "APPROVED" if approved else "BLOCKED",
-    )
-
-    return approved, probability, regime['type']
-
+# ── Inference: direction-specific probabilities (RF or rule fallback) ───────────
 
 def _direction_probability(df: pd.DataFrame, model, scaler, direction: str) -> float:
     """
@@ -578,6 +504,209 @@ def _rule_based_probability(df: pd.DataFrame, direction: str) -> float:
 
     except Exception:
         return 0.0
+
+
+def _log_ai_audit_strong_signal(
+    symbol: str,
+    direction: str,
+    regime: dict,
+    df_1d: pd.DataFrame | None,
+    df_4h: pd.DataFrame | None,
+    df_15m: pd.DataFrame | None,
+    probs: dict[str, float],
+    probability: float,
+    effective_min: float,
+) -> None:
+    """
+    Structured audit log when blended probability meets the effective gate threshold.
+    Suitable for later export as a re-training dataset (features + model outputs).
+    """
+    if probability < effective_min:
+        return
+    snapshot: dict[str, dict] = {}
+    for tf_key, df in (("1d", df_1d), ("4h", df_4h), ("15m", df_15m)):
+        if df is None or df.empty:
+            snapshot[tf_key] = {}
+            continue
+        feat = build_features(_flatten(df)).dropna()
+        if feat.empty:
+            snapshot[tf_key] = {}
+            continue
+        row = feat.iloc[-1]
+        snapshot[tf_key] = {
+            str(k): (float(row[k]) if pd.notna(row[k]) else None)
+            for k in row.index
+        }
+    payload = {
+        "event": "ai_gate_audit",
+        "model_version": MODEL_VERSION,
+        "symbol": symbol,
+        "direction": direction,
+        "features_last_bar": snapshot,
+        "model_output": {
+            "per_tf_probability_pct": {k: float(v) for k, v in probs.items()},
+            "blended_probability_pct": float(probability),
+            "regime": dict(regime),
+        },
+    }
+    try:
+        log.info("[AI_AUDIT] %s", json.dumps(payload, default=str))
+    except Exception as exc:
+        log.warning("[AI_AUDIT] serialize failed: %s", exc)
+
+
+def evaluate_symbol(
+    symbol: str,
+    timeframe_data: dict,
+    *,
+    min_probability: float | None = None,
+    ms_score: float | None = None,
+) -> dict:
+    """
+    Primary AI gate contract: blend per-timeframe scores for the proposed direction.
+
+    timeframe_data must include DataFrames under keys '1d', '4h', '15m' (any may be
+    empty) and 'direction': 'BUY' | 'SELL'.
+
+    Returns:
+        {
+            'ai_score': float,      # final blended probability (0–100)
+            'direction': str,       # proposed direction evaluated
+            'confidence': float,    # same as ai_score after post-processing
+            'regime': str,          # regime['type']
+            'is_approved': bool,    # vs AI_PROBABILITY_THRESHOLD or min_probability
+        }
+    """
+    direction = str(timeframe_data.get("direction") or "").strip().upper()
+    df_15m = timeframe_data.get("15m")
+    df_4h = timeframe_data.get("4h")
+    df_1d = timeframe_data.get("1d")
+
+    bad = {
+        "ai_score": 0.0,
+        "direction": direction or "UNKNOWN",
+        "confidence": 0.0,
+        "regime": "UNKNOWN",
+        "is_approved": False,
+    }
+
+    if direction not in ("BUY", "SELL"):
+        log.warning("[AI Gate %s] Invalid direction in timeframe_data — blocking", symbol)
+        return bad
+
+    if not any(df is not None and not df.empty for df in (df_15m, df_4h, df_1d)):
+        log.warning("[AI Gate %s] No data for validation — blocking", symbol)
+        return bad
+
+    regime_df = df_15m if (df_15m is not None and not df_15m.empty) else (
+        df_4h if (df_4h is not None and not df_4h.empty) else df_1d
+    )
+    regime = detect_regime(_flatten(regime_df))
+
+    probs: dict[str, float] = {}
+    weights = _GATEKEEPER_TF_WEIGHTS
+    for tf, df in (("1d", df_1d), ("4h", df_4h), ("15m", df_15m)):
+        if df is None or df.empty:
+            continue
+        frame = _flatten(df)
+        model, scaler = load_or_train_model(symbol, timeframe=tf)
+        if model and scaler:
+            probs[tf] = _direction_probability(frame, model, scaler, direction)
+        else:
+            probs[tf] = _rule_based_probability(frame, direction)
+
+    if not probs:
+        return {
+            "ai_score": 0.0,
+            "direction": direction,
+            "confidence": 0.0,
+            "regime": regime["type"],
+            "is_approved": False,
+        }
+
+    weight_sum = sum(weights[tf] for tf in probs.keys())
+    probability = sum(probs[tf] * weights[tf] for tf in probs.keys()) / max(weight_sum, 1e-9)
+    probability = round(float(probability), 1)
+
+    if ENABLE_MS_SCORE_AI_INTEGRATION and ms_score is not None:
+        try:
+            ms_val = float(ms_score)
+            if np.isfinite(ms_val):
+                delta = (ms_val - float(MS_SCORE_AI_NEUTRAL)) * float(MS_SCORE_AI_SCALE)
+                cap = abs(float(MS_SCORE_AI_MAX_IMPACT))
+                delta = max(-cap, min(cap, delta))
+                probability = probability + delta
+        except Exception:
+            pass
+
+    if regime["type"] == "VOLATILE":
+        probability = round(probability * 0.90, 1)
+        log.info(
+            "[AI Gate %s] VOLATILE regime penalty applied → probability=%.1f%%",
+            symbol,
+            probability,
+        )
+    else:
+        probability = round(float(probability), 1)
+
+    min_prob = AI_PROBABILITY_THRESHOLD if min_probability is None else float(min_probability)
+    approved = probability >= min_prob
+
+    log.info(
+        "[AI Gate %s] direction=%s | probability=%.1f%% | regime=%s | %s",
+        symbol,
+        direction,
+        probability,
+        regime["type"],
+        "APPROVED" if approved else "BLOCKED",
+    )
+
+    _log_ai_audit_strong_signal(
+        symbol,
+        direction,
+        regime,
+        df_1d,
+        df_4h,
+        df_15m,
+        probs,
+        probability,
+        min_prob,
+    )
+
+    return {
+        "ai_score": probability,
+        "direction": direction,
+        "confidence": probability,
+        "regime": regime["type"],
+        "is_approved": approved,
+    }
+
+
+def validate_signal(
+    symbol: str,
+    direction: str,
+    timeframes: dict,
+    *,
+    min_probability: float | None = None,
+    ms_score: float | None = None,
+) -> tuple:
+    """
+    AI Gatekeeper — compatibility wrapper for executor / main.
+
+    Delegates to evaluate_symbol(); returns (approved, probability, regime string).
+    """
+    contract = evaluate_symbol(
+        symbol,
+        {
+            "1d": timeframes.get("1d"),
+            "4h": timeframes.get("4h"),
+            "15m": timeframes.get("15m"),
+            "direction": direction,
+        },
+        min_probability=min_probability,
+        ms_score=ms_score,
+    )
+    return contract["is_approved"], contract["confidence"], contract["regime"]
 
 
 # ── Internal prediction (direction generator) ─────────────────────────────────
