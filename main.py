@@ -35,6 +35,7 @@ from utils.autonomous_training import AutonomousTrainingManager
 from utils.market_hours import (
     get_market_status,
     is_market_open,
+    is_nyse_trading_day,
     minutes_to_open,
     STATUS_OPEN,
     STATUS_CLOSED,
@@ -46,7 +47,6 @@ from utils.market_hours import (
     sync_utc_with_ntp,
     next_utc_occurrence,
     seconds_until_utc,
-    _is_trading_day,
 )
 from utils.daily_report import send_daily_reports
 from core.executor import place_trade_for_user, monitor_and_close, process_pending_limit_orders
@@ -165,6 +165,20 @@ _zero_hour_event = threading.Event()
 _triple_tz_threads_started = False
 # Background hourly watchlist refresh (does not block watcher / signal scans).
 _hourly_refresh_thread: Optional[threading.Thread] = None
+# Log [CALENDAR] sleep message at most once per UTC day when skipping Capital.com scans.
+_last_calendar_sleep_log_date = None
+
+
+def _log_calendar_sleep_mode(reason: str) -> None:
+    global _last_calendar_sleep_log_date
+    d = utc_today()
+    if _last_calendar_sleep_log_date == d:
+        return
+    _last_calendar_sleep_log_date = d
+    print(
+        f"[CALENDAR] Market is closed today ({reason}). Entering sleep mode until next session.",
+        flush=True,
+    )
 
 
 def _in_premarket_utc_preparation_window(now_utc: datetime) -> bool:
@@ -201,6 +215,11 @@ def _boot_open_gates_and_maybe_scan(now_utc: datetime) -> None:
     global _scan_in_progress
 
     if not _TRIPLE_TZ_SCHED_ENABLED:
+        return
+    now_et_boot = now_utc.astimezone(ET)
+    if not is_nyse_trading_day(now_et_boot):
+        r = "Weekend" if now_et_boot.weekday() >= 5 else "Holiday"
+        _log_calendar_sleep_mode(r)
         return
     if not _is_market_hours_utc(now_utc):
         return
@@ -602,7 +621,7 @@ def _market_open_alert_loop():
                 and 30 <= now_ny.minute <= 35
             )
             if is_open_window and _market_open_last_alert_date != ny_date:
-                if not (is_market_open() or _is_trading_day(now_ny)):
+                if not (is_market_open() or is_nyse_trading_day(now_ny)):
                     time.sleep(30)
                     continue
                 tz_map = get_current_timezones(now_utc)
@@ -843,6 +862,10 @@ def _auto_resume_trading_at_open():
 # ── Daily scan ────────────────────────────────────────────────────────────────
 
 def run_daily_scan(hourly_refresh: bool = False):
+    now_et = synchronized_utc_now().astimezone(ET)
+    if not is_nyse_trading_day(now_et):
+        return []
+
     print("=" * 55)
     print(f"🌅 المسح اليومي الشامل — {synchronized_utc_now().strftime('%Y-%m-%d %H:%M UTC')}")
 
@@ -892,8 +915,14 @@ def _run_daily_scan_cached(hourly_refresh: bool = False) -> Optional[list[str]]:
     """
     Wrapper around run_daily_scan() that maintains a cache for the 13:00 UTC alert.
     Never raises. Returns None if another scan is already running (exclusive lock).
+    Skips all Capital.com / filter work on NYSE weekends and holidays (calendar).
     """
     global _scan_in_progress, _scan_cached_watchlist_count, _scan_cached_utc
+    now_et = synchronized_utc_now().astimezone(ET)
+    if not is_nyse_trading_day(now_et):
+        r = "Weekend" if now_et.weekday() >= 5 else "Holiday"
+        _log_calendar_sleep_mode(r)
+        return None
     if not _scan_lock.acquire(blocking=False):
         print("[SCAN] Skipped: another scan is already in progress.", flush=True)
         return None
@@ -936,7 +965,7 @@ def send_premarket_alert(watchlist_count: int, *, extra_note: str | None = None)
     from core.watcher import get_all_active_subscribers
 
     now_et = synchronized_utc_now().astimezone(ET)
-    if not (is_market_open() or _is_trading_day(now_et)):
+    if not (is_market_open() or is_nyse_trading_day(now_et)):
         return
 
     for row in get_all_active_subscribers():
@@ -1542,9 +1571,10 @@ def run_trading_bot():
                 continue
 
             # ── Pre-market preparation (UTC): scan + pretrain + 13:00 alert before CLOSED branch ──
+            # Respects NYSE calendar (weekends + pandas_market_calendars holidays); no Capital.com burst on closed days.
             if _TRIPLE_TZ_SCHED_ENABLED and _in_premarket_utc_preparation_window(now_utc):
                 now_et = now_utc.astimezone(ET)
-                if _is_trading_day(now_et):
+                if is_nyse_trading_day(now_et):
                     if _last_scan_date != today:
                         wl = _run_daily_scan_cached()
                         if wl is not None:

@@ -305,6 +305,20 @@ def _is_trading_day(dt: datetime) -> bool:
         return True                # library absent → assume trading day
 
 
+def is_nyse_trading_day(now_et: datetime | None = None) -> bool:
+    """
+    True if the America/New_York calendar date is a regular Nasdaq cash session day
+    (Monday–Friday, excluding exchange holidays). Uses ``_is_trading_day``:
+    weekend filter plus ``pandas_market_calendars`` NASDAQ schedule when installed.
+    """
+    dt = _now_et() if now_et is None else now_et
+    if getattr(dt, "tzinfo", None) is None:
+        dt = ET.localize(dt)
+    else:
+        dt = dt.astimezone(ET)
+    return _is_trading_day(dt)
+
+
 def get_market_status() -> str:
     """
     Return the current Nasdaq session status.
