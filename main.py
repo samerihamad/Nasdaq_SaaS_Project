@@ -1530,6 +1530,13 @@ def run_trading_bot():
 
     while True:
         try:
+            now_utc = synchronized_utc_now()
+            now_et = now_utc.astimezone(ET)
+            if not is_nyse_trading_day(now_et):
+                print("[GLOBAL GATE] Non-trading day (weekend/holiday) — hard stop for 300s.", flush=True)
+                time.sleep(300)
+                continue
+
             # Triple-timezone scheduler: do not block Alpha alert / daily scan / zero-hour.
             # Threads are idempotent (daemon) and safe to call once per process.
             if _TRIPLE_TZ_SCHED_ENABLED:
@@ -1540,7 +1547,6 @@ def run_trading_bot():
                     # Mid-session restart safety: if we're already past zero-hour, open gates now
                     # and (if needed) kick off a boot scan immediately.
                     _boot_open_gates_and_maybe_scan(synchronized_utc_now())
-            now_utc       = synchronized_utc_now()
             today         = utc_today()
             market_status = get_market_status()
 

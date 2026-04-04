@@ -10,6 +10,7 @@ import os
 import time
 import asyncio
 import threading
+import random
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime, timezone
 from typing import Any
@@ -38,10 +39,10 @@ _SESSION_TTL_SEC = int(os.getenv("MARKET_DATA_SESSION_TTL_SEC", "45"))
 _LOG_ROOT = os.getenv("ENGINE_LOG_ROOT", "logs")
 _CAPITAL_PRICES_MAX_BARS_CAP = int(os.getenv("CAPITAL_PRICES_MAX_BARS_CAP", "1000"))
 _DAILY_PRICES_MAX = min(1000, max(50, _CAPITAL_PRICES_MAX_BARS_CAP))
-# Hard cap 5 concurrent Capital.com HTTP calls (proven safe for this platform).
-CAPITAL_HTTP_CONCURRENCY = max(1, min(5, int(os.getenv("CAPITAL_HTTP_CONCURRENCY", "5"))))
+# Hard cap 5 concurrent Capital.com HTTP calls (safe default now lowered to 2).
+CAPITAL_HTTP_CONCURRENCY = max(1, min(5, int(os.getenv("CAPITAL_HTTP_CONCURRENCY", "2"))))
 # After this many successful Capital.com responses, pause 1s ("breathing") to reduce throttling.
-_CAPITAL_SUCCESS_BREATH_EVERY = 20
+_CAPITAL_SUCCESS_BREATH_EVERY = 15
 _CAPITAL_SUCCESS_COUNT = 0
 _CAPITAL_SUCCESS_LOCK = threading.Lock()
 # Pause between per-ticker Capital calls in bulk filters (Level 2/3) to reduce HTTP 429.
@@ -55,10 +56,14 @@ BULK_GAP_ONE_TIMEOUT_SEC = float(os.getenv("BULK_GAP_ONE_TIMEOUT_SEC", "8.0"))
 BULK_PARALLEL_BATCH_SIZE = max(1, int(os.getenv("BULK_PARALLEL_BATCH_SIZE", "5")))
 BULK_BATCH_GAP_SLEEP_SEC = float(os.getenv("BULK_BATCH_GAP_SLEEP_SEC", "0.5"))
 # Watchlist / multi-symbol scans: strict chunk size for asyncio.gather; micro-pause between chunks (anti-burst).
-CHUNKED_SCAN_BATCH_SIZE = max(1, min(3, int(os.getenv("CHUNKED_SCAN_BATCH_SIZE", "3"))))
+CHUNKED_SCAN_BATCH_SIZE = max(1, min(3, int(os.getenv("CHUNKED_SCAN_BATCH_SIZE", "2"))))
 CHUNKED_SCAN_INTER_BATCH_SLEEP_SEC = float(os.getenv("CHUNKED_SCAN_INTER_BATCH_SLEEP_SEC", "0.2"))
 # Full pause after HTTP 429 so the broker can reset rate-limit counters.
 HTTP_429_COOLDOWN_SEC = float(os.getenv("HTTP_429_COOLDOWN_SEC", "60"))
+# Global minimum interval between any Capital HTTP requests (GET/POST).
+MIN_REQUEST_INTERVAL = float(os.getenv("MIN_REQUEST_INTERVAL", "0.15"))
+_LAST_REQUEST_TIME = 0.0
+_REQUEST_GATE_LOCK = threading.Lock()
 
 _SESSION_CACHE: dict[str, dict] = {}
 _EPIC_CACHE: dict[str, str] = {}
@@ -93,6 +98,28 @@ CAPITAL_CLIENT_TIMEOUT = _AIO_TIMEOUT
 
 def _new_http_semaphore() -> asyncio.Semaphore:
     return asyncio.Semaphore(CAPITAL_HTTP_CONCURRENCY)
+
+
+async def _respect_global_request_interval() -> None:
+    """Serialize request starts so GET/POST share one global anti-burst gate."""
+    global _LAST_REQUEST_TIME
+    wait_s = 0.0
+    with _REQUEST_GATE_LOCK:
+        now = time.monotonic()
+        wait_s = float(MIN_REQUEST_INTERVAL) - (now - float(_LAST_REQUEST_TIME))
+        if wait_s > 0:
+            _LAST_REQUEST_TIME = now + wait_s
+        else:
+            _LAST_REQUEST_TIME = now
+    if wait_s > 0:
+        await asyncio.sleep(wait_s)
+
+
+def _next_429_cooldown() -> float:
+    """Adaptive 429 cooldown: each hit increases wait up to 120s."""
+    global HTTP_429_COOLDOWN_SEC
+    HTTP_429_COOLDOWN_SEC = min(120.0, float(HTTP_429_COOLDOWN_SEC) * 1.5)
+    return float(HTTP_429_COOLDOWN_SEC)
 
 
 async def _after_capital_success() -> None:
@@ -175,7 +202,7 @@ async def chunked_parallel_gather(
         out.extend(part)
         lo = hi
         if lo < n:
-            await asyncio.sleep(pause)
+            await asyncio.sleep(float(pause) + random.uniform(0.1, 0.3))
     return out
 
 
@@ -268,6 +295,7 @@ async def _aio_get(
     for attempt in range(max_attempts):
         async with sem:
             try:
+                await _respect_global_request_interval()
                 async with session.get(url, headers=headers, params=params) as resp:
                     status = int(resp.status)
                     if status == 200:
@@ -278,12 +306,13 @@ async def _aio_get(
                         await _after_capital_success()
                         return status, data
                     if status == 429 and attempt < max_attempts - 1:
+                        cooldown = _next_429_cooldown()
                         print(
                             "[API] HTTP 429 Too Many Requests (Capital.com GET) — "
-                            f"rate limited; cooling down {HTTP_429_COOLDOWN_SEC:.0f}s before retry.",
+                            f"rate limited; cooling down {cooldown:.0f}s before retry.",
                             flush=True,
                         )
-                        await asyncio.sleep(HTTP_429_COOLDOWN_SEC)
+                        await asyncio.sleep(cooldown)
                         continue
                     if attempt == 0:
                         await asyncio.sleep(0.12)
@@ -310,6 +339,7 @@ async def _aio_post_json(
     for attempt in range(max_attempts):
         async with sem:
             try:
+                await _respect_global_request_interval()
                 async with session.post(
                     url,
                     headers=headers,
@@ -324,12 +354,13 @@ async def _aio_post_json(
                         await _after_capital_success()
                         return status, resp.headers, data
                     if status == 429 and attempt < max_attempts - 1:
+                        cooldown = _next_429_cooldown()
                         print(
                             "[API] HTTP 429 Too Many Requests (Capital.com POST) — "
-                            f"rate limited; cooling down {HTTP_429_COOLDOWN_SEC:.0f}s before retry.",
+                            f"rate limited; cooling down {cooldown:.0f}s before retry.",
                             flush=True,
                         )
-                        await asyncio.sleep(HTTP_429_COOLDOWN_SEC)
+                        await asyncio.sleep(cooldown)
                         continue
                     return status, resp.headers, data
             except Exception:

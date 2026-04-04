@@ -570,7 +570,7 @@ async def scan_watchlist_parallel_async(
 ) -> list[dict[str, Any]]:
     """
     Async batch scan: one aiohttp session, bounded Capital HTTP concurrency.
-    Symbols run in chunks of CHUNKED_SCAN_BATCH_SIZE (default 3) via chunked_parallel_gather
+    Symbols run in chunks of CHUNKED_SCAN_BATCH_SIZE (default 2) via chunked_parallel_gather
     in utils.market_scanner — gather only per chunk, micro-pause between chunks.
     """
     del max_workers  # retained for API compatibility; concurrency is HTTP-only
@@ -578,6 +578,11 @@ async def scan_watchlist_parallel_async(
     wl = [str(s).strip().upper() for s in (watchlist or []) if str(s).strip()]
     if not wl:
         return []
+    log.info(
+        "[SCAN SAFETY] HTTP concurrency=%d | chunk_size=%d",
+        int(CAPITAL_HTTP_CONCURRENCY),
+        int(CHUNKED_SCAN_BATCH_SIZE),
+    )
 
     results: list[dict[str, Any]] = []
     sem = asyncio.Semaphore(CAPITAL_HTTP_CONCURRENCY)
