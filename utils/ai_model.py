@@ -50,7 +50,17 @@ log = logging.getLogger(__name__)
 
 MODEL_DIR             = "models"
 MODEL_VERSION         = 4          # bump to force retrain after provider/feature alignment changes
-AI_PROBABILITY_THRESHOLD = 60.0    # minimum probability to approve a trade
+AI_PROBABILITY_THRESHOLD = 60.0    # baseline / fallback when regime is unknown (percent 0–100)
+# Adaptive gate thresholds by regime (percent 0–100); applied in evaluate_symbol unless min_probability overrides.
+AI_THRESHOLD_TRENDING_PCT = 55.0
+AI_THRESHOLD_RANGING_PCT = 62.0
+AI_THRESHOLD_VOLATILE_PCT = 65.0
+# Default blend when regime classification is unexpected (matches legacy static mix).
+_GATEKEEPER_TF_WEIGHTS_DEFAULT = {"1d": 0.20, "4h": 0.35, "15m": 0.45}
+# Volatile regime: dampen probability slightly (was 0.90; institutional refinement 0.95).
+AI_VOLATILE_PROBABILITY_MULT = 0.95
+# When 1d/4h/15m all agree on dominant direction vs proposed, add to blended score.
+AI_AGREEMENT_BONUS_PCT = 5.0
 # Align with config MIN_ANALYSIS_BARS / TARGET_ANALYSIS_BARS (scanner + training gate).
 MIN_TRAIN_BARS = MIN_ANALYSIS_BARS
 TRAIN_RETRY_HOURS     = 6          # avoid retry spam for symbols with short history
@@ -67,8 +77,32 @@ LABEL_BUY  =  1
 LABEL_SELL = -1
 LABEL_HOLD =  0
 
-# Per-timeframe weights for gatekeeper probability blend (unchanged).
-_GATEKEEPER_TF_WEIGHTS = {"1d": 0.20, "4h": 0.35, "15m": 0.45}
+# Per-timeframe weights for gatekeeper probability blend (legacy alias).
+_GATEKEEPER_TF_WEIGHTS = _GATEKEEPER_TF_WEIGHTS_DEFAULT
+
+
+def _adaptive_threshold_pct(regime_type: str) -> float:
+    """Effective AI gate threshold (percent) from regime."""
+    rt = str(regime_type or "").strip().upper()
+    if rt == "TRENDING":
+        return float(AI_THRESHOLD_TRENDING_PCT)
+    if rt == "RANGING":
+        return float(AI_THRESHOLD_RANGING_PCT)
+    if rt == "VOLATILE":
+        return float(AI_THRESHOLD_VOLATILE_PCT)
+    return float(AI_PROBABILITY_THRESHOLD)
+
+
+def _adaptive_gatekeeper_weights(regime_type: str) -> dict[str, float]:
+    """Regime-specific TF weights for blending per-timeframe AI scores."""
+    rt = str(regime_type or "").strip().upper()
+    if rt == "TRENDING":
+        return {"1d": 0.40, "4h": 0.35, "15m": 0.25}
+    if rt == "RANGING":
+        return {"1d": 0.15, "4h": 0.35, "15m": 0.50}
+    if rt == "VOLATILE":
+        return {"1d": 0.33, "4h": 0.33, "15m": 0.34}
+    return dict(_GATEKEEPER_TF_WEIGHTS_DEFAULT)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -475,6 +509,7 @@ def _rule_based_probability(df: pd.DataFrame, direction: str) -> float:
     """
     Rule-based probability estimate when no trained model is available.
     Checks EMA alignment, RSI, MACD direction alignment with proposed direction.
+    Relaxed RSI bands and partial credit; EMA strictness eased when trend strength is high.
     Returns 0–100.
     """
     try:
@@ -493,17 +528,75 @@ def _rule_based_probability(df: pd.DataFrame, direction: str) -> float:
         e50 = float(ema50.iloc[-1])
         e200 = float(ema200.iloc[-1])
 
-        if direction == 'BUY':
-            checks = [c > e20, c > e50, c > e200, r > 45, h > 0]
-        else:
-            checks = [c < e20, c < e50, c < e200, r < 55, h < 0]
+        trend_pct = abs(e20 - e50) / max(abs(e50), 1e-9) * 100.0
+        strong_trend = trend_pct > 2.0
 
-        hit_rate = sum(checks) / len(checks)
-        prob     = round(30.0 + hit_rate * 60.0, 1)    # range 30–90
+        if direction == "BUY":
+            ema_hits = 0.0
+            ema_hits += 1.0 if c > e20 else (0.55 if strong_trend else 0.0)
+            ema_hits += 1.0 if c > e50 else (0.5 if strong_trend else 0.0)
+            ema_hits += 1.0 if c > e200 else (0.5 if strong_trend else 0.0)
+            ema_score = ema_hits / 3.0
+            if r > 45:
+                rsi_score = 1.0
+            elif r > 40:
+                rsi_score = 0.55
+            else:
+                rsi_score = 0.0
+            macd_score = 1.0 if h > 0 else 0.0
+        else:
+            ema_hits = 0.0
+            ema_hits += 1.0 if c < e20 else (0.55 if strong_trend else 0.0)
+            ema_hits += 1.0 if c < e50 else (0.5 if strong_trend else 0.0)
+            ema_hits += 1.0 if c < e200 else (0.5 if strong_trend else 0.0)
+            ema_score = ema_hits / 3.0
+            if r < 55:
+                rsi_score = 1.0
+            elif r < 62:
+                rsi_score = 0.72
+            elif r < 68:
+                rsi_score = 0.45
+            else:
+                rsi_score = 0.0
+            macd_score = 1.0 if h < 0 else 0.0
+
+        hit_rate = (ema_score + rsi_score + macd_score) / 3.0
+        prob = round(30.0 + hit_rate * 60.0, 1)
         return prob
 
     except Exception:
         return 0.0
+
+
+def _tf_dominant_matches_proposed(
+    symbol: str,
+    tf: str,
+    frame: pd.DataFrame,
+    direction: str,
+) -> bool:
+    """True if this timeframe's RF winner (or rule fallback) matches proposed direction."""
+    model, scaler = load_or_train_model(symbol, timeframe=tf)
+    if model and scaler:
+        act, _ = _predict(frame, model, scaler)
+        return act == direction if act in ("BUY", "SELL") else False
+    p = _rule_based_probability(frame, direction)
+    return p >= 50.0
+
+
+def _all_three_timeframes_agree(
+    symbol: str,
+    direction: str,
+    df_1d: pd.DataFrame | None,
+    df_4h: pd.DataFrame | None,
+    df_15m: pd.DataFrame | None,
+) -> bool:
+    """Agreement bonus: 1d, 4h, 15m all present and each supports the same side as proposed."""
+    for tf, df in (("1d", df_1d), ("4h", df_4h), ("15m", df_15m)):
+        if df is None or df.empty:
+            return False
+        if not _tf_dominant_matches_proposed(symbol, tf, _flatten(df), direction):
+            return False
+    return True
 
 
 def _log_ai_audit_strong_signal(
@@ -516,6 +609,10 @@ def _log_ai_audit_strong_signal(
     probs: dict[str, float],
     probability: float,
     effective_min: float,
+    *,
+    adaptive_threshold_base_pct: float,
+    tf_weights: dict[str, float],
+    agreement_bonus_applied: bool,
 ) -> None:
     """
     Structured audit log when blended probability meets the effective gate threshold.
@@ -547,6 +644,11 @@ def _log_ai_audit_strong_signal(
             "per_tf_probability_pct": {k: float(v) for k, v in probs.items()},
             "blended_probability_pct": float(probability),
             "regime": dict(regime),
+            "regime_type": str(regime.get("type", "")),
+            "effective_threshold_pct": float(effective_min),
+            "adaptive_threshold_base_pct": float(adaptive_threshold_base_pct),
+            "tf_weights": {k: float(v) for k, v in tf_weights.items()},
+            "agreement_bonus_applied": bool(agreement_bonus_applied),
         },
     }
     try:
@@ -574,7 +676,7 @@ def evaluate_symbol(
             'direction': str,       # proposed direction evaluated
             'confidence': float,    # same as ai_score after post-processing
             'regime': str,          # regime['type']
-            'is_approved': bool,    # vs AI_PROBABILITY_THRESHOLD or min_probability
+            'is_approved': bool,    # vs adaptive threshold or min_probability override
         }
     """
     direction = str(timeframe_data.get("direction") or "").strip().upper()
@@ -602,9 +704,10 @@ def evaluate_symbol(
         df_4h if (df_4h is not None and not df_4h.empty) else df_1d
     )
     regime = detect_regime(_flatten(regime_df))
+    regime_type = str(regime.get("type") or "")
+    weights = _adaptive_gatekeeper_weights(regime_type)
 
     probs: dict[str, float] = {}
-    weights = _GATEKEEPER_TF_WEIGHTS
     for tf, df in (("1d", df_1d), ("4h", df_4h), ("15m", df_15m)):
         if df is None or df.empty:
             continue
@@ -640,24 +743,32 @@ def evaluate_symbol(
             pass
 
     if regime["type"] == "VOLATILE":
-        probability = round(probability * 0.90, 1)
+        probability = round(probability * float(AI_VOLATILE_PROBABILITY_MULT), 1)
         log.info(
-            "[AI Gate %s] VOLATILE regime penalty applied → probability=%.1f%%",
+            "[AI Gate %s] VOLATILE regime penalty applied (×%.2f) → probability=%.1f%%",
             symbol,
+            float(AI_VOLATILE_PROBABILITY_MULT),
             probability,
         )
     else:
         probability = round(float(probability), 1)
 
-    min_prob = AI_PROBABILITY_THRESHOLD if min_probability is None else float(min_probability)
+    agreement_bonus_applied = False
+    if _all_three_timeframes_agree(symbol, direction, df_1d, df_4h, df_15m):
+        probability = round(min(100.0, probability + float(AI_AGREEMENT_BONUS_PCT)), 1)
+        agreement_bonus_applied = True
+
+    adaptive_base = _adaptive_threshold_pct(regime_type)
+    min_prob = float(min_probability) if min_probability is not None else adaptive_base
     approved = probability >= min_prob
 
     log.info(
-        "[AI Gate %s] direction=%s | probability=%.1f%% | regime=%s | %s",
+        "[AI Gate %s] direction=%s | probability=%.1f%% | regime=%s | threshold=%.1f%% | %s",
         symbol,
         direction,
         probability,
         regime["type"],
+        min_prob,
         "APPROVED" if approved else "BLOCKED",
     )
 
@@ -671,6 +782,9 @@ def evaluate_symbol(
         probs,
         probability,
         min_prob,
+        adaptive_threshold_base_pct=adaptive_base,
+        tf_weights=weights,
+        agreement_bonus_applied=agreement_bonus_applied,
     )
 
     return {
