@@ -4,7 +4,7 @@ with a shared session and `CAPITAL_HTTP_CONCURRENCY` (max 5; see utils.filters.l
 
 Multi-symbol watchlist scans use `chunked_parallel_gather` (default batch 3, 200ms pause
 between batches) so `asyncio.gather` is never applied to the full symbol list at once.
-Per-request 429 handling remains in `_aio_get` / `_aio_post_json`.
+Per-request 429 handling (60s cooldown) remains in `_aio_get` / `_aio_post_json`.
 """
 import os
 import time
@@ -57,6 +57,8 @@ BULK_BATCH_GAP_SLEEP_SEC = float(os.getenv("BULK_BATCH_GAP_SLEEP_SEC", "0.5"))
 # Watchlist / multi-symbol scans: strict chunk size for asyncio.gather; micro-pause between chunks (anti-burst).
 CHUNKED_SCAN_BATCH_SIZE = max(1, min(3, int(os.getenv("CHUNKED_SCAN_BATCH_SIZE", "3"))))
 CHUNKED_SCAN_INTER_BATCH_SLEEP_SEC = float(os.getenv("CHUNKED_SCAN_INTER_BATCH_SLEEP_SEC", "0.2"))
+# Full pause after HTTP 429 so the broker can reset rate-limit counters.
+HTTP_429_COOLDOWN_SEC = float(os.getenv("HTTP_429_COOLDOWN_SEC", "60"))
 
 _SESSION_CACHE: dict[str, dict] = {}
 _EPIC_CACHE: dict[str, str] = {}
@@ -135,7 +137,7 @@ async def chunked_parallel_gather(
     (never on the full symbol list). After each batch completes, ``await asyncio.sleep``
     for *inter_chunk_sleep_sec* so the broker does not see a single large burst.
 
-    Per-request HTTP 429 handling (e.g. 20s cooldown) remains in ``_aio_get`` / ``_aio_post_json``.
+    Per-request HTTP 429 handling (e.g. 60s cooldown) remains in ``_aio_get`` / ``_aio_post_json``.
     """
     cs = CHUNKED_SCAN_BATCH_SIZE if chunk_size is None else max(1, int(chunk_size))
     pause = (
@@ -278,10 +280,10 @@ async def _aio_get(
                     if status == 429 and attempt < max_attempts - 1:
                         print(
                             "[API] HTTP 429 Too Many Requests (Capital.com GET) — "
-                            "rate limited; cooling down 20.0s before retry.",
+                            f"rate limited; cooling down {HTTP_429_COOLDOWN_SEC:.0f}s before retry.",
                             flush=True,
                         )
-                        await asyncio.sleep(20.0)
+                        await asyncio.sleep(HTTP_429_COOLDOWN_SEC)
                         continue
                     if attempt == 0:
                         await asyncio.sleep(0.12)
@@ -324,10 +326,10 @@ async def _aio_post_json(
                     if status == 429 and attempt < max_attempts - 1:
                         print(
                             "[API] HTTP 429 Too Many Requests (Capital.com POST) — "
-                            "rate limited; cooling down 20.0s before retry.",
+                            f"rate limited; cooling down {HTTP_429_COOLDOWN_SEC:.0f}s before retry.",
                             flush=True,
                         )
-                        await asyncio.sleep(20.0)
+                        await asyncio.sleep(HTTP_429_COOLDOWN_SEC)
                         continue
                     return status, resp.headers, data
             except Exception:
