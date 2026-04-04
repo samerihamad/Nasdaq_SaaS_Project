@@ -1533,7 +1533,7 @@ def run_trading_bot():
             now_utc = synchronized_utc_now()
             now_et = now_utc.astimezone(ET)
             if not is_nyse_trading_day(now_et):
-                print("[GLOBAL GATE] Non-trading day (weekend/holiday) — hard stop for 300s.", flush=True)
+                print("[ENGINE] Market closed → full sleep mode", flush=True)
                 time.sleep(300)
                 continue
 

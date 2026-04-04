@@ -22,7 +22,7 @@ from typing import Any
 
 import aiohttp
 
-from utils.market_hours import utc_today
+from utils.market_hours import utc_today, synchronized_utc_now, ET, is_nyse_trading_day
 from config import (
     WATCHLIST,
     MIN_CONFIDENCE,
@@ -327,6 +327,9 @@ def run_scan() -> list[dict]:
     This function is STATELESS — it doesn't sleep or loop.
     The scheduler in main.py is responsible for repeating calls.
     """
+    if not is_nyse_trading_day(synchronized_utc_now().astimezone(ET)):
+        log.info("[SCAN SAFETY] NYSE closed day — run_scan skipped.")
+        return []
     log.info("=== Market scan started — %d tickers ===", len(WATCHLIST))
 
     subscribers = _get_active_subscribers()
@@ -574,6 +577,9 @@ async def scan_watchlist_parallel_async(
     in utils.market_scanner — gather only per chunk, micro-pause between chunks.
     """
     del max_workers  # retained for API compatibility; concurrency is HTTP-only
+    if not is_nyse_trading_day(synchronized_utc_now().astimezone(ET)):
+        log.info("[SCAN SAFETY] NYSE closed day — async watchlist scan skipped.")
+        return []
 
     wl = [str(s).strip().upper() for s in (watchlist or []) if str(s).strip()]
     if not wl:
@@ -628,6 +634,9 @@ def scan_watchlist_parallel(
     Output rows contain:
       symbol, action, confidence, strategy_label, reason, stop_loss_pct, timeframes
     """
+    if not is_nyse_trading_day(synchronized_utc_now().astimezone(ET)):
+        log.info("[SCAN SAFETY] NYSE closed day — watchlist scan skipped.")
+        return []
     return asyncio.run(
         scan_watchlist_parallel_async(
             watchlist,

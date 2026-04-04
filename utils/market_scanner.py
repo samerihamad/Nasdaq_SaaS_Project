@@ -33,14 +33,15 @@ from config import (
     MIN_15M_BARS,
     TARGET_ANALYSIS_BARS,
 )
+from utils.market_hours import ET, synchronized_utc_now, is_nyse_trading_day
 
 _DATA_TIMEOUT_SEC = int(os.getenv("MARKET_DATA_TIMEOUT_SEC", "20"))
 _SESSION_TTL_SEC = int(os.getenv("MARKET_DATA_SESSION_TTL_SEC", "45"))
 _LOG_ROOT = os.getenv("ENGINE_LOG_ROOT", "logs")
 _CAPITAL_PRICES_MAX_BARS_CAP = int(os.getenv("CAPITAL_PRICES_MAX_BARS_CAP", "1000"))
 _DAILY_PRICES_MAX = min(1000, max(50, _CAPITAL_PRICES_MAX_BARS_CAP))
-# Hard cap 5 concurrent Capital.com HTTP calls (safe default now lowered to 2).
-CAPITAL_HTTP_CONCURRENCY = max(1, min(5, int(os.getenv("CAPITAL_HTTP_CONCURRENCY", "2"))))
+# Hard cap 5 concurrent Capital.com HTTP calls (stability-mode default: 1).
+CAPITAL_HTTP_CONCURRENCY = max(1, min(5, int(os.getenv("CAPITAL_HTTP_CONCURRENCY", "1"))))
 # After this many successful Capital.com responses, pause 1s ("breathing") to reduce throttling.
 _CAPITAL_SUCCESS_BREATH_EVERY = 15
 _CAPITAL_SUCCESS_COUNT = 0
@@ -61,9 +62,9 @@ CHUNKED_SCAN_INTER_BATCH_SLEEP_SEC = float(os.getenv("CHUNKED_SCAN_INTER_BATCH_S
 # Full pause after HTTP 429 so the broker can reset rate-limit counters.
 HTTP_429_COOLDOWN_SEC = float(os.getenv("HTTP_429_COOLDOWN_SEC", "60"))
 # Global minimum interval between any Capital HTTP requests (GET/POST).
-MIN_REQUEST_INTERVAL = float(os.getenv("MIN_REQUEST_INTERVAL", "0.15"))
+MIN_REQUEST_INTERVAL = float(os.getenv("MIN_REQUEST_INTERVAL", "0.25"))
 _LAST_REQUEST_TIME = 0.0
-_REQUEST_GATE_LOCK = threading.Lock()
+_REQUEST_GATE_LOCK = asyncio.Lock()
 
 _SESSION_CACHE: dict[str, dict] = {}
 _EPIC_CACHE: dict[str, str] = {}
@@ -103,16 +104,14 @@ def _new_http_semaphore() -> asyncio.Semaphore:
 async def _respect_global_request_interval() -> None:
     """Serialize request starts so GET/POST share one global anti-burst gate."""
     global _LAST_REQUEST_TIME
-    wait_s = 0.0
-    with _REQUEST_GATE_LOCK:
+    async with _REQUEST_GATE_LOCK:
         now = time.monotonic()
-        wait_s = float(MIN_REQUEST_INTERVAL) - (now - float(_LAST_REQUEST_TIME))
-        if wait_s > 0:
-            _LAST_REQUEST_TIME = now + wait_s
-        else:
-            _LAST_REQUEST_TIME = now
-    if wait_s > 0:
-        await asyncio.sleep(wait_s)
+        elapsed = now - _LAST_REQUEST_TIME
+        if elapsed < MIN_REQUEST_INTERVAL:
+            wait_time = MIN_REQUEST_INTERVAL - elapsed
+            jitter = random.uniform(0.05, 0.15)
+            await asyncio.sleep(wait_time + jitter)
+        _LAST_REQUEST_TIME = time.monotonic()
 
 
 def _next_429_cooldown() -> float:
@@ -924,6 +923,8 @@ def scan_market(
     client_timeout: aiohttp.ClientTimeout | None = None,
 ):
     """Sync wrapper: async Capital.com OHLCV fetch with aiohttp (concurrency capped internally)."""
+    if not is_nyse_trading_day(synchronized_utc_now().astimezone(ET)):
+        return None
 
     async def _run():
         to = client_timeout if client_timeout is not None else _AIO_TIMEOUT
@@ -951,6 +952,8 @@ async def scan_multi_timeframe_async(
     """
     Async multi-timeframe fetch. Pass shared session+semaphore from scan batches for efficiency.
     """
+    if not is_nyse_trading_day(synchronized_utc_now().astimezone(ET)):
+        return None
     close_local = session is None
     if session is None:
         session = aiohttp.ClientSession(timeout=_AIO_TIMEOUT)
@@ -1078,6 +1081,8 @@ async def fetch_15m_ohlcv_async(
     Returns (dataframe, None) on success, (None, reason) where reason is one of:
       mapping_error, session_error, 15m_unavailable
     """
+    if not is_nyse_trading_day(synchronized_utc_now().astimezone(ET)):
+        return None, "market_closed_day"
     close_local = session is None
     if session is None:
         session = aiohttp.ClientSession(timeout=_AIO_TIMEOUT)
@@ -1110,6 +1115,8 @@ async def fetch_15m_ohlcv_async(
 
 def scan_multi_timeframe(symbol, session_context: dict | None = None):
     """Sync wrapper around async multi-timeframe fetch."""
+    if not is_nyse_trading_day(synchronized_utc_now().astimezone(ET)):
+        return None
 
     async def _run():
         async with aiohttp.ClientSession(timeout=_AIO_TIMEOUT) as sess:
