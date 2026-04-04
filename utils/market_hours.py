@@ -319,6 +319,14 @@ def is_nyse_trading_day(now_et: datetime | None = None) -> bool:
     return _is_trading_day(dt)
 
 
+def is_trading_required() -> bool:
+    """
+    False on U.S. weekends and Nasdaq holidays; True on regular session days.
+    Use in background threads to skip Capital.com / broker authentication and API calls.
+    """
+    return is_nyse_trading_day()
+
+
 def get_market_status() -> str:
     """
     Return the current Nasdaq session status.

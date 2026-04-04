@@ -36,6 +36,7 @@ from utils.market_hours import (
     get_market_status,
     is_market_open,
     is_nyse_trading_day,
+    is_trading_required,
     minutes_to_open,
     STATUS_OPEN,
     STATUS_CLOSED,
@@ -403,6 +404,9 @@ def _heartbeat_loop():
     """Daemon thread: writes heartbeat.json every HEARTBEAT_INTERVAL seconds."""
     while True:
         try:
+            if not is_trading_required():
+                time.sleep(HEARTBEAT_INTERVAL)
+                continue
             with open(HEARTBEAT_FILE, 'w') as f:
                 json.dump({'timestamp': synchronized_utc_now().isoformat()}, f)
         except Exception as e:
@@ -416,6 +420,9 @@ def _backup_loop():
     time.sleep(60)  # let main process stabilise before first backup
     while True:
         try:
+            if not is_trading_required():
+                time.sleep(BACKUP_INTERVAL)
+                continue
             if is_maintenance_mode():
                 print("[BACKUP] Skipped — maintenance mode is active.")
                 time.sleep(BACKUP_INTERVAL)
@@ -445,6 +452,9 @@ def _hybrid_approval_loop():
     """
     while True:
         try:
+            if not is_trading_required():
+                time.sleep(5)
+                continue
             db_path = DB_PATH
 
             # ── Execute approved signals ──────────────────────────────────────
@@ -535,6 +545,7 @@ def _limit_order_worker_loop():
     """Daemon worker: tracks pending limits and handles TTL cancels."""
     while True:
         try:
+            # TTL expiry runs every cycle (DB/Telegram only). Capital touch/execute is gated inside process_pending_limit_orders.
             n = process_pending_limit_orders()
             if n:
                 print(f"[LIMIT WORKER] processed={n}")

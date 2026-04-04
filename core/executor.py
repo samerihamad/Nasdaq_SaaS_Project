@@ -23,7 +23,8 @@ from config import (
     LIMIT_ORDER_ALLOW_MARKET_FALLBACK,
     EXECUTION_REJECTION_NOTIFY_COOLDOWN_SEC,
 )
-from utils.market_scanner import scan_multi_timeframe
+from utils.market_scanner import HTTP_429_COOLDOWN_SEC, scan_multi_timeframe
+from utils.market_hours import is_trading_required
 from database.db_manager import (
     DB_PATH,
     is_maintenance_mode,
@@ -467,6 +468,7 @@ def _place_pending_limit_order(
 def process_pending_limit_orders():
     """
     Worker: track pending limits, trigger execution on touch, auto-cancel on TTL.
+    TTL expiry uses DB/Telegram only (runs on weekends). Touch/execute uses Capital only when is_trading_required().
     """
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -521,6 +523,9 @@ def process_pending_limit_orders():
             )
             send_telegram_message(str(chat_id), msg)
             processed += 1
+            continue
+
+        if not is_trading_required():
             continue
 
         creds = get_user_credentials(str(chat_id))
@@ -654,6 +659,15 @@ def get_session(creds, chat_id: str | None = None, force_refresh: bool = False):
                 "expires_at": now + timedelta(seconds=SESSION_TTL_SECONDS),
             }
             return base_url, session_headers
+        if auth_res is not None and int(auth_res.status_code) == 429:
+            print(
+                f"[Capital Auth] HTTP 429 — cooling down {float(HTTP_429_COOLDOWN_SEC):.0f}s "
+                f"before retry (attempt {attempt + 1}/3).",
+                flush=True,
+            )
+            if attempt < 2:
+                time.sleep(float(HTTP_429_COOLDOWN_SEC))
+            continue
         if attempt < 2:
             time.sleep(0.7 * (attempt + 1))
 
