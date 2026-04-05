@@ -5,6 +5,8 @@ import uuid
 import math
 import os
 import logging
+import threading
+import hashlib
 from datetime import datetime, timedelta, timezone
 import pandas as pd
 from bot.notifier import send_telegram_message, notify_admin_alert
@@ -69,6 +71,23 @@ MAX_SLIPPAGE_PCT = float(os.getenv("MAX_SLIPPAGE_PCT", "0.003"))
 _EXEC_ATR_PERIOD = 14
 _EXEC_ATR_W_15M = 0.60
 _EXEC_ATR_W_1H = 0.40
+_CORRELATED_GROUP_MAX_EXPOSURE_PCT = 0.20
+_CORRELATED_GROUPS: dict[str, set[str]] = {
+    "TECH": {"AAPL", "MSFT", "GOOGL", "NVDA", "QQQ"},
+}
+_VOLATILE_LIMIT_ATR_FRAC = 0.12
+_ADX_STRONG_TREND = 25.0
+_ADX_RANGING = 20.0
+_TRAIL_MULT_STRONG = 1.6
+_TRAIL_MULT_BASE = 2.0
+_TRAIL_MULT_RANGING = 2.5
+_EXEC_TELEMETRY_LOCK = threading.Lock()
+_EXEC_TELEMETRY_DAY = synchronized_utc_now().date().isoformat()
+_EXEC_TELEMETRY = {
+    "slippage_aborts": 0,
+    "local_guard_blocks": 0,
+    "weekend_blocks": 0,
+}
 
 _TIME_SHIFT_ERROR_MARKERS = (
     "time shift",
@@ -107,6 +126,42 @@ def _atr_from_ohlcv(df: pd.DataFrame | None, period: int = _EXEC_ATR_PERIOD) -> 
         return None
 
 
+def _bump_execution_shield_counter(
+    metric: str,
+    *,
+    chat_id: str | None = None,
+    symbol: str | None = None,
+    action: str | None = None,
+    details: str = "",
+) -> None:
+    """Daily-reset telemetry counters for execution shield guards."""
+    global _EXEC_TELEMETRY_DAY
+    today = synchronized_utc_now().date().isoformat()
+    with _EXEC_TELEMETRY_LOCK:
+        if _EXEC_TELEMETRY_DAY != today:
+            _EXEC_TELEMETRY_DAY = today
+            _EXEC_TELEMETRY["slippage_aborts"] = 0
+            _EXEC_TELEMETRY["local_guard_blocks"] = 0
+            _EXEC_TELEMETRY["weekend_blocks"] = 0
+        if metric not in _EXEC_TELEMETRY:
+            return
+        _EXEC_TELEMETRY[metric] = int(_EXEC_TELEMETRY.get(metric, 0)) + 1
+        snapshot = (
+            f"day={_EXEC_TELEMETRY_DAY} "
+            f"slippage_aborts={int(_EXEC_TELEMETRY['slippage_aborts'])} "
+            f"local_guard_blocks={int(_EXEC_TELEMETRY['local_guard_blocks'])} "
+            f"weekend_blocks={int(_EXEC_TELEMETRY['weekend_blocks'])}"
+        )
+    _audit_exec_event(
+        stage=f"telemetry_{metric}",
+        chat_id=chat_id,
+        symbol=symbol,
+        action=action,
+        details=f"{snapshot} {details}".strip(),
+    )
+    log.info("[EXEC_TELEMETRY] %s", snapshot)
+
+
 def _weighted_multi_tf_atr(symbol: str, *, session_context: dict | None = None) -> tuple[float | None, float | None, float | None]:
     """Weighted ATR from 15m (60%) + 1h (40%) with safe fallback."""
     atr_15m = _atr_from_ohlcv(scan_market(symbol, period="7d", interval="15m", session_context=session_context))
@@ -118,6 +173,64 @@ def _weighted_multi_tf_atr(symbol: str, *, session_context: dict | None = None) 
     if atr_1h is not None:
         return float(atr_1h), atr_15m, atr_1h
     return None, None, None
+
+
+def _symbol_group(symbol: str) -> str | None:
+    s = str(symbol or "").upper().strip()
+    for g, members in _CORRELATED_GROUPS.items():
+        if s in members:
+            return g
+    return None
+
+
+def _local_group_notional(chat_id: str, group: str) -> float:
+    members = _CORRELATED_GROUPS.get(str(group), set())
+    if not members:
+        return 0.0
+    try:
+        placeholders = ",".join(["?"] * len(members))
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                f"""
+                SELECT COALESCE(SUM(ABS(COALESCE(entry_price,0) * COALESCE(size,0))), 0)
+                FROM trades
+                WHERE chat_id=?
+                  AND UPPER(status)='OPEN'
+                  AND UPPER(symbol) IN ({placeholders})
+                """,
+                [str(chat_id), *[str(x).upper() for x in members]],
+            )
+            row = c.fetchone()
+            return float(row[0] or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _adaptive_trailing_multiplier(symbol: str, *, session_context: dict | None = None) -> float:
+    """
+    ADX-aware trailing multiplier:
+    - ADX > 25: tighter trail (smaller multiplier)
+    - ADX < 20: looser trail (larger multiplier)
+    """
+    try:
+        from core.strategy_momentum import _adx as _mom_adx, _flatten as _mom_flatten
+
+        df = scan_market(str(symbol), period="5d", interval="15m", session_context=session_context)
+        if df is None or len(df) < 30:
+            return float(_TRAIL_MULT_BASE)
+        flat = _mom_flatten(df)
+        adx_s, _, _ = _mom_adx(flat)
+        adx_val = float(adx_s.iloc[-1])
+        if not math.isfinite(adx_val):
+            return float(_TRAIL_MULT_BASE)
+        if adx_val > float(_ADX_STRONG_TREND):
+            return float(_TRAIL_MULT_STRONG)
+        if adx_val < float(_ADX_RANGING):
+            return float(_TRAIL_MULT_RANGING)
+        return float(_TRAIL_MULT_BASE)
+    except Exception:
+        return float(_TRAIL_MULT_BASE)
 
 
 def _has_local_pending_or_open_trade(chat_id: str, symbol: str) -> bool:
@@ -449,6 +562,7 @@ def _calculate_limit_price(
     atr: float | None,
     *,
     session_context: dict | None = None,
+    regime_type: str | None = None,
 ) -> float:
     """
     Sprint 2 policy map:
@@ -484,6 +598,14 @@ def _calculate_limit_price(
             px = float(entry_price) - atr_off
         else:
             px = float(entry_price) + atr_off
+
+    # VOLATILE regime: use slightly more aggressive limit (closer to market) for better fill.
+    if str(regime_type or "").upper() == "VOLATILE" and atr is not None and math.isfinite(float(atr)) and float(atr) > 0:
+        tighten = float(atr) * float(_VOLATILE_LIMIT_ATR_FRAC)
+        if action == "BUY":
+            px = max(float(px), float(entry_price) - float(tighten))
+        else:
+            px = min(float(px), float(entry_price) + float(tighten))
 
     return max(0.01, round(px, 4))
 
@@ -598,6 +720,13 @@ def process_pending_limit_orders():
             continue
 
         if not is_nyse_trading_day(synchronized_utc_now().astimezone(ET)):
+            _bump_execution_shield_counter(
+                "weekend_blocks",
+                chat_id=str(chat_id),
+                symbol=str(symbol),
+                action=str(action),
+                details="pending_limit gate",
+            )
             continue
         if not is_trading_required():
             continue
@@ -1675,6 +1804,43 @@ def _sanitize_protection_levels(action, entry_price, stop_level, target1, target
     return round(stop, 6), round(t1, 6), round(t2, 6)
 
 
+def _local_positions_state_hash(chat_id: str) -> str:
+    rows = get_open_trades(chat_id) or []
+    parts: list[str] = []
+    for r in rows:
+        parts.append(
+            "|".join(
+                [
+                    str(r.get("deal_id") or "").strip(),
+                    str(r.get("symbol") or "").upper().strip(),
+                    str(r.get("direction") or "").upper().strip(),
+                    f"{float(r.get('size') or 0.0):.4f}",
+                ]
+            )
+        )
+    payload = "||".join(sorted(parts))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _broker_positions_state_hash(live_positions: list[dict]) -> str:
+    parts: list[str] = []
+    for p in live_positions or []:
+        m = p.get("market") or {}
+        pos = p.get("position") or {}
+        parts.append(
+            "|".join(
+                [
+                    str(pos.get("dealId") or p.get("dealId") or "").strip(),
+                    str(m.get("epic") or "").upper().strip(),
+                    str(pos.get("direction") or "").upper().strip(),
+                    f"{float(pos.get('size') or 0.0):.4f}",
+                ]
+            )
+        )
+    payload = "||".join(sorted(parts))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 # ── Position monitoring — trailing stop + hard fallback ───────────────────────
 
 def monitor_and_close(chat_id):
@@ -1722,6 +1888,18 @@ def monitor_and_close(chat_id):
     live_positions  = pos_res.json().get('positions', [])
     balance         = _get_balance(base_url, headers)
     hard_stop_limit = -(balance * 0.03)   # -3% of balance
+    # Optional state-sync guard: skip close attempts on hard local/broker divergence.
+    local_hash = _local_positions_state_hash(str(chat_id))
+    broker_hash = _broker_positions_state_hash(live_positions)
+    if local_hash != broker_hash:
+        _audit_exec_event(
+            stage="state_hash_mismatch",
+            chat_id=str(chat_id),
+            symbol=None,
+            action=None,
+            details=f"local_hash={local_hash[:12]} broker_hash={broker_hash[:12]} skip_close_cycle=1",
+        )
+        return False
 
     # Index by every dealId/positionId Capital exposes (DB may store either).
     live_by_id = {}
@@ -1793,6 +1971,10 @@ def monitor_and_close(chat_id):
             # We only apply "lock after TP1" and "trailing after TP2"
             # to the TP2 leg, because TP1 leg is closed by broker at TP1.
             manage_leg = leg_role.upper() == "TP2"
+            trail_mult = _adaptive_trailing_multiplier(
+                symbol,
+                session_context=_scanner_context_from_creds(str(chat_id), creds),
+            )
 
             if tp2_hit and manage_leg:
                 # Persist milestone once TP2 threshold is first reached.
@@ -1801,7 +1983,7 @@ def monitor_and_close(chat_id):
                         update_trade_target_reached(trade_id, "TARGET_2_HIT")
                 except Exception:
                     pass
-                candidate = compute_stop_candidate(direction, current_price, atr)
+                candidate = compute_stop_candidate(direction, current_price, atr, multiplier=float(trail_mult))
                 prev_stop = float(base_stop if base_stop is not None else candidate)
                 breakeven = entry_price
                 if direction == 'BUY':
@@ -2024,39 +2206,26 @@ def monitor_and_close(chat_id):
 
 # ── Trade execution ───────────────────────────────────────────────────────────
 
-def place_trade_for_user(
-    chat_id,
-    symbol,
-    action,
-    confidence=75.0,
-    stop_loss_pct=None,
-    strategy_label=None,
-    force_market: bool = False,
-    ai_prob: float | None = None,
-    signal_price: float | None = None,
-):
-    """
-    Open a new position.
 
-    Flow:
-      1. Maintenance gate.
-      2. Circuit Breaker / Hard Block state gate.
-      3. Daily drawdown guard  (-5% → hard stop, new in v2).
-      4. Duplicate position check.
-      5. R:R ratio gate         (minimum 1:2, new in v2).
-      6. Dynamic position sizing (1–2% risk, tightened in v2).
-      7. Place order via Capital.com API.
-      8. Record the initial ATR-based trailing stop in local DB.
-    """
-    # ── Maintenance gate ──────────────────────────────────────────────────────
+def _validate_execution_gate(
+    chat_id: str,
+    symbol: str,
+    action: str,
+) -> tuple[bool, str, dict]:
+    """Pre-trade checks: market/session/account/local-duplicate/broker-duplicate."""
     if is_maintenance_mode():
-        return "🔧 System in maintenance — new entries suspended."
+        return False, "🔧 System in maintenance — new entries suspended.", {}
 
     lang = get_subscriber_lang(chat_id)
-    # ── Global execution gate: no entries on NYSE closed days ─────────────────
     if not is_nyse_trading_day(synchronized_utc_now().astimezone(ET)):
         msg = "[GUARD] Execution blocked: Market is closed."
-        print(msg, flush=True)
+        _bump_execution_shield_counter(
+            "weekend_blocks",
+            chat_id=str(chat_id),
+            symbol=str(symbol),
+            action=str(action),
+            details="place_trade_for_user gate",
+        )
         _audit_exec_event(
             stage="execution_guard_closed_day",
             chat_id=str(chat_id),
@@ -2064,11 +2233,17 @@ def place_trade_for_user(
             action=str(action),
             details="is_nyse_trading_day=0",
         )
-        return msg
+        return False, msg, {"lang": lang}
 
-    # ── Local execution state guard (no duplicate OPEN/PENDING) ──────────────
     if _has_local_pending_or_open_trade(str(chat_id), str(symbol)):
         msg = f"⏭️ Local guard: existing OPEN/PENDING trade for {symbol}."
+        _bump_execution_shield_counter(
+            "local_guard_blocks",
+            chat_id=str(chat_id),
+            symbol=str(symbol),
+            action=str(action),
+            details="duplicate local OPEN/PENDING found",
+        )
         _audit_exec_event(
             stage="local_execution_guard_duplicate",
             chat_id=str(chat_id),
@@ -2076,60 +2251,75 @@ def place_trade_for_user(
             action=str(action),
             details="duplicate local OPEN/PENDING found",
         )
-        return msg
+        return False, msg, {"lang": lang}
 
-    # ── Session Gatekeeper (UTC) — do not call broker outside window ─────────
     try:
         from utils.market_hours import is_within_us_cash_session_utc
         ok_sess, sess_reason = is_within_us_cash_session_utc()
     except Exception:
         ok_sess, sess_reason = True, "OK"
     if not ok_sess:
-        if lang == "en":
-            msg = f"⏭️ Skipped: Outside Market Hours ({sess_reason}) — {symbol}"
-        else:
-            msg = f"⏭️ تم التخطي: خارج ساعات السوق ({sess_reason}) — {symbol}"
-        print(msg)
+        msg = (
+            f"⏭️ Skipped: Outside Market Hours ({sess_reason}) — {symbol}"
+            if lang == "en"
+            else f"⏭️ تم التخطي: خارج ساعات السوق ({sess_reason}) — {symbol}"
+        )
         if not is_maintenance_mode():
             send_telegram_message(chat_id, msg)
-        return msg
+        return False, msg, {"lang": lang}
 
-    # ── Circuit Breaker / Hard Block gate ─────────────────────────────────────
     allowed, reason = can_open_trade(chat_id)
     if not allowed:
-        return f"🚫 {reason}"
+        return False, f"🚫 {reason}", {"lang": lang}
 
     creds = get_user_credentials(chat_id)
     if not creds:
         msg = "❌ User not registered"
         _maybe_notify_rejection(chat_id, msg, symbol=symbol, action=action, stage="user_not_registered")
-        return msg
+        return False, msg, {"lang": lang}
+
     base_url, headers = get_session(creds, chat_id=str(chat_id))
     if not headers:
         msg = "❌ Capital.com authentication failed"
         _maybe_notify_rejection(chat_id, msg, symbol=symbol, action=action, stage="capital_auth_failed")
-        return msg
+        return False, msg, {"lang": lang}
 
-    # ── Daily drawdown gate ───────────────────────────────────────────────────
     balance, free_margin = _get_balance_and_free_margin(base_url, headers)
     within_dd, dd_pct = check_daily_drawdown(chat_id, balance)
     if not within_dd:
         msg = f"🔴 Daily drawdown limit reached ({dd_pct:.1f}%) — no new entries today."
         _maybe_notify_rejection(chat_id, msg, symbol=symbol, action=action, stage="daily_drawdown")
-        return msg
+        return False, msg, {"lang": lang}
 
-    # ── Resolve broker epic from scanner ticker ────────────────────────────────
+    # Correlation/Sector guard (local DB only: no extra broker API calls here).
+    group = _symbol_group(symbol)
+    if group and float(balance) > 0:
+        group_notional = _local_group_notional(str(chat_id), group)
+        exposure_pct = float(group_notional) / max(float(balance), 1e-9)
+        if exposure_pct > float(_CORRELATED_GROUP_MAX_EXPOSURE_PCT):
+            msg = (
+                f"🚫 Correlation guard: {group} exposure {exposure_pct * 100.0:.1f}% "
+                f"> {float(_CORRELATED_GROUP_MAX_EXPOSURE_PCT) * 100.0:.1f}%."
+            )
+            _audit_exec_event(
+                stage="correlation_guard_reject",
+                chat_id=str(chat_id),
+                symbol=str(symbol),
+                action=str(action),
+                details=(
+                    f"group={group} group_notional={group_notional:.2f} "
+                    f"equity={float(balance):.2f} exposure_pct={exposure_pct * 100.0:.4f}"
+                ),
+            )
+            return False, msg, {"lang": lang}
+
     order_epic = resolve_epic_for_user(
         chat_id, symbol, base_url=base_url, headers=headers, is_demo=bool(creds[2])
     )
     if not order_epic:
-        # Symbol is not tradable on this broker account/region.
-        # Skip quietly for subscribers to avoid noisy false "errors".
         msg = f"⏭️ Skipped ({symbol} {action}): symbol not available on broker"
-        print(f"[BROKER SKIP] chat={chat_id} {msg}")
-        return msg
+        return False, msg, {"lang": lang}
 
-    # ── Duplicate check (epic-first, robust) ─────────────────────────────────
     pos_res, headers = _resilient_capital_get(
         f"{base_url}/positions",
         headers=headers,
@@ -2140,25 +2330,45 @@ def place_trade_for_user(
     if pos_res is None:
         msg = f"❌ Order failed ({symbol} {action}): broker request failed"
         _maybe_notify_rejection(chat_id, msg, symbol=symbol, action=action, stage="broker_positions_request")
-        return msg
+        return False, msg, {"lang": lang}
     if pos_res.status_code == 200:
-        for p in pos_res.json().get('positions', []):
-            m = p.get('market', {})
-            live_epic = str(m.get('epic', '')).upper()
-            live_name = str(m.get('instrumentName', '')).upper()
+        for p in pos_res.json().get("positions", []):
+            m = p.get("market", {})
+            live_epic = str(m.get("epic", "")).upper()
+            live_name = str(m.get("instrumentName", "")).upper()
             if live_epic == str(order_epic).upper() or symbol.upper() in live_name:
-                return (
-                    f"⚠️ Position already open for {symbol} "
-                    f"({order_epic}) — monitoring."
-                )
+                return False, f"⚠️ Position already open for {symbol} ({order_epic}) — monitoring.", {"lang": lang}
 
-    # ── ATR fetch (used for both RR check and initial stop) ───────────────────
+    return True, "", {
+        "lang": lang,
+        "open_reason": str(reason or ""),
+        "creds": creds,
+        "base_url": base_url,
+        "headers": headers,
+        "balance": float(balance),
+        "free_margin": float(free_margin),
+        "order_epic": str(order_epic),
+        "scanner_ctx": _scanner_context_from_creds(str(chat_id), creds),
+    }
+
+
+def _generate_protection_levels(
+    *,
+    chat_id: str,
+    symbol: str,
+    action: str,
+    confidence: float,
+    stop_loss_pct: float | None,
+    strategy_label: str | None,
+    base_url: str,
+    headers: dict,
+    order_epic: str,
+    scanner_ctx: dict,
+    lang: str,
+) -> tuple[bool, str, dict]:
+    """Build entry/ATR/SL and enforce RR gate."""
     entry_price = _get_current_price(base_url, headers, order_epic)
-    scanner_ctx = _scanner_context_from_creds(str(chat_id), creds)
-    multi_tf_atr_value, atr_15m, atr_1h = _weighted_multi_tf_atr(
-        str(symbol),
-        session_context=scanner_ctx,
-    )
+    multi_tf_atr_value, _, _ = _weighted_multi_tf_atr(str(symbol), session_context=scanner_ctx)
     atr = (
         float(multi_tf_atr_value)
         if multi_tf_atr_value is not None and math.isfinite(float(multi_tf_atr_value))
@@ -2167,24 +2377,17 @@ def place_trade_for_user(
     if not isinstance(entry_price, (int, float)) or not math.isfinite(float(entry_price)) or float(entry_price) <= 0:
         msg = f"❌ Order failed ({symbol} {action}): invalid broker entry price"
         _log_trade_rejection(chat_id, symbol, action, "entry_price_validation", msg, f"entry={entry_price}")
-        _audit_exec_event(
-            stage="entry_price_invalid",
-            chat_id=str(chat_id),
-            symbol=str(symbol),
-            action=str(action),
-            details=f"entry_price={entry_price}",
-        )
-        return msg
+        return False, msg, {}
 
-    # ── Market hours / tradability gate (before opening ANY leg) ─────────────
     is_tradeable, m_status = _market_tradeability(base_url, headers, order_epic)
     if not is_tradeable:
-        print(f"Trade skipped: Market Closed for {symbol} ({order_epic}) status={m_status}")
-        if lang == "en":
-            return f"⏭️ Trade skipped: Market Closed for {symbol} ({m_status})"
-        return f"⏭️ تم التخطي: السوق مغلق لـ {symbol} ({m_status})"
+        msg = (
+            f"⏭️ Trade skipped: Market Closed for {symbol} ({m_status})"
+            if lang == "en"
+            else f"⏭️ تم التخطي: السوق مغلق لـ {symbol} ({m_status})"
+        )
+        return False, msg, {}
 
-    # ── Institutional stop-loss generation (ATR + volatility + structure + liquidity) ─
     effective_sl_pct = stop_loss_pct if stop_loss_pct is not None else (
         (atr * 2.0 / entry_price) if (atr and entry_price > 0) else 0.01
     )
@@ -2194,26 +2397,33 @@ def place_trade_for_user(
         effective_sl_pct = 0.01
     if (not math.isfinite(effective_sl_pct)) or effective_sl_pct <= 0:
         effective_sl_pct = 0.01
+
     base_stop_price = (
-        entry_price * (1 - effective_sl_pct) if action == 'BUY'
+        entry_price * (1 - effective_sl_pct) if action == "BUY"
         else entry_price * (1 + effective_sl_pct)
     )
     min_dist = _get_min_stop_profit_distance(base_url, headers, order_epic)
     max_dist = _get_max_stop_profit_distance(base_url, headers, order_epic)
 
-    liq_levels = None
     tf: dict = {}
     df_15m_sl = None
     rsi_15m_gate = None
+    regime_type = "UNKNOWN"
     try:
         tf = scan_multi_timeframe(str(symbol), session_context=scanner_ctx) or {}
         df_15m_sl = tf.get("15m")
         if df_15m_sl is not None and len(df_15m_sl) > 0:
             rsi_15m_gate = compute_last_rsi(df_15m_sl["Close"])
+            try:
+                from utils.ai_model import regime_type as _ai_regime_type
+                regime_type = _ai_regime_type(df_15m_sl)
+            except Exception:
+                regime_type = "UNKNOWN"
     except Exception:
         tf = {}
         df_15m_sl = None
         rsi_15m_gate = None
+        regime_type = "UNKNOWN"
 
     try:
         if df_15m_sl is not None and len(df_15m_sl) > 0:
@@ -2239,7 +2449,6 @@ def place_trade_for_user(
     except Exception:
         stop_price, stop_reason, stop_meta = base_stop_price, "fallback_base_stop_exception", {}
 
-    # ── R:R ratio gate ────────────────────────────────────────────────────────
     rr_ok, rr_ratio, rr_reason = check_rr_ratio(
         float(entry_price),
         float(stop_price),
@@ -2251,30 +2460,49 @@ def place_trade_for_user(
         rr_reason = "invalid_rr_nan"
     if not rr_ok:
         if rr_reason == "target_beyond_atr_limit":
-            msg = (
-                f"❌ R:R {rr_ratio:.1f}:1 rejected — target not achievable "
-                f"within ATR limit ({symbol} {action})"
-            )
+            msg = f"❌ R:R {rr_ratio:.1f}:1 rejected — target not achievable within ATR limit ({symbol} {action})"
         elif rr_reason == "invalid_rr_nan":
             msg = f"❌ R:R nan:1 does not meet minimum 1:2 — setup discarded ({symbol} {action})"
         else:
-            msg = (
-                f"❌ R:R {rr_ratio:.1f}:1 does not meet minimum 1:2 — "
-                f"setup discarded ({symbol} {action})"
-            )
-        _log_trade_rejection(
-            chat_id,
-            symbol,
-            action,
-            "rr_gate",
-            msg,
-            f"{rr_reason or ''} stop_reason={stop_reason} stop_meta={stop_meta}",
-        )
-        if not SUPPRESS_EXPECTED_REJECTION_TELEGRAM:
-            _maybe_notify_rejection(chat_id, msg, symbol=symbol, action=action, stage="rr_gate")
-        return msg
+            msg = f"❌ R:R {rr_ratio:.1f}:1 does not meet minimum 1:2 — setup discarded ({symbol} {action})"
+        _log_trade_rejection(chat_id, symbol, action, "rr_gate", msg, f"{rr_reason or ''} stop_reason={stop_reason} stop_meta={stop_meta}")
+        return False, msg, {}
 
-    # ── Mandatory pre-trade validation (margin + size + exposure) ────────────
+    return True, "", {
+        "entry_price": float(entry_price),
+        "atr": (float(atr) if atr is not None and math.isfinite(float(atr)) else None),
+        "effective_sl_pct": float(effective_sl_pct),
+        "stop_price": float(stop_price),
+        "min_dist": min_dist,
+        "max_dist": max_dist,
+        "rsi_15m_gate": rsi_15m_gate,
+        "rr_ratio": float(rr_ratio),
+        "stop_reason": stop_reason,
+        "stop_meta": stop_meta,
+        "regime_type": str(regime_type),
+        "strategy_label": str(strategy_label or ""),
+        "confidence": float(confidence),
+    }
+
+
+def _calculate_position_sizing(
+    *,
+    chat_id: str,
+    symbol: str,
+    action: str,
+    confidence: float,
+    strategy_label: str | None,
+    base_url: str,
+    headers: dict,
+    order_epic: str,
+    balance: float,
+    free_margin: float,
+    entry_price: float,
+    stop_price: float,
+    effective_sl_pct: float,
+    rsi_15m_gate,
+) -> tuple[bool, str, dict]:
+    """Validate exposure/margin then produce pre-trade position size."""
     lev = get_effective_leverage(str(chat_id))
     sym_exposure, total_exposure, exposure_by_symbol = _current_exposure_notional(
         base_url=base_url,
@@ -2300,34 +2528,265 @@ def place_trade_for_user(
     )
     if not approved_pre:
         msg = str(pre_reason or "Trade rejected: pre-trade validation failed")
-        print(msg)
-        detail_required = pre_details.get("required_margin")
-        detail_free = pre_details.get("free_margin")
-        detail_size = pre_details.get("position_size")
-        _log_trade_rejection(
-            chat_id,
-            symbol,
-            action,
-            "pre_trade_validation",
-            msg,
-            (
-                f"required_margin={detail_required} free_margin={detail_free} "
-                f"size={detail_size} leverage={lev}"
-            ),
+        return False, msg, {}
+    pretrade_size = float(pre_details.get("position_size") or 0.0)
+    size = pretrade_size if pretrade_size >= 1.0 else calculate_position_size(
+        float(balance), float(confidence), float(entry_price), float(effective_sl_pct), str(chat_id)
+    )
+    return True, "", {
+        "leverage": float(lev),
+        "pre_details": pre_details,
+        "pretrade_size": pretrade_size,
+        "size": float(size),
+    }
+
+
+def _check_slippage_safety(
+    *,
+    chat_id: str,
+    symbol: str,
+    action: str,
+    signal_price: float | None,
+    base_url: str,
+    headers: dict,
+    order_epic: str,
+) -> tuple[bool, str, float]:
+    """Abort if signal price drift exceeds MAX_SLIPPAGE_PCT."""
+    signal_ref_price = None
+    try:
+        if signal_price is not None and math.isfinite(float(signal_price)) and float(signal_price) > 0:
+            signal_ref_price = float(signal_price)
+    except Exception:
+        signal_ref_price = None
+    if signal_ref_price is None:
+        return True, "", 0.0
+    latest_px = _get_current_price(base_url, headers, order_epic)
+    if not isinstance(latest_px, (int, float)) or not math.isfinite(float(latest_px)) or float(latest_px) <= 0:
+        return True, "", 0.0
+    calculated_slippage_pct = abs(float(latest_px) - float(signal_ref_price)) / float(signal_ref_price)
+    if calculated_slippage_pct > float(MAX_SLIPPAGE_PCT):
+        msg = (
+            f"[SLIPPAGE] Trade aborted: Current price move "
+            f"({calculated_slippage_pct * 100.0:.2f}%) exceeds max slippage "
+            f"({float(MAX_SLIPPAGE_PCT) * 100.0:.1f}%)."
         )
-        _audit_exec_event(
-            stage="pre_trade_validation_reject",
+        _bump_execution_shield_counter(
+            "slippage_aborts",
             chat_id=str(chat_id),
             symbol=str(symbol),
             action=str(action),
             details=(
-                f"{msg} | required_margin={detail_required} "
-                f"free_margin={detail_free} size={detail_size} leverage={lev}"
+                f"signal={float(signal_ref_price):.4f} latest={float(latest_px):.4f} "
+                f"slippage_pct={calculated_slippage_pct * 100.0:.4f}"
             ),
         )
-        _maybe_notify_rejection(chat_id, msg, symbol=symbol, action=action, stage="pre_trade_validation")
-        return msg
-    pretrade_size = float(pre_details.get("position_size") or 0.0)
+        return False, msg, calculated_slippage_pct
+    return True, "", calculated_slippage_pct
+
+
+def _execute_broker_order(
+    *,
+    base_url: str,
+    headers: dict,
+    order_epic: str,
+    action: str,
+    leg_size: float,
+    stop_level: float,
+    leg_target: float,
+    entry_price: float,
+    min_dist,
+    target1: float,
+    creds,
+    chat_id: str,
+    opened_broker_legs: list[dict],
+) -> tuple[bool, str, float]:
+    """
+    Final layer touching Capital.com API for one execution leg.
+    Returns (ok, error_message, effective_target).
+    """
+    attempts = 2 if str(len(opened_broker_legs)) == "1" else 1
+    last_err = ""
+    current_target = float(leg_target)
+    for attempt in range(attempts):
+        ok, out = _open_position_with_protection(
+            base_url,
+            headers,
+            order_epic,
+            action,
+            leg_size,
+            stop_level,
+            current_target,
+            creds=creds,
+            chat_id=str(chat_id),
+        )
+        if not ok:
+            last_err = str(out)
+            if attempt == 0 and min_dist and float(min_dist) > 0 and entry_price > 0:
+                widen = float(min_dist) * float(TP2_MIN_DISTANCE_BUFFER_MULT)
+                current_target = (float(entry_price) + widen) if action == "BUY" else (float(entry_price) - widen)
+                stop_level, target1, current_target = _sanitize_protection_levels(
+                    action, entry_price, stop_level, target1, current_target
+                )
+                continue
+            return False, last_err or "unknown rejection", float(current_target)
+
+        payload = out if isinstance(out, dict) else {}
+        ok_deal, deal_id, deal_ref, cerr = _confirm_deal_and_visibility(
+            base_url,
+            headers,
+            payload,
+            order_epic=order_epic,
+            direction=action,
+            leg_size=float(leg_size),
+            exclude_deal_ids={str(x.get("deal_id")).strip() for x in opened_broker_legs if str(x.get("deal_id")).strip()},
+        )
+        if not ok_deal or not deal_id:
+            return False, str(cerr), float(current_target)
+
+        capital_oid = (
+            payload.get("orderId")
+            or payload.get("order_id")
+            or (payload.get("position") or {}).get("orderId")
+        )
+        if capital_oid is not None:
+            capital_oid = str(capital_oid).strip() or None
+        opened_broker_legs.append(
+            {
+                "size": float(leg_size),
+                "tp": float(current_target),
+                "deal_id": str(deal_id),
+                "deal_reference": (str(deal_ref).strip() if deal_ref else None),
+                "capital_order_id": capital_oid,
+            }
+        )
+        return True, "", float(current_target)
+    return False, last_err or "unknown rejection", float(current_target)
+
+def place_trade_for_user(
+    chat_id,
+    symbol,
+    action,
+    confidence=75.0,
+    stop_loss_pct=None,
+    strategy_label=None,
+    force_market: bool = False,
+    ai_prob: float | None = None,
+    signal_price: float | None = None,
+):
+    """
+    Open a new position.
+
+    Flow:
+      1. Maintenance gate.
+      2. Circuit Breaker / Hard Block state gate.
+      3. Daily drawdown guard  (-5% → hard stop, new in v2).
+      4. Duplicate position check.
+      5. R:R ratio gate         (minimum 1:2, new in v2).
+      6. Dynamic position sizing (1–2% risk, tightened in v2).
+      7. Place order via Capital.com API.
+      8. Record the initial ATR-based trailing stop in local DB.
+    """
+    gate_ok, gate_msg, gate_ctx = _validate_execution_gate(
+        str(chat_id), str(symbol), str(action)
+    )
+    if not gate_ok:
+        _audit_exec_event(
+            stage="pipeline_abort_validate_execution_gate",
+            chat_id=str(chat_id),
+            symbol=str(symbol),
+            action=str(action),
+            details=str(gate_msg)[:240],
+        )
+        return gate_msg
+    lang = str(gate_ctx.get("lang") or get_subscriber_lang(chat_id))
+    reason = str(gate_ctx.get("open_reason") or "")
+    creds = gate_ctx["creds"]
+    base_url = gate_ctx["base_url"]
+    headers = gate_ctx["headers"]
+    balance = float(gate_ctx["balance"])
+    free_margin = float(gate_ctx["free_margin"])
+    order_epic = str(gate_ctx["order_epic"])
+    scanner_ctx = gate_ctx["scanner_ctx"]
+
+    prot_ok, prot_msg, prot_ctx = _generate_protection_levels(
+        chat_id=str(chat_id),
+        symbol=str(symbol),
+        action=str(action),
+        confidence=float(confidence),
+        stop_loss_pct=(float(stop_loss_pct) if stop_loss_pct is not None else None),
+        strategy_label=str(strategy_label or ""),
+        base_url=base_url,
+        headers=headers,
+        order_epic=order_epic,
+        scanner_ctx=scanner_ctx,
+        lang=lang,
+    )
+    if not prot_ok:
+        _audit_exec_event(
+            stage="pipeline_abort_generate_protection_levels",
+            chat_id=str(chat_id),
+            symbol=str(symbol),
+            action=str(action),
+            details=str(prot_msg)[:240],
+        )
+        return prot_msg
+    entry_price = float(prot_ctx["entry_price"])
+    atr = prot_ctx["atr"]
+    effective_sl_pct = float(prot_ctx["effective_sl_pct"])
+    stop_price = float(prot_ctx["stop_price"])
+    min_dist = prot_ctx["min_dist"]
+    max_dist = prot_ctx["max_dist"]
+    rsi_15m_gate = prot_ctx["rsi_15m_gate"]
+    rr_ratio = float(prot_ctx["rr_ratio"])
+    regime_type = str(prot_ctx.get("regime_type") or "UNKNOWN")
+
+    size_ok, size_msg, size_ctx = _calculate_position_sizing(
+        chat_id=str(chat_id),
+        symbol=str(symbol),
+        action=str(action),
+        confidence=float(confidence),
+        strategy_label=str(strategy_label or ""),
+        base_url=base_url,
+        headers=headers,
+        order_epic=order_epic,
+        balance=float(balance),
+        free_margin=float(free_margin),
+        entry_price=float(entry_price),
+        stop_price=float(stop_price),
+        effective_sl_pct=float(effective_sl_pct),
+        rsi_15m_gate=rsi_15m_gate,
+    )
+    if not size_ok:
+        _audit_exec_event(
+            stage="pipeline_abort_calculate_position_sizing",
+            chat_id=str(chat_id),
+            symbol=str(symbol),
+            action=str(action),
+            details=str(size_msg)[:240],
+        )
+        _maybe_notify_rejection(chat_id, size_msg, symbol=symbol, action=action, stage="pre_trade_validation")
+        return size_msg
+    pre_details = size_ctx["pre_details"]
+    pretrade_size = float(size_ctx["pretrade_size"])
+
+    slip_ok, slip_msg, calculated_slippage_pct = _check_slippage_safety(
+        chat_id=str(chat_id),
+        symbol=str(symbol),
+        action=str(action),
+        signal_price=signal_price,
+        base_url=base_url,
+        headers=headers,
+        order_epic=order_epic,
+    )
+    if not slip_ok:
+        _audit_exec_event(
+            stage="pipeline_abort_check_slippage_safety",
+            chat_id=str(chat_id),
+            symbol=str(symbol),
+            action=str(action),
+            details=str(slip_msg)[:240],
+        )
+        return slip_msg
 
     # ── Sprint 2: limit-first entry policy ───────────────────────────────────
     if ENABLE_LIMIT_ORDER_MODE and not force_market:
@@ -2338,6 +2797,7 @@ def place_trade_for_user(
             entry_price=float(entry_price),
             atr=float(atr) if atr is not None else None,
             session_context=scanner_ctx,
+            regime_type=regime_type,
         )
         ok_lim, oid, lim_reason = _place_pending_limit_order(
             chat_id=str(chat_id),
@@ -2513,107 +2973,35 @@ def place_trade_for_user(
     # Atomic execution: open/confirm BOTH legs first, then write to DB.
     opened_broker_legs: list[dict] = []
     parent_session = str(uuid.uuid4())
-    calculated_slippage_pct = 0.0
-    signal_ref_price = None
-    try:
-        if signal_price is not None and math.isfinite(float(signal_price)) and float(signal_price) > 0:
-            signal_ref_price = float(signal_price)
-    except Exception:
-        signal_ref_price = None
-    if signal_ref_price is not None:
-        latest_px = _get_current_price(base_url, headers, order_epic)
-        if (
-            isinstance(latest_px, (int, float))
-            and math.isfinite(float(latest_px))
-            and float(latest_px) > 0
-        ):
-            calculated_slippage_pct = abs(float(latest_px) - float(signal_ref_price)) / float(signal_ref_price)
-            if calculated_slippage_pct > float(MAX_SLIPPAGE_PCT):
-                msg = (
-                    f"[SLIPPAGE] Trade aborted: Current price move "
-                    f"({calculated_slippage_pct * 100.0:.2f}%) exceeds max slippage "
-                    f"({float(MAX_SLIPPAGE_PCT) * 100.0:.1f}%)."
-                )
-                print(msg, flush=True)
-                _audit_exec_event(
-                    stage="slippage_guard_aborted",
-                    chat_id=str(chat_id),
-                    symbol=str(symbol),
-                    action=str(action),
-                    details=(
-                        f"signal={float(signal_ref_price):.4f} latest={float(latest_px):.4f} "
-                        f"slippage_pct={calculated_slippage_pct * 100.0:.4f} "
-                        f"max_slippage_pct={float(MAX_SLIPPAGE_PCT) * 100.0:.4f}"
-                    ),
-                )
-                return msg
+    calculated_slippage_pct = float(calculated_slippage_pct or 0.0)
 
     for idx, leg in enumerate(legs):
         leg_role = str(leg["role"])
         leg_size = float(leg["size"])
         leg_target = float(leg["tp"])
 
-        # Retry TP2 once by widening TP2 if needed.
-        attempts = 2 if leg_role == "TP2" else 1
-        last_err = ""
-        for attempt in range(attempts):
-            ok, out = _open_position_with_protection(
-                base_url,
-                headers,
-                order_epic,
-                action,
-                leg_size,
-                stop_level,
-                leg_target,
-                creds=creds,
-                chat_id=str(chat_id),
-            )
-            if not ok:
-                last_err = str(out)
-                if leg_role == "TP2" and attempt == 0 and min_dist and float(min_dist) > 0 and entry_price > 0:
-                    widen = float(min_dist) * float(TP2_MIN_DISTANCE_BUFFER_MULT)
-                    leg_target = (float(entry_price) + widen) if action == "BUY" else (float(entry_price) - widen)
-                    stop_level, target1, leg_target = _sanitize_protection_levels(
-                        action, entry_price, stop_level, target1, leg_target
-                    )
-                    continue
-                break
-
-            payload = out if isinstance(out, dict) else {}
-            ok_deal, deal_id, deal_ref, cerr = _confirm_deal_and_visibility(
-                base_url,
-                headers,
-                payload,
-                order_epic=order_epic,
-                direction=action,
-                leg_size=float(leg_size),
-                exclude_deal_ids={str(x.get("deal_id")).strip() for x in opened_broker_legs if str(x.get("deal_id")).strip()},
-            )
-            if not ok_deal or not deal_id:
-                last_err = str(cerr)
-                break
-
-            capital_oid = (
-                payload.get("orderId")
-                or payload.get("order_id")
-                or (payload.get("position") or {}).get("orderId")
-            )
-            if capital_oid is not None:
-                capital_oid = str(capital_oid).strip() or None
-            opened_broker_legs.append(
-                {
-                    "role": leg_role,
-                    "size": float(leg_size),
-                    "tp": float(leg_target),
-                    "deal_id": str(deal_id),
-                    "deal_reference": (str(deal_ref).strip() if deal_ref else None),
-                    "capital_order_id": capital_oid,
-                }
-            )
+        ok_leg, last_err, leg_target = _execute_broker_order(
+            base_url=base_url,
+            headers=headers,
+            order_epic=order_epic,
+            action=action,
+            leg_size=float(leg_size),
+            stop_level=float(stop_level),
+            leg_target=float(leg_target),
+            entry_price=float(entry_price),
+            min_dist=min_dist,
+            target1=float(target1),
+            creds=creds,
+            chat_id=str(chat_id),
+            opened_broker_legs=opened_broker_legs,
+        )
+        if ok_leg and opened_broker_legs:
+            opened_broker_legs[-1]["role"] = leg_role
+            deal_id = str(opened_broker_legs[-1].get("deal_id") or "")
             ok_sync, info = _sync_protection_to_broker(
                 base_url,
                 headers,
-                str(deal_id),
+                deal_id,
                 stop_level,
                 float(leg_target),
                 creds=creds,
@@ -2624,7 +3012,6 @@ def place_trade_for_user(
                     f"⚠️  Broker TP/SL sync failed "
                     f"[{symbol} {deal_id}] sl={stop_level:.4f} tp={float(leg_target):.4f} :: {info}"
                 )
-            break
 
         # If this leg failed, rollback any opened legs and abort (no half-configured trade).
         if len(opened_broker_legs) != (idx + 1):

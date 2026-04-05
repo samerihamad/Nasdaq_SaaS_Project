@@ -482,6 +482,14 @@ def detect_regime(df: pd.DataFrame) -> dict:
     }
 
 
+def regime_type(df: pd.DataFrame) -> str:
+    """Convenience helper for callers that only need the regime label."""
+    try:
+        return str((detect_regime(df) or {}).get("type") or "UNKNOWN").upper()
+    except Exception:
+        return "UNKNOWN"
+
+
 # ── Inference: direction-specific probabilities (RF or rule fallback) ───────────
 
 def _direction_probability(df: pd.DataFrame, model, scaler, direction: str) -> float:
