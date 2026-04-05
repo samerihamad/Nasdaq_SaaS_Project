@@ -4,7 +4,9 @@ import time
 import uuid
 import math
 import os
+import logging
 from datetime import datetime, timedelta, timezone
+import pandas as pd
 from bot.notifier import send_telegram_message, notify_admin_alert
 from bot.licensing import safe_decrypt
 from config import (
@@ -24,7 +26,8 @@ from config import (
     EXECUTION_REJECTION_NOTIFY_COOLDOWN_SEC,
 )
 from utils.market_scanner import HTTP_429_COOLDOWN_SEC, scan_multi_timeframe
-from utils.market_hours import is_trading_required
+from utils.market_scanner import scan_market
+from utils.market_hours import is_trading_required, is_nyse_trading_day, ET
 from database.db_manager import (
     DB_PATH,
     is_maintenance_mode,
@@ -53,6 +56,8 @@ from core.sync import capital_deal_still_open
 from core.sync import _capital_all_ids_from_row
 from utils.market_hours import synchronized_utc_now, sync_utc_with_ntp
 
+log = logging.getLogger(__name__)
+
 # Daily per-user symbol→epic cache (and unsupported symbols) to avoid
 # repeating broker lookups for every signal cycle.
 _EPIC_CACHE = {}
@@ -60,6 +65,10 @@ _SESSION_CACHE = {}
 SESSION_TTL_SECONDS = 45
 LOG_ROOT = os.getenv("ENGINE_LOG_ROOT", "logs")
 _REJECTION_NOTIFY_CACHE: dict[str, float] = {}
+MAX_SLIPPAGE_PCT = float(os.getenv("MAX_SLIPPAGE_PCT", "0.003"))
+_EXEC_ATR_PERIOD = 14
+_EXEC_ATR_W_15M = 0.60
+_EXEC_ATR_W_1H = 0.40
 
 _TIME_SHIFT_ERROR_MARKERS = (
     "time shift",
@@ -67,6 +76,69 @@ _TIME_SHIFT_ERROR_MARKERS = (
     "invalid timestamp",
     "request expired",
 )
+
+
+def _atr_from_ohlcv(df: pd.DataFrame | None, period: int = _EXEC_ATR_PERIOD) -> float | None:
+    try:
+        if df is None or len(df) < int(period) + 1:
+            return None
+        work = df.copy()
+        if isinstance(work.columns, pd.MultiIndex):
+            work.columns = work.columns.get_level_values(0)
+        if not all(c in work.columns for c in ("High", "Low", "Close")):
+            return None
+        high = work["High"].astype(float)
+        low = work["Low"].astype(float)
+        close = work["Close"].astype(float)
+        prev_close = close.shift(1)
+        tr = pd.concat(
+            [
+                (high - low),
+                (high - prev_close).abs(),
+                (low - prev_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        atr = tr.rolling(int(period)).mean().iloc[-1]
+        if pd.isna(atr):
+            return None
+        return float(atr)
+    except Exception:
+        return None
+
+
+def _weighted_multi_tf_atr(symbol: str, *, session_context: dict | None = None) -> tuple[float | None, float | None, float | None]:
+    """Weighted ATR from 15m (60%) + 1h (40%) with safe fallback."""
+    atr_15m = _atr_from_ohlcv(scan_market(symbol, period="7d", interval="15m", session_context=session_context))
+    atr_1h = _atr_from_ohlcv(scan_market(symbol, period="14d", interval="1h", session_context=session_context))
+    if atr_15m is not None and atr_1h is not None:
+        return (float(atr_15m) * _EXEC_ATR_W_15M) + (float(atr_1h) * _EXEC_ATR_W_1H), atr_15m, atr_1h
+    if atr_15m is not None:
+        return float(atr_15m), atr_15m, atr_1h
+    if atr_1h is not None:
+        return float(atr_1h), atr_15m, atr_1h
+    return None, None, None
+
+
+def _has_local_pending_or_open_trade(chat_id: str, symbol: str) -> bool:
+    """Execution state guard against duplicate local entries during broker lag."""
+    try:
+        s = str(symbol or "").upper().strip()
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "SELECT 1 FROM trades WHERE chat_id=? AND UPPER(symbol)=? AND UPPER(status) IN ('OPEN','PENDING') LIMIT 1",
+                (str(chat_id), s),
+            )
+            if c.fetchone():
+                return True
+            c.execute(
+                "SELECT 1 FROM pending_limit_orders WHERE chat_id=? AND UPPER(symbol)=? AND UPPER(status)='PENDING' LIMIT 1",
+                (str(chat_id), s),
+            )
+            return bool(c.fetchone())
+    except Exception:
+        return False
 
 
 def _append_daily_exec_log(filename: str, message: str):
@@ -525,6 +597,8 @@ def process_pending_limit_orders():
             processed += 1
             continue
 
+        if not is_nyse_trading_day(synchronized_utc_now().astimezone(ET)):
+            continue
         if not is_trading_required():
             continue
 
@@ -1950,7 +2024,17 @@ def monitor_and_close(chat_id):
 
 # ── Trade execution ───────────────────────────────────────────────────────────
 
-def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct=None, strategy_label=None, force_market: bool = False, ai_prob: float | None = None):
+def place_trade_for_user(
+    chat_id,
+    symbol,
+    action,
+    confidence=75.0,
+    stop_loss_pct=None,
+    strategy_label=None,
+    force_market: bool = False,
+    ai_prob: float | None = None,
+    signal_price: float | None = None,
+):
     """
     Open a new position.
 
@@ -1969,6 +2053,30 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
         return "🔧 System in maintenance — new entries suspended."
 
     lang = get_subscriber_lang(chat_id)
+    # ── Global execution gate: no entries on NYSE closed days ─────────────────
+    if not is_nyse_trading_day(synchronized_utc_now().astimezone(ET)):
+        msg = "[GUARD] Execution blocked: Market is closed."
+        print(msg, flush=True)
+        _audit_exec_event(
+            stage="execution_guard_closed_day",
+            chat_id=str(chat_id),
+            symbol=str(symbol),
+            action=str(action),
+            details="is_nyse_trading_day=0",
+        )
+        return msg
+
+    # ── Local execution state guard (no duplicate OPEN/PENDING) ──────────────
+    if _has_local_pending_or_open_trade(str(chat_id), str(symbol)):
+        msg = f"⏭️ Local guard: existing OPEN/PENDING trade for {symbol}."
+        _audit_exec_event(
+            stage="local_execution_guard_duplicate",
+            chat_id=str(chat_id),
+            symbol=str(symbol),
+            action=str(action),
+            details="duplicate local OPEN/PENDING found",
+        )
+        return msg
 
     # ── Session Gatekeeper (UTC) — do not call broker outside window ─────────
     try:
@@ -2047,7 +2155,15 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
     # ── ATR fetch (used for both RR check and initial stop) ───────────────────
     entry_price = _get_current_price(base_url, headers, order_epic)
     scanner_ctx = _scanner_context_from_creds(str(chat_id), creds)
-    atr         = calculate_atr(symbol, session_context=scanner_ctx)
+    multi_tf_atr_value, atr_15m, atr_1h = _weighted_multi_tf_atr(
+        str(symbol),
+        session_context=scanner_ctx,
+    )
+    atr = (
+        float(multi_tf_atr_value)
+        if multi_tf_atr_value is not None and math.isfinite(float(multi_tf_atr_value))
+        else calculate_atr(symbol, session_context=scanner_ctx)
+    )
     if not isinstance(entry_price, (int, float)) or not math.isfinite(float(entry_price)) or float(entry_price) <= 0:
         msg = f"❌ Order failed ({symbol} {action}): invalid broker entry price"
         _log_trade_rejection(chat_id, symbol, action, "entry_price_validation", msg, f"entry={entry_price}")
@@ -2397,6 +2513,40 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
     # Atomic execution: open/confirm BOTH legs first, then write to DB.
     opened_broker_legs: list[dict] = []
     parent_session = str(uuid.uuid4())
+    calculated_slippage_pct = 0.0
+    signal_ref_price = None
+    try:
+        if signal_price is not None and math.isfinite(float(signal_price)) and float(signal_price) > 0:
+            signal_ref_price = float(signal_price)
+    except Exception:
+        signal_ref_price = None
+    if signal_ref_price is not None:
+        latest_px = _get_current_price(base_url, headers, order_epic)
+        if (
+            isinstance(latest_px, (int, float))
+            and math.isfinite(float(latest_px))
+            and float(latest_px) > 0
+        ):
+            calculated_slippage_pct = abs(float(latest_px) - float(signal_ref_price)) / float(signal_ref_price)
+            if calculated_slippage_pct > float(MAX_SLIPPAGE_PCT):
+                msg = (
+                    f"[SLIPPAGE] Trade aborted: Current price move "
+                    f"({calculated_slippage_pct * 100.0:.2f}%) exceeds max slippage "
+                    f"({float(MAX_SLIPPAGE_PCT) * 100.0:.1f}%)."
+                )
+                print(msg, flush=True)
+                _audit_exec_event(
+                    stage="slippage_guard_aborted",
+                    chat_id=str(chat_id),
+                    symbol=str(symbol),
+                    action=str(action),
+                    details=(
+                        f"signal={float(signal_ref_price):.4f} latest={float(latest_px):.4f} "
+                        f"slippage_pct={calculated_slippage_pct * 100.0:.4f} "
+                        f"max_slippage_pct={float(MAX_SLIPPAGE_PCT) * 100.0:.4f}"
+                    ),
+                )
+                return msg
 
     for idx, leg in enumerate(legs):
         leg_role = str(leg["role"])
@@ -2648,8 +2798,18 @@ def place_trade_for_user(chat_id, symbol, action, confidence=75.0, stop_loss_pct
         details=(
             f"legs={len(opened_legs)} qty={verified_qty:.2f} entry={entry_price:.4f} "
             f"sl={stop_info} rr={float(rr_ratio):.2f} "
-            f"tier={pre_details.get('subscription_tier', 'n/a')}"
+            f"tier={pre_details.get('subscription_tier', 'n/a')} "
+            f"calculated_slippage_pct={calculated_slippage_pct * 100.0:.4f} "
+            f"multi_tf_atr_value={(float(atr) if atr is not None else 0.0):.6f}"
         ),
+    )
+    log.info(
+        "[TRADE_EXECUTION] symbol=%s action=%s entry=%.4f calculated_slippage=%.4f%% multi_tf_atr_value=%.6f",
+        str(symbol),
+        str(action),
+        float(entry_price),
+        float(calculated_slippage_pct * 100.0),
+        float(atr) if atr is not None and math.isfinite(float(atr)) else 0.0,
     )
     return (
         f"✅ Opened — legs: {len(opened_legs)} | size: {verified_qty} | "

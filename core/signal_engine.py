@@ -112,6 +112,18 @@ def _side_label(action: str | None) -> str:
     return a
 
 
+def _latest_signal_price(timeframes: dict) -> float | None:
+    """Use latest 15m close as signal reference price for execution slippage guard."""
+    try:
+        df_15m = (timeframes or {}).get("15m")
+        if df_15m is None or getattr(df_15m, "empty", True):
+            return None
+        px = float(df_15m["Close"].iloc[-1])
+        return px if px > 0 else None
+    except Exception:
+        return None
+
+
 # ── Subscriber helpers ────────────────────────────────────────────────────────
 
 def _get_active_subscribers() -> list[str]:
@@ -295,6 +307,7 @@ def _dispatch_signal(signal: dict, subscribers: list[str]) -> int:
                 confidence,
                 stop_loss_pct=signal.get("stop_loss_pct"),
                 strategy_label=strategy,
+                signal_price=signal.get("signal_price"),
             )
             success = isinstance(result, str) and result.startswith("✅")
             log.info(
@@ -549,6 +562,7 @@ def _analyze_one_from_timeframes(
         "mom_vol_ratio": float(best_mom_vol) if best_label == "Momentum" and best_mom_vol is not None else None,
         "mom_low_vol_entry": bool(best_mom_low_vol) if best_label == "Momentum" else False,
         "mom_macd_bypassed": bool(best_mom_macd_bypassed) if best_label == "Momentum" else False,
+        "signal_price": _latest_signal_price(timeframes),
     }
     return out
 
