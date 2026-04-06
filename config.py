@@ -40,12 +40,12 @@ TARGET_ANALYSIS_BARS = int(os.getenv("TARGET_ANALYSIS_BARS", "200"))
 
 # RSI thresholds — tier-based (Fast vs Gold / GOLDEN signal profile).
 # Tuple: (oversold_max_for_BUY, overbought_min_for_SELL) on 15m RSI.
-FAST_RSI_LIMITS = (40, 60)
+FAST_RSI_LIMITS = (45, 70)
 GOLD_RSI_LIMITS = (30, 70)
 
 # FAST Mean Reversion: at/ beyond these 15m RSI levels, FAST tier may skip reversal candle / sweep (GOLDEN never).
-FAST_MR_RSI_EXTREME_OVERSOLD = float(os.getenv("FAST_MR_RSI_EXTREME_OVERSOLD", "25"))
-FAST_MR_RSI_EXTREME_OVERBOUGHT = float(os.getenv("FAST_MR_RSI_EXTREME_OVERBOUGHT", "75"))
+FAST_MR_RSI_EXTREME_OVERSOLD = float(os.getenv("FAST_MR_RSI_EXTREME_OVERSOLD", "45"))
+FAST_MR_RSI_EXTREME_OVERBOUGHT = float(os.getenv("FAST_MR_RSI_EXTREME_OVERBOUGHT", "70"))
 
 # Strategy scan defaults: use Fast limits so the engine emits candidates broadly;
 # per-user Gold tier re-validates RSI at execution time in validate_pre_trade().
@@ -88,7 +88,7 @@ MIN_15M_BARS = int(os.getenv("MIN_15M_BARS", "100"))
 
 # Momentum tier gates on 15m (scanner emits FAST-style signals; GOLDEN re-checked in dispatch).
 FAST_MOM_ADX_THRESHOLD = float(os.getenv("FAST_MOM_ADX_THRESHOLD", "18"))
-FAST_MOM_VOL_RATIO = float(os.getenv("FAST_MOM_VOL_RATIO", "1.0"))
+FAST_MOM_VOL_RATIO = float(os.getenv("FAST_MOM_VOL_RATIO", "0.6"))
 # When 15m RSI > FAST_MOM_RSI_VOL_TIER_HIGH (BUY), allow volume down to this multiple of MA20.
 FAST_MOM_VOL_RATIO_HIGH_RSI = float(os.getenv("FAST_MOM_VOL_RATIO_HIGH_RSI", "0.8"))
 FAST_MOM_RSI_VOL_TIER_HIGH = float(os.getenv("FAST_MOM_RSI_VOL_TIER_HIGH", "70"))

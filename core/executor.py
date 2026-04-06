@@ -27,8 +27,12 @@ from config import (
     LIMIT_ORDER_ALLOW_MARKET_FALLBACK,
     EXECUTION_REJECTION_NOTIFY_COOLDOWN_SEC,
 )
-from utils.market_scanner import HTTP_429_COOLDOWN_SEC, scan_multi_timeframe
-from utils.market_scanner import scan_market
+from utils.market_scanner import (
+    HTTP_429_COOLDOWN_SEC,
+    respect_capital_http_interval_sync,
+    scan_multi_timeframe,
+    scan_market,
+)
 from utils.market_hours import is_trading_required, is_nyse_trading_day, ET
 from database.db_manager import (
     DB_PATH,
@@ -294,25 +298,51 @@ def _maybe_notify_rejection(chat_id: str, message: str, *, symbol: str = "", act
         return False
 
 
-def _log_trade_rejection(chat_id, symbol, action, stage: str, reason: str, details: str = ""):
+def _log_trade_rejection(
+    chat_id,
+    symbol,
+    action,
+    stage: str,
+    reason: str,
+    details: str = "",
+    *,
+    reason_code: str | None = None,
+):
     """
     Persist expected rejections for audit without spamming Telegram.
     """
     try:
+        code = (reason_code or stage or "UNKNOWN").strip().upper().replace(" ", "_")
         conn = sqlite3.connect(DB_PATH)
-        conn.execute(
-            "INSERT INTO trade_rejections (created_at, chat_id, symbol, action, stage, reason, details) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                datetime.now(timezone.utc).isoformat(),
-                str(chat_id),
-                str(symbol),
-                str(action),
-                str(stage),
-                str(reason),
-                str(details or ""),
-            ),
-        )
+        try:
+            conn.execute(
+                "INSERT INTO trade_rejections (created_at, chat_id, symbol, action, stage, reason, details, reason_code) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    str(chat_id),
+                    str(symbol),
+                    str(action),
+                    str(stage),
+                    str(reason),
+                    str(details or ""),
+                    str(code),
+                ),
+            )
+        except Exception:
+            conn.execute(
+                "INSERT INTO trade_rejections (created_at, chat_id, symbol, action, stage, reason, details) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    str(chat_id),
+                    str(symbol),
+                    str(action),
+                    str(stage),
+                    str(reason),
+                    str(details or ""),
+                ),
+            )
         conn.commit()
         conn.close()
     except Exception:
@@ -420,6 +450,7 @@ def _resilient_capital_get(
     GET with broker timestamp + one-shot self-heal for time/session errors.
     Returns (response, active_headers).
     """
+    respect_capital_http_interval_sync()
     stamped = _with_broker_timestamp_headers(headers)
     try:
         res = requests.get(url, headers=stamped, timeout=timeout)
@@ -436,6 +467,7 @@ def _resilient_capital_get(
         if recovered and payload and payload.get("headers"):
             new_headers = payload["headers"]
             try:
+                respect_capital_http_interval_sync()
                 res2 = requests.get(
                     url,
                     headers=_with_broker_timestamp_headers(new_headers),
@@ -503,6 +535,7 @@ def _broker_request(
     Unified broker request wrapper.
     Returns: (ok, payload, error_msg, status_code)
     """
+    respect_capital_http_interval_sync()
     req_headers = _with_broker_timestamp_headers(headers)
     try:
         res = requests.request(
@@ -534,6 +567,7 @@ def _broker_request(
                     pass
                 retry_headers = _with_broker_timestamp_headers(payload["headers"])
                 try:
+                    respect_capital_http_interval_sync()
                     res2 = requests.request(
                         method=method.upper(),
                         url=url,
@@ -840,6 +874,7 @@ def get_session(creds, chat_id: str | None = None, force_refresh: bool = False):
     # Retry briefly before surfacing an authentication failure to the user.
     for attempt in range(3):
         try:
+            respect_capital_http_interval_sync()
             auth_headers = _with_broker_timestamp_headers(headers)
             auth_res = requests.post(
                 f"{base_url}/session",

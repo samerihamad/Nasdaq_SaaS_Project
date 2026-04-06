@@ -65,7 +65,7 @@ from core.market_structure import (
 log = logging.getLogger(__name__)
 
 # FAST tier floors (ops): relaxed ADX; minimum volume vs MA20 for long/short.
-_FAST_MOM_ADX_MIN = 15.0
+_FAST_MOM_ADX_MIN = 12.0
 _FAST_MOM_VOL_RATIO_FLOOR = 0.7
 
 

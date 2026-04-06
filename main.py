@@ -319,18 +319,33 @@ def _log_structural_rejection(symbol: str, strategy: str, reason: str, notified:
     # Keep structural rejections auditable in DB without Telegram noise.
     try:
         conn = sqlite3.connect(DB_PATH)
-        conn.execute(
-            "INSERT INTO trade_rejections (created_at, chat_id, symbol, action, stage, reason, details) "
-            "VALUES (datetime('now'), ?, ?, ?, ?, ?, ?)",
-            (
-                str(ADMIN_CHAT_ID or "n/a"),
-                str(symbol or ""),
-                "",
-                "structural_filter",
-                str(reason or ""),
-                f"strategy={strategy} notified={int(bool(notified))}",
-            ),
-        )
+        try:
+            conn.execute(
+                "INSERT INTO trade_rejections (created_at, chat_id, symbol, action, stage, reason, details, reason_code) "
+                "VALUES (datetime('now'), ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    str(ADMIN_CHAT_ID or "n/a"),
+                    str(symbol or ""),
+                    "",
+                    "structural_filter",
+                    str(reason or ""),
+                    f"strategy={strategy} notified={int(bool(notified))}",
+                    "STRUCTURAL_FILTER",
+                ),
+            )
+        except Exception:
+            conn.execute(
+                "INSERT INTO trade_rejections (created_at, chat_id, symbol, action, stage, reason, details) "
+                "VALUES (datetime('now'), ?, ?, ?, ?, ?, ?)",
+                (
+                    str(ADMIN_CHAT_ID or "n/a"),
+                    str(symbol or ""),
+                    "",
+                    "structural_filter",
+                    str(reason or ""),
+                    f"strategy={strategy} notified={int(bool(notified))}",
+                ),
+            )
         conn.commit()
         conn.close()
     except Exception:

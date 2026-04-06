@@ -252,6 +252,10 @@ def create_db():
             reason     TEXT,
             details    TEXT)'''
     )
+    try:
+        c.execute("ALTER TABLE trade_rejections ADD COLUMN reason_code TEXT")
+    except Exception:
+        pass
 
     # ── Pending limit orders (Sprint 2) ─────────────────────────────────────
     c.execute(

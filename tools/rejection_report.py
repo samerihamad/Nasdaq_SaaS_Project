@@ -5,6 +5,10 @@ from database.db_manager import DB_PATH
 def main():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    c.execute("PRAGMA table_info(trade_rejections)")
+    tr_cols = [str(r[1]) for r in (c.fetchall() or [])]
+    reason_code_sql = ", reason_code" if "reason_code" in tr_cols else ""
+
     c.execute(
         """
         SELECT stage, COUNT(*) AS n
@@ -23,8 +27,8 @@ def main():
             print(f"{stage}: {n}")
 
     c.execute(
-        """
-        SELECT created_at, chat_id, symbol, action, stage, reason
+        f"""
+        SELECT created_at, chat_id, symbol, action, stage, reason{reason_code_sql}
         FROM trade_rejections
         ORDER BY id DESC
         LIMIT 30

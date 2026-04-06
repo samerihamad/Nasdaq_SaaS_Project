@@ -59,7 +59,7 @@ _DYNAMIC_CHOPPY_THRESHOLD = 62.0
 def _dynamic_confidence_threshold(timeframes: dict, _symbol: str) -> float:
     """
     Per-symbol minimum confidence: FAST_MIN_CONFIDENCE baseline, 52% if strong trend
-    (bullish: ADX > 25 and RSI > 70; bearish: ADX > 25 and RSI < 30), 62% if choppy (ADX < 15).
+    (bullish: ADX > 25 and RSI > 70; bearish: ADX > 25 and RSI < 30), 62% if choppy (ADX < 12).
     Applies to both Long (BUY) and Short (SELL) — threshold is on confidence %, not direction.
     """
     base = float(FAST_MIN_CONFIDENCE)
@@ -77,7 +77,7 @@ def _dynamic_confidence_threshold(timeframes: dict, _symbol: str) -> float:
     except Exception:
         return base
 
-    if adx_val < 15:
+    if adx_val < 12:
         thr = _DYNAMIC_CHOPPY_THRESHOLD
         log.info(
             "[DYNAMIC] Adjusted threshold to %.1f%% due to Choppy conditions.",

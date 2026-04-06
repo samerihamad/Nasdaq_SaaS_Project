@@ -1,6 +1,6 @@
 """
 Capital.com OHLCV via aiohttp. Watchlist Level 2 gap filter calls `scan_market_async`
-with a shared session and `CAPITAL_HTTP_CONCURRENCY` (max 5; see utils.filters.level2_filter_async).
+with a shared session and `CAPITAL_HTTP_CONCURRENCY` (clamped to 1 for stability; see env).
 
 Multi-symbol watchlist scans use `chunked_parallel_gather` (default batch 3, 200ms pause
 between batches) so `asyncio.gather` is never applied to the full symbol list at once.
@@ -40,8 +40,9 @@ _SESSION_TTL_SEC = int(os.getenv("MARKET_DATA_SESSION_TTL_SEC", "45"))
 _LOG_ROOT = os.getenv("ENGINE_LOG_ROOT", "logs")
 _CAPITAL_PRICES_MAX_BARS_CAP = int(os.getenv("CAPITAL_PRICES_MAX_BARS_CAP", "1000"))
 _DAILY_PRICES_MAX = min(1000, max(50, _CAPITAL_PRICES_MAX_BARS_CAP))
-# Hard cap 5 concurrent Capital.com HTTP calls (stability-mode default: 1).
-CAPITAL_HTTP_CONCURRENCY = max(1, min(5, int(os.getenv("CAPITAL_HTTP_CONCURRENCY", "1"))))
+# Hard cap 5 concurrent Capital.com HTTP calls; ops default 1 (env values >1 are clamped to 1).
+_CAP_ENV = max(1, min(5, int(os.getenv("CAPITAL_HTTP_CONCURRENCY", "1"))))
+CAPITAL_HTTP_CONCURRENCY = min(1, _CAP_ENV)
 # After this many successful Capital.com responses, pause 1s ("breathing") to reduce throttling.
 _CAPITAL_SUCCESS_BREATH_EVERY = 15
 _CAPITAL_SUCCESS_COUNT = 0
@@ -62,9 +63,12 @@ CHUNKED_SCAN_INTER_BATCH_SLEEP_SEC = float(os.getenv("CHUNKED_SCAN_INTER_BATCH_S
 # Full pause after HTTP 429 so the broker can reset rate-limit counters.
 HTTP_429_COOLDOWN_SEC = float(os.getenv("HTTP_429_COOLDOWN_SEC", "60"))
 # Global minimum interval between any Capital HTTP requests (GET/POST).
-MIN_REQUEST_INTERVAL = float(os.getenv("MIN_REQUEST_INTERVAL", "0.25"))
+MIN_REQUEST_INTERVAL = float(os.getenv("MIN_REQUEST_INTERVAL", "0.8"))
 _LAST_REQUEST_TIME = 0.0
 _REQUEST_GATE_LOCK = asyncio.Lock()
+# Sync broker HTTP (core/executor) — same spacing as async, separate clock to avoid lock mixing.
+_LAST_SYNC_REQUEST_TIME = 0.0
+_REQUEST_SYNC_LOCK = threading.Lock()
 
 _SESSION_CACHE: dict[str, dict] = {}
 _EPIC_CACHE: dict[str, str] = {}
@@ -101,6 +105,22 @@ def _new_http_semaphore() -> asyncio.Semaphore:
     return asyncio.Semaphore(CAPITAL_HTTP_CONCURRENCY)
 
 
+def respect_capital_http_interval_sync() -> None:
+    """
+    Space synchronous Capital.com HTTP calls (e.g. requests in core/executor).
+    Uses the same MIN_REQUEST_INTERVAL and human-like jitter as async paths.
+    """
+    global _LAST_SYNC_REQUEST_TIME
+    with _REQUEST_SYNC_LOCK:
+        now = time.monotonic()
+        elapsed = now - _LAST_SYNC_REQUEST_TIME
+        if elapsed < MIN_REQUEST_INTERVAL:
+            wait_time = MIN_REQUEST_INTERVAL - elapsed
+            jitter = random.uniform(0.1, 0.3)
+            time.sleep(wait_time + jitter)
+        _LAST_SYNC_REQUEST_TIME = time.monotonic()
+
+
 async def _respect_global_request_interval() -> None:
     """Serialize request starts so GET/POST share one global anti-burst gate."""
     global _LAST_REQUEST_TIME
@@ -109,7 +129,7 @@ async def _respect_global_request_interval() -> None:
         elapsed = now - _LAST_REQUEST_TIME
         if elapsed < MIN_REQUEST_INTERVAL:
             wait_time = MIN_REQUEST_INTERVAL - elapsed
-            jitter = random.uniform(0.05, 0.15)
+            jitter = random.uniform(0.1, 0.3)
             await asyncio.sleep(wait_time + jitter)
         _LAST_REQUEST_TIME = time.monotonic()
 
