@@ -300,6 +300,14 @@ DEEP_DIRECTION_INFERENCE_KIND = os.getenv("DEEP_DIRECTION_INFERENCE_KIND", DEEP_
 # Refresh watchlist while market is open (seconds)
 WATCHLIST_REFRESH_SECONDS = 3600
 
+# ── Admin Streamlit dashboard (Telegram /admin deep link) ─────────────────────
+# Public base URL for the Streamlit app (no trailing path). Token is appended by the bot.
+STREAMLIT_PUBLIC_URL = os.getenv("STREAMLIT_PUBLIC_URL", "http://127.0.0.1:8501").strip()
+# Shared secret: must match Streamlit ?token= and be kept private.
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
+# Optional: shell command to restart the trading engine (Linux systemd example in deploy/).
+ENGINE_RESTART_CMD = os.getenv("ENGINE_RESTART_CMD", "").strip()
+
 # ── Capital.com Broker ────────────────────────────────────────────────────────
 
 # These are per-user credentials stored in DB; the keys below are for

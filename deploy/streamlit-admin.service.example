@@ -1,0 +1,23 @@
+# Example systemd unit — copy to /etc/systemd/system/natb-streamlit.service and adjust paths/user.
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable natb-streamlit
+#   sudo systemctl start natb-streamlit
+#
+# Ensure .env in WorkingDirectory contains ADMIN_TOKEN, TELEGRAM_BOT_TOKEN, etc.
+
+[Unit]
+Description=NATB Streamlit Admin Dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/natb/Nasdaq_SaaS_Project
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/natb/Nasdaq_SaaS_Project/.venv/bin/streamlit run streamlit_admin/app.py --server.port 8501 --server.address 0.0.0.0
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

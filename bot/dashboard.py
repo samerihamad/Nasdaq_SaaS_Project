@@ -48,7 +48,13 @@ from core.executor import get_user_credentials, get_session
 from core.sync import reconcile, backfill_closed_pnls
 from core.trailing_stop import close_trade_in_db
 from core.trade_session_finalize import after_trade_leg_closed
-from bot.admin import admin_handler, limits_handler, monitor_handler, audit_sync_handler
+from bot.admin import (
+    admin_handler,
+    admin_inline_callback,
+    limits_handler,
+    monitor_handler,
+    audit_sync_handler,
+)
 from database.db_manager import (
     create_db, get_bank_details,
     DB_PATH,
@@ -2331,6 +2337,7 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND, report_input_handler
     ))
+    app.add_handler(CallbackQueryHandler(admin_inline_callback, pattern=r"^admin_"))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(CommandHandler('override',   override_handler))
     app.add_handler(CommandHandler('stop_today', stop_today_handler))

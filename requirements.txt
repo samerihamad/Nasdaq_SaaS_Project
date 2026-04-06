@@ -39,6 +39,9 @@ google-auth-oauthlib>=1.0.0
 # Technical indicators (not imported by core code today; install if you add TA features):
 #   pip install "pandas-ta>=0.3.14"
 #
+# Admin Streamlit dashboard (streamlit_admin/app.py):
+#   pip install "streamlit>=1.30.0"
+#
 # ── Optional (install only if you use the feature) ───────────────────────────
 # Dropbox backup (BACKUP_PROVIDER=dropbox):  pip install "dropbox>=11.36"
 # WhatsApp alerts (TWILIO_* in .env):        pip install "twilio>=8.0"

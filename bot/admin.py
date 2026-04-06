@@ -3,6 +3,9 @@ Admin Control Panel — NATB v2.0
 
 All commands require the sender's chat_id to match ADMIN_CHAT_ID in .env.
 
+  /admin (no args) — Arabic welcome + Streamlit dashboard URL (?token=ADMIN_TOKEN)
+    and inline buttons: scan stats, restart engine, time check, emergency kill switch.
+
 Commands:
   /admin maintenance on|off      — toggle global maintenance mode
   /admin killswitch on|off       — stop ALL users globally
@@ -22,9 +25,11 @@ Commands:
 
 import os
 import sqlite3
+import subprocess
+import sys
 from datetime import datetime, timezone
 import requests
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from database.db_manager import (
@@ -56,6 +61,9 @@ from config import (
     ENABLE_MS_SCORE_AI_INTEGRATION,
     MS_SCORE_AI_SCALE,
     MS_SCORE_AI_MAX_IMPACT,
+    STREAMLIT_PUBLIC_URL,
+    ADMIN_TOKEN,
+    ENGINE_RESTART_CMD,
 )
 
 ADMIN_CHAT_ID = os.getenv('ADMIN_CHAT_ID', '')
@@ -64,6 +72,83 @@ LOG_ROOT      = os.getenv("ENGINE_LOG_ROOT", "logs")
 
 def _is_admin(chat_id: str) -> bool:
     return bool(ADMIN_CHAT_ID) and str(chat_id) == str(ADMIN_CHAT_ID)
+
+
+def build_admin_dashboard_keyboard() -> InlineKeyboardMarkup:
+    """URL to Streamlit + quick admin actions (callbacks: admin_*)."""
+    base = (STREAMLIT_PUBLIC_URL or "http://127.0.0.1:8501").rstrip("/")
+    tok = (ADMIN_TOKEN or "").strip()
+    dashboard_url = f"{base}/?token={tok}" if tok else base
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🌐 لوحة التحكم / Open dashboard", url=dashboard_url)],
+            [
+                InlineKeyboardButton("📊 Check Stats", callback_data="admin_stats"),
+                InlineKeyboardButton("🔄 Restart Engine", callback_data="admin_restart"),
+            ],
+            [
+                InlineKeyboardButton("🕒 Check Time", callback_data="admin_time"),
+                InlineKeyboardButton("🛑 Global Emergency Stop", callback_data="admin_killswitch"),
+            ],
+        ]
+    )
+
+
+def _build_today_scan_stats_text() -> str:
+    """Today's scan / engine cycle tail + AI runtime panel."""
+    day_dir = os.path.join(LOG_ROOT, datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+    cycle_path = os.path.join(day_dir, "engine_cycle.txt")
+    parts: list[str] = []
+    try:
+        if os.path.isfile(cycle_path):
+            with open(cycle_path, "r", encoding="utf-8", errors="ignore") as f:
+                all_lines = [ln.strip() for ln in f if ln.strip()]
+            tail = all_lines[-12:] if len(all_lines) > 12 else all_lines
+            parts.append("*Today's scan cycles (last lines)*\n" + "\n".join(f"`{ln}`" for ln in tail))
+        else:
+            parts.append("_No engine_cycle.txt for today yet._")
+    except Exception as exc:
+        parts.append(f"_Could not read cycle log: {exc}_")
+    parts.append("")
+    parts.append(_build_ai_runtime_panel())
+    return "\n".join(parts)
+
+
+def _run_time_sync_diagnostic() -> str:
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    script = os.path.join(root, "tools", "check_time_sync.py")
+    try:
+        p = subprocess.run(
+            [sys.executable, script],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            cwd=root,
+        )
+        out = ((p.stdout or "") + "\n" + (p.stderr or "")).strip()
+        return out[:3800] if out else "(no output)"
+    except Exception as exc:
+        return f"Time diagnostic failed: {exc}"
+
+
+def _try_engine_restart() -> tuple[bool, str]:
+    cmd = (ENGINE_RESTART_CMD or "").strip()
+    if not cmd:
+        return False, (
+            "ENGINE_RESTART_CMD is not set. Set it in .env, e.g. "
+            "`ENGINE_RESTART_CMD=sudo systemctl restart your-engine.service` "
+            "(Linux) or a script that restarts the bot/engine safely."
+        )
+    try:
+        subprocess.Popen(
+            cmd,
+            shell=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True, f"Restart command dispatched: `{cmd[:180]}`"
+    except Exception as exc:
+        return False, f"Failed to start restart command: {exc}"
 
 
 def _fmt_remaining(expires_at: str) -> str:
@@ -356,7 +441,7 @@ async def admin_handler(update: Update, context):
     chat_id = str(update.message.chat_id)
 
     if not _is_admin(chat_id):
-        await update.message.reply_text("Access denied.")
+        await update.message.reply_text("Access Denied")
         return
     try:
         touch_bot_activity(chat_id)
@@ -366,25 +451,8 @@ async def admin_handler(update: Update, context):
     args = context.args or []
     if not args:
         await update.message.reply_text(
-            "*Admin Commands:*\n"
-            "`/admin maintenance on|off`\n"
-            "`/admin killswitch on|off`\n"
-            "`/admin killuser <chat_id>`\n"
-            "`/admin reviveuser <chat_id>`\n"
-            "`/admin riskset <chat_id> <min%> <max%>`\n"
-            "`/admin broadcast <message>`\n"
-            "`/admin monitor`\n"
-            "`/admin ai`\n"
-            "`/admin subscribers`\n"
-            "`/admin status`\n"
-            "`/admin orphans`\n"
-            "`/admin issue <chat_id> <days>`\n"
-            "`/admin setbank <field> <value>`\n"
-            "`/admin getbank`\n"
-            "`/admin payments`\n"
-            "`/admin purgeusers CONFIRM`\n"
-            "`/admin audit_sync [chat_id] [fix]`",
-            parse_mode='Markdown'
+            "مرحباً أيها المدير، للدخول إلى لوحة التحكم اضغط هنا",
+            reply_markup=build_admin_dashboard_keyboard(),
         )
         return
 
@@ -749,6 +817,55 @@ async def admin_handler(update: Update, context):
         await update.message.reply_text(
             f"Unknown command: `{cmd}`", parse_mode='Markdown'
         )
+
+
+async def admin_inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Inline keyboard actions from /admin dashboard (admin_* callbacks).
+    """
+    q = update.callback_query
+    if not q:
+        return
+    uid = str(q.message.chat_id)
+    if not _is_admin(uid):
+        await q.answer("Access Denied", show_alert=True)
+        return
+    try:
+        touch_bot_activity(uid)
+    except Exception:
+        pass
+
+    data = str(q.data or "")
+    await q.answer()
+
+    if data == "admin_stats":
+        await q.message.reply_text(
+            _build_today_scan_stats_text()[:4000],
+            parse_mode="Markdown",
+        )
+        return
+    if data == "admin_time":
+        await q.message.reply_text(_run_time_sync_diagnostic()[:4000])
+        return
+    if data == "admin_restart":
+        ok, msg = _try_engine_restart()
+        await q.message.reply_text(
+            ("✅ " if ok else "⚠️ ") + msg,
+            parse_mode="Markdown",
+        )
+        return
+    if data == "admin_killswitch":
+        set_master_kill_switch(True)
+        count = broadcast_to_all(
+            "*MASTER KILL SWITCH ACTIVATED*\n\n"
+            "All new trade entries have been halted by the admin.\n"
+            "Open positions remain active until TP / SL."
+        )
+        await q.message.reply_text(
+            f"*Emergency stop: ON*\n{count} subscriber(s) notified.",
+            parse_mode="Markdown",
+        )
+        return
 
 
 async def limits_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
