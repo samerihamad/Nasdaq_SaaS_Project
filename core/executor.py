@@ -32,6 +32,7 @@ from utils.market_scanner import (
     respect_capital_http_interval_sync,
     scan_multi_timeframe,
     scan_market,
+    _SESSION_CACHE as _SHARED_SESSION_CACHE,
 )
 from utils.market_hours import is_trading_required, is_nyse_trading_day, ET
 from database.db_manager import (
@@ -67,7 +68,6 @@ log = logging.getLogger(__name__)
 # Daily per-user symbol→epic cache (and unsupported symbols) to avoid
 # repeating broker lookups for every signal cycle.
 _EPIC_CACHE = {}
-_SESSION_CACHE = {}
 SESSION_TTL_SECONDS = 45
 LOG_ROOT = os.getenv("ENGINE_LOG_ROOT", "logs")
 _REJECTION_NOTIFY_CACHE: dict[str, float] = {}
@@ -863,11 +863,18 @@ def get_session(creds, chat_id: str | None = None, force_refresh: bool = False):
         "Accept": "application/json",
     }
 
-    cache_key = f"{api_key}|{is_demo}|{user_email}"
+    # Use the same cache_key scheme as utils.market_scanner so scanner + executor share sessions.
+    cache_key = f"{api_key[:8]}|{user_email}|{int(bool(is_demo))}"
     now = datetime.now(timezone.utc)
-    cached = _SESSION_CACHE.get(cache_key)
-    if (not force_refresh) and cached and cached.get("expires_at") and cached["expires_at"] > now:
-        return cached["base_url"], cached["headers"]
+    cached = _SHARED_SESSION_CACHE.get(cache_key, {})
+    try:
+        expires_ts = float(cached.get("expires_ts") or 0.0)
+    except Exception:
+        expires_ts = 0.0
+    cached_headers = cached.get("headers")
+    cached_base = cached.get("base_url")
+    if (not force_refresh) and cached_headers and cached_base and now.timestamp() < expires_ts:
+        return str(cached_base), dict(cached_headers)
 
     auth_res = None
     # Capital auth can fail transiently (network edge / temporary backend errors).
@@ -891,10 +898,10 @@ def get_session(creds, chat_id: str | None = None, force_refresh: bool = False):
                 "CST": auth_res.headers.get("CST"),
                 "X-SECURITY-TOKEN": auth_res.headers.get("X-SECURITY-TOKEN"),
             }
-            _SESSION_CACHE[cache_key] = {
+            _SHARED_SESSION_CACHE[cache_key] = {
                 "base_url": base_url,
                 "headers": session_headers,
-                "expires_at": now + timedelta(seconds=SESSION_TTL_SECONDS),
+                "expires_ts": datetime.now(timezone.utc).timestamp() + float(SESSION_TTL_SECONDS),
             }
             return base_url, session_headers
         if auth_res is not None and int(auth_res.status_code) == 429:

@@ -62,13 +62,16 @@ CHUNKED_SCAN_BATCH_SIZE = max(1, min(3, int(os.getenv("CHUNKED_SCAN_BATCH_SIZE",
 CHUNKED_SCAN_INTER_BATCH_SLEEP_SEC = float(os.getenv("CHUNKED_SCAN_INTER_BATCH_SLEEP_SEC", "0.2"))
 # Full pause after HTTP 429 so the broker can reset rate-limit counters.
 HTTP_429_COOLDOWN_SEC = float(os.getenv("HTTP_429_COOLDOWN_SEC", "60"))
-# Global minimum interval between any Capital HTTP requests (GET/POST).
-MIN_REQUEST_INTERVAL = float(os.getenv("MIN_REQUEST_INTERVAL", "0.8"))
-_LAST_REQUEST_TIME = 0.0
-_REQUEST_GATE_LOCK = asyncio.Lock()
-# Sync broker HTTP (core/executor) — same spacing as async, separate clock to avoid lock mixing.
-_LAST_SYNC_REQUEST_TIME = 0.0
-_REQUEST_SYNC_LOCK = threading.Lock()
+# Global minimum interval between any Capital HTTP requests (GET/POST) across BOTH:
+# - async aiohttp scanner calls
+# - sync requests-based executor calls
+#
+# This is the single global anti-burst gate (prevents concurrent API hits).
+GLOBAL_MIN_INTERVAL = float(os.getenv("MIN_REQUEST_INTERVAL", "1.1"))
+GLOBAL_JITTER_MIN = 0.2
+GLOBAL_JITTER_MAX = 0.5
+_LAST_REQUEST_TIME = 0.0  # monotonic time of the *reserved* next request slot
+_GLOBAL_REQUEST_LOCK = threading.Lock()
 
 _SESSION_CACHE: dict[str, dict] = {}
 _EPIC_CACHE: dict[str, str] = {}
@@ -125,33 +128,38 @@ def _new_http_semaphore() -> asyncio.Semaphore:
     return asyncio.Semaphore(CAPITAL_HTTP_CONCURRENCY)
 
 
+def _reserve_request_slot() -> float:
+    """
+    Reserve the next allowed request start time and return how long the caller should wait.
+    Uses one shared timer for both sync + async paths (thundering-herd protection).
+    """
+    global _LAST_REQUEST_TIME
+    now = time.monotonic()
+    jitter = random.uniform(float(GLOBAL_JITTER_MIN), float(GLOBAL_JITTER_MAX))
+    with _GLOBAL_REQUEST_LOCK:
+        scheduled = max(float(_LAST_REQUEST_TIME), now) + float(GLOBAL_MIN_INTERVAL) + jitter
+        wait = max(0.0, scheduled - now)
+        _LAST_REQUEST_TIME = float(scheduled)
+    if wait > 0.0005:
+        try:
+            log.warning("[LEAK-PREVENTION] Delaying request by %.2fs", float(wait))
+        except Exception:
+            print(f"[LEAK-PREVENTION] Delaying request by {wait:.2f}s", flush=True)
+    return float(wait)
+
+
 def respect_capital_http_interval_sync() -> None:
-    """
-    Space synchronous Capital.com HTTP calls (e.g. requests in core/executor).
-    Uses the same MIN_REQUEST_INTERVAL and human-like jitter as async paths.
-    """
-    global _LAST_SYNC_REQUEST_TIME
-    with _REQUEST_SYNC_LOCK:
-        now = time.monotonic()
-        elapsed = now - _LAST_SYNC_REQUEST_TIME
-        if elapsed < MIN_REQUEST_INTERVAL:
-            wait_time = MIN_REQUEST_INTERVAL - elapsed
-            jitter = random.uniform(0.1, 0.3)
-            time.sleep(wait_time + jitter)
-        _LAST_SYNC_REQUEST_TIME = time.monotonic()
+    """Global request spacing for synchronous Capital.com HTTP calls."""
+    wait = _reserve_request_slot()
+    if wait > 0:
+        time.sleep(wait)
 
 
 async def _respect_global_request_interval() -> None:
-    """Serialize request starts so GET/POST share one global anti-burst gate."""
-    global _LAST_REQUEST_TIME
-    async with _REQUEST_GATE_LOCK:
-        now = time.monotonic()
-        elapsed = now - _LAST_REQUEST_TIME
-        if elapsed < MIN_REQUEST_INTERVAL:
-            wait_time = MIN_REQUEST_INTERVAL - elapsed
-            jitter = random.uniform(0.1, 0.3)
-            await asyncio.sleep(wait_time + jitter)
-        _LAST_REQUEST_TIME = time.monotonic()
+    """Global request spacing for async Capital.com HTTP calls (shared with sync paths)."""
+    wait = _reserve_request_slot()
+    if wait > 0:
+        await asyncio.sleep(wait)
 
 
 def _next_429_cooldown() -> float:
@@ -1029,18 +1037,12 @@ async def scan_multi_timeframe_async(
             )
             return None
 
-        raw_1d, raw_4h, raw_15m = await asyncio.gather(
-            _fetch_bars_aio(
-                session, semaphore, base_url, headers, epic, "1d", log_symbol=str(symbol)
-            ),
-            _fetch_bars_aio(
-                session, semaphore, base_url, headers, epic, "4h", log_symbol=str(symbol)
-            ),
-            _fetch_bars_aio(
-                session, semaphore, base_url, headers, epic, "15m", log_symbol=str(symbol)
-            ),
-            return_exceptions=True,
-        )
+        # Do not burst multiple timeframe requests in parallel.
+        # Even with a semaphore, parallel tasks can create back-to-back request starts across
+        # different codepaths; keep this strictly sequential to respect GLOBAL_MIN_INTERVAL.
+        raw_1d = await _fetch_bars_aio(session, semaphore, base_url, headers, epic, "1d", log_symbol=str(symbol))
+        raw_4h = await _fetch_bars_aio(session, semaphore, base_url, headers, epic, "4h", log_symbol=str(symbol))
+        raw_15m = await _fetch_bars_aio(session, semaphore, base_url, headers, epic, "15m", log_symbol=str(symbol))
 
         def _unwrap(res: object, tf: str) -> pd.DataFrame | None:
             if isinstance(res, Exception):

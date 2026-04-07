@@ -138,6 +138,10 @@ RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "0.5"))
 # Signals with confidence below this are discarded before risk checks
 MIN_CONFIDENCE       = 67.0
 
+# Global minimum strategy confidence (%). If a signal meets this floor, it should
+# proceed to the next stage regardless of older per-strategy defaults.
+GLOBAL_MIN_AI_CONFIDENCE = float(os.getenv("GLOBAL_MIN_AI_CONFIDENCE", "55.0"))
+
 # ── Phase 8: Dual Signal Profiles (Fast vs Golden) ───────────────────────────
 # Backward compatibility:
 # - Existing MIN_CONFIDENCE / MR_MIN_SCORE / MOM_MIN_SCORE remain valid defaults.

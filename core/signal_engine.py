@@ -28,6 +28,7 @@ from config import (
     MIN_CONFIDENCE,
     SIGNAL_MIN_CONFIDENCE,
     FAST_MIN_CONFIDENCE,
+    GLOBAL_MIN_AI_CONFIDENCE,
     MAX_DAILY_TRADES,
     SCAN_INTERVAL_SEC,
 )
@@ -63,6 +64,8 @@ def _dynamic_confidence_threshold(timeframes: dict, _symbol: str) -> float:
     Applies to both Long (BUY) and Short (SELL) — threshold is on confidence %, not direction.
     """
     base = float(FAST_MIN_CONFIDENCE)
+    # Global alignment: never require more than the global floor to *consider* a signal.
+    base = min(base, float(GLOBAL_MIN_AI_CONFIDENCE))
     df_15m = timeframes.get("15m")
     if df_15m is None or getattr(df_15m, "empty", True):
         return base
@@ -83,22 +86,22 @@ def _dynamic_confidence_threshold(timeframes: dict, _symbol: str) -> float:
             "[DYNAMIC] Adjusted threshold to %.1f%% due to Choppy conditions.",
             thr,
         )
-        return thr
+        return min(thr, float(GLOBAL_MIN_AI_CONFIDENCE))
     if adx_val > 25 and rsi_val > 70:
         thr = _DYNAMIC_TREND_THRESHOLD
         log.info(
             "[DYNAMIC] Adjusted threshold to %.1f%% due to Trend (bullish) conditions.",
             thr,
         )
-        return thr
+        return min(thr, float(GLOBAL_MIN_AI_CONFIDENCE))
     if adx_val > 25 and rsi_val < 30:
         thr = _DYNAMIC_TREND_THRESHOLD
         log.info(
             "[DYNAMIC] Adjusted threshold to %.1f%% due to Trend (bearish) conditions.",
             thr,
         )
-        return thr
-    return base
+        return min(thr, float(GLOBAL_MIN_AI_CONFIDENCE))
+    return min(base, float(GLOBAL_MIN_AI_CONFIDENCE))
 
 
 def _side_label(action: str | None) -> str:
