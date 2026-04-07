@@ -75,21 +75,19 @@ def _is_admin(chat_id: str) -> bool:
 
 
 def build_admin_dashboard_keyboard() -> InlineKeyboardMarkup:
-    """URL to Streamlit + quick admin actions (callbacks: admin_*)."""
+    """Unified /admin menu keyboard (callbacks: admin_*)."""
     base = (STREAMLIT_PUBLIC_URL or "http://127.0.0.1:8501").rstrip("/")
     tok = (ADMIN_TOKEN or "").strip()
     dashboard_url = f"{base}/?token={tok}" if tok else base
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("🌐 لوحة التحكم / Open dashboard", url=dashboard_url)],
+            [InlineKeyboardButton("Open Dashboard 🌐", url=dashboard_url)],
             [
-                InlineKeyboardButton("📊 Check Stats", callback_data="admin_stats"),
-                InlineKeyboardButton("🔄 Restart Engine", callback_data="admin_restart"),
+                InlineKeyboardButton("Stats 📊", callback_data="admin_stats"),
+                InlineKeyboardButton("Quick Restart 🔄", callback_data="admin_restart"),
+                InlineKeyboardButton("Time Sync 🕒", callback_data="admin_time"),
             ],
-            [
-                InlineKeyboardButton("🕒 Check Time", callback_data="admin_time"),
-                InlineKeyboardButton("🛑 Global Emergency Stop", callback_data="admin_killswitch"),
-            ],
+            [InlineKeyboardButton("Emergency Stop 🛑", callback_data="admin_killswitch")],
         ]
     )
 
@@ -149,6 +147,43 @@ def _try_engine_restart() -> tuple[bool, str]:
         return True, f"Restart command dispatched: `{cmd[:180]}`"
     except Exception as exc:
         return False, f"Failed to start restart command: {exc}"
+
+
+def _killswitch_set(active: bool) -> int:
+    """
+    Shared kill-switch implementation used by both:
+    - legacy: /admin killswitch on|off
+    - new UI: Emergency Stop button
+    """
+    set_master_kill_switch(bool(active))
+    if active:
+        count = broadcast_to_all(
+            "*MASTER KILL SWITCH ACTIVATED*\n\n"
+            "All new trade entries have been halted by the admin.\n"
+            "Open positions remain active until TP / SL."
+        )
+        return int(count or 0)
+    count = broadcast_to_all(
+        "*Trading Resumed*\n\n"
+        "The kill switch has been deactivated.\n"
+        "Normal trading has resumed."
+    )
+    return int(count or 0)
+
+
+def _admin_cheat_sheet() -> str:
+    return (
+        "*Cheat Sheet (critical legacy commands)*\n"
+        "`/admin maintenance on|off`\n"
+        "`/admin killswitch on|off`\n"
+        "`/admin restart`\n"
+        "`/admin broadcast <message>`\n"
+        "`/admin issue <chat_id> <days>`\n"
+        "`/admin killuser <chat_id>`\n"
+        "`/admin reviveuser <chat_id>`\n"
+        "`/admin riskset <chat_id> <min%> <max%>`\n"
+        "`/admin audit_sync [chat_id] [fix]`\n"
+    )
 
 
 def _fmt_remaining(expires_at: str) -> str:
@@ -451,9 +486,10 @@ async def admin_handler(update: Update, context):
     args = context.args or []
     if not args:
         await update.message.reply_text(
-            "مرحباً أيها المدير، للدخول إلى لوحة التحكم اضغط هنا",
+            "Welcome Admin. Use the Dashboard for UI or commands below for deep control.",
             reply_markup=build_admin_dashboard_keyboard(),
         )
+        await update.message.reply_text(_admin_cheat_sheet(), parse_mode="Markdown")
         return
 
     cmd = args[0].lower()
@@ -496,6 +532,14 @@ async def admin_handler(update: Update, context):
         message = ' '.join(args[1:])
         count   = broadcast_to_all(f"*Message from Admin*\n\n{message}")
         await update.message.reply_text(f"Sent to {count} subscriber(s).")
+
+    # ── quick restart (uses ENGINE_RESTART_CMD) ───────────────────────────────
+    elif cmd in ("restart", "quickrestart", "reboot"):
+        ok, msg = _try_engine_restart()
+        await update.message.reply_text(
+            ("✅ " if ok else "⚠️ ") + msg,
+            parse_mode="Markdown",
+        )
 
     # ── purge ALL subscribers (broadcast first) ───────────────────────────────
     elif cmd in ('purgeusers', 'purge', 'resetusers'):
@@ -673,28 +717,11 @@ async def admin_handler(update: Update, context):
             return
 
         activate = args[1].lower() == 'on'
-        set_master_kill_switch(activate)
-
-        if activate:
-            count = broadcast_to_all(
-                "*MASTER KILL SWITCH ACTIVATED*\n\n"
-                "All new trade entries have been halted by the admin.\n"
-                "Open positions remain active until TP / SL."
-            )
-            await update.message.reply_text(
-                f"*Kill Switch: ON*\n{count} subscriber(s) notified.",
-                parse_mode='Markdown',
-            )
-        else:
-            count = broadcast_to_all(
-                "*Trading Resumed*\n\n"
-                "The kill switch has been deactivated.\n"
-                "Normal trading has resumed."
-            )
-            await update.message.reply_text(
-                f"*Kill Switch: OFF*\n{count} subscriber(s) notified.",
-                parse_mode='Markdown',
-            )
+        count = _killswitch_set(bool(activate))
+        await update.message.reply_text(
+            f"*Kill Switch: {'ON' if activate else 'OFF'}*\n{count} subscriber(s) notified.",
+            parse_mode='Markdown',
+        )
 
     # ── Per-user kill switch ───────────────────────────────────────────────────
     elif cmd == 'killuser':
@@ -855,12 +882,7 @@ async def admin_inline_callback(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
     if data == "admin_killswitch":
-        set_master_kill_switch(True)
-        count = broadcast_to_all(
-            "*MASTER KILL SWITCH ACTIVATED*\n\n"
-            "All new trade entries have been halted by the admin.\n"
-            "Open positions remain active until TP / SL."
-        )
+        count = _killswitch_set(True)
         await q.message.reply_text(
             f"*Emergency stop: ON*\n{count} subscriber(s) notified.",
             parse_mode="Markdown",
