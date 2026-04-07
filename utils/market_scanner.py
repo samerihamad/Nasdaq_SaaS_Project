@@ -74,6 +74,26 @@ _SESSION_CACHE: dict[str, dict] = {}
 _EPIC_CACHE: dict[str, str] = {}
 _UNSUPPORTED_CACHE: set[str] = set()
 
+# Session refresh lock (prevents "thundering herd" login storms).
+# We create one lock per running event loop to avoid "attached to a different loop" issues
+# when callers spin up their own loops (e.g. asyncio.run in different threads/processes).
+_SESSION_LOCKS: dict[int, asyncio.Lock] = {}
+
+
+def _get_session_lock() -> asyncio.Lock:
+    try:
+        loop = asyncio.get_running_loop()
+    except Exception:
+        # Fallback: if called outside a running loop (shouldn't happen for async paths),
+        # return a lock bound to the default policy's loop.
+        return asyncio.Lock()
+    key = id(loop)
+    lock = _SESSION_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _SESSION_LOCKS[key] = lock
+    return lock
+
 _TF_CONFIG = {
     "1d": {
         "resolutions": ("DAY", "D1", "DAY_1"),
@@ -412,6 +432,7 @@ async def _get_market_data_session_aio(
         )
         return None, None
 
+    # Fast-path: return cached session without any lock.
     now_ts = datetime.now(timezone.utc).timestamp()
     cached = _SESSION_CACHE.get(cache_key, {})
     cached_headers = cached.get("headers")
@@ -419,6 +440,18 @@ async def _get_market_data_session_aio(
     expires_ts = float(cached.get("expires_ts") or 0.0)
     if cached_headers and cached_base and now_ts < expires_ts:
         return str(cached_base), dict(cached_headers)
+
+    # Slow-path: refresh session with double-check locking to avoid thundering herd.
+    lock = _get_session_lock()
+    async with lock:
+        # Double-check inside lock in case another task refreshed the session.
+        now_ts2 = datetime.now(timezone.utc).timestamp()
+        cached2 = _SESSION_CACHE.get(cache_key, {})
+        cached_headers2 = cached2.get("headers")
+        cached_base2 = cached2.get("base_url")
+        expires_ts2 = float(cached2.get("expires_ts") or 0.0)
+        if cached_headers2 and cached_base2 and now_ts2 < expires_ts2:
+            return str(cached_base2), dict(cached_headers2)
 
     base_headers = {
         "X-CAP-API-KEY": api_key,
@@ -450,7 +483,7 @@ async def _get_market_data_session_aio(
         _SESSION_CACHE[cache_key] = {
             "headers": session_headers,
             "base_url": base_url,
-            "expires_ts": now_ts + float(_SESSION_TTL_SEC),
+            "expires_ts": datetime.now(timezone.utc).timestamp() + float(_SESSION_TTL_SEC),
         }
         return base_url, session_headers
     except Exception as exc:

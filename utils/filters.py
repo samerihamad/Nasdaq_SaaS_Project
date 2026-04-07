@@ -513,7 +513,8 @@ async def level2_filter_async(tickers: list[str]) -> list[str]:
         return []
 
     gap_ok: set[str] = set()
-    sem = asyncio.Semaphore(BULK_PARALLEL_BATCH_SIZE)
+    # Strictly bound Capital.com HTTP concurrency (thundering-herd protection).
+    sem = asyncio.Semaphore(max(1, int(CAPITAL_HTTP_CONCURRENCY)))
 
     print(f"[LEVEL 2] Processing 0/{n}", flush=True)
     async with aiohttp.ClientSession(timeout=BULK_CAPITAL_CLIENT_TIMEOUT) as session:
