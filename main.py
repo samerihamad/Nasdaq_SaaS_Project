@@ -7,7 +7,7 @@ Both processes share the SQLite database.
 Pre-market alert:  sent ~30 minutes before market open (ET, DST-aware).
 Daily scan:        runs before open when alert window starts, with open fallback.
 Live cycle:        every CHECK_INTERVAL seconds during market hours.
-Heartbeat:         written every HEARTBEAT_INTERVAL seconds for watchdog.py.
+Heartbeat:         written every HEARTBEAT_INTERVAL seconds (always when process is up; not gated by market hours).
 Backup:            hourly encrypted cloud backup in a background thread.
 """
 
@@ -416,14 +416,26 @@ def _log_scan_cycle_summary(
 # ── Heartbeat & backup threads ────────────────────────────────────────────────
 
 def _heartbeat_loop():
-    """Daemon thread: writes heartbeat.json every HEARTBEAT_INTERVAL seconds."""
+    """
+    Daemon thread: writes heartbeat.json every HEARTBEAT_INTERVAL seconds.
+
+    Process liveness is independent of market hours: the file is updated whenever
+    this process is healthy, so watchdog.py does not false-alert on weekends or
+    when the engine is idling. Trading vs idle is recorded as metadata only.
+    """
     while True:
         try:
-            if not is_trading_required():
-                time.sleep(HEARTBEAT_INTERVAL)
-                continue
-            with open(HEARTBEAT_FILE, 'w') as f:
-                json.dump({'timestamp': synchronized_utc_now().isoformat()}, f)
+            try:
+                trading_required = bool(is_trading_required())
+            except Exception:
+                trading_required = False
+            payload = {
+                "status": "alive",
+                "timestamp": synchronized_utc_now().isoformat(),
+                "trading_required": trading_required,
+            }
+            with open(HEARTBEAT_FILE, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
         except Exception as e:
             print(f"[HEARTBEAT] write error: {e}")
         time.sleep(HEARTBEAT_INTERVAL)
