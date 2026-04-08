@@ -65,7 +65,6 @@ from database.db_manager import touch_engine_activity, touch_signal_delivered
 from database.db_manager import get_user_signal_profile
 from database.db_manager import DB_PATH
 from config import (
-    MIN_CONFIDENCE,
     SIGNAL_MIN_CONFIDENCE,
     FAST_MIN_CONFIDENCE,
     GOLDEN_MIN_CONFIDENCE,

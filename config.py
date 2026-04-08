@@ -92,6 +92,8 @@ MIN_15M_BARS = int(os.getenv("MIN_15M_BARS", "100"))
 FAST_MOM_ADX_THRESHOLD = float(os.getenv("FAST_MOM_ADX_THRESHOLD", "18"))
 # CHANGED FOR MORE SIGNALS — FAST MODE ONLY — CONSERVATIVE BALANCED VERSION — based on April 7-8 logs
 FAST_MOM_VOL_RATIO = float(os.getenv("FAST_MOM_VOL_RATIO", "0.55"))
+# Vol vs MA20 floor: fully from .env — if unset, matches FAST_MOM_VOL_RATIO (no hardcoded 0.7).
+FAST_MOM_VOL_RATIO_FLOOR = float(os.getenv("FAST_MOM_VOL_RATIO_FLOOR", str(FAST_MOM_VOL_RATIO)))
 # When 15m RSI > FAST_MOM_RSI_VOL_TIER_HIGH (BUY), allow volume down to this multiple of MA20.
 FAST_MOM_VOL_RATIO_HIGH_RSI = float(os.getenv("FAST_MOM_VOL_RATIO_HIGH_RSI", "0.65"))
 FAST_MOM_RSI_VOL_TIER_HIGH = float(os.getenv("FAST_MOM_RSI_VOL_TIER_HIGH", "70"))
@@ -137,18 +139,16 @@ BE_LOCK_BUFFER_PCT = 0.0005  # 0.05% beyond entry (per direction)
 RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "0.5"))
 
 # ── Signal Quality Gate ───────────────────────────────────────────────────────
-
-# Signals with confidence below this are discarded before risk checks
-MIN_CONFIDENCE       = 67.0
+# Active scan threshold is SIGNAL_MIN_CONFIDENCE (derived from FAST_* / GOLDEN_* via SIGNAL_PROFILE).
 
 # Global minimum strategy confidence (%). If a signal meets this floor, it should
 # proceed to the next stage regardless of older per-strategy defaults.
 GLOBAL_MIN_AI_CONFIDENCE = float(os.getenv("GLOBAL_MIN_AI_CONFIDENCE", "55.0"))
 
 # ── Phase 8: Dual Signal Profiles (Fast vs Golden) ───────────────────────────
-# Backward compatibility:
-# - Existing MIN_CONFIDENCE / MR_MIN_SCORE / MOM_MIN_SCORE remain valid defaults.
-# - New SIGNAL_* values are selected by SIGNAL_PROFILE and can be adopted gradually.
+# SIGNAL_* values are selected by SIGNAL_PROFILE (FAST | GOLDEN).
+# Legacy MR_MIN_SCORE / MOM_MIN_SCORE above remain documentation defaults only;
+# runtime uses SIGNAL_MR_MIN_SCORE / SIGNAL_MOM_MIN_SCORE.
 SIGNAL_PROFILE = os.getenv("SIGNAL_PROFILE", "FAST").strip().upper()  # FAST | GOLDEN
 
 # CHANGED FOR MORE SIGNALS — FAST MODE ONLY — CONSERVATIVE BALANCED VERSION — based on April 7-8 logs

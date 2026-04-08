@@ -4,7 +4,7 @@ Signal Engine — NATB v2.0
 Responsibilities:
   1. Iterate the WATCHLIST and fetch multi-timeframe data for each ticker.
   2. Run Mean Reversion and Momentum strategies in parallel (thread pool).
-  3. Select the best signal per ticker (highest score; must exceed MIN_CONFIDENCE).
+  3. Select the best signal per ticker (highest score; must exceed SIGNAL_MIN_CONFIDENCE / dynamic floor).
   4. Gate every signal through the risk engine (can_open_trade).
   5. Enforce the per-user daily trade cap (MAX_DAILY_TRADES).
   6. Dispatch valid signals to place_trade_for_user for EVERY eligible subscriber.
@@ -25,7 +25,6 @@ import aiohttp
 from utils.market_hours import utc_today, synchronized_utc_now, ET, is_nyse_trading_day
 from config import (
     WATCHLIST,
-    MIN_CONFIDENCE,
     SIGNAL_MIN_CONFIDENCE,
     FAST_MIN_CONFIDENCE,
     GLOBAL_MIN_AI_CONFIDENCE,
@@ -50,7 +49,7 @@ from utils.market_scanner import (
 from utils.ai_model         import analyze_multi_timeframe
 
 log = logging.getLogger(__name__)
-ACTIVE_MIN_CONFIDENCE = float(SIGNAL_MIN_CONFIDENCE if SIGNAL_MIN_CONFIDENCE is not None else MIN_CONFIDENCE)
+ACTIVE_MIN_CONFIDENCE = float(SIGNAL_MIN_CONFIDENCE)
 
 # Dynamic gate (15m ADX/RSI): bonus / choppy targets; neutral uses FAST_MIN_CONFIDENCE from .env.
 _DYNAMIC_TREND_THRESHOLD = 52.0

@@ -36,9 +36,12 @@ from config import (
     MOM_GAP_PCT,
     MOM_MACD_CONFIRM,
     SIGNAL_MOM_MIN_SCORE,
+    SIGNAL_PROFILE,
     MIN_15M_BARS,
     FAST_MOM_MIN_SCORE,
+    FAST_MOM_ADX_THRESHOLD,
     FAST_MOM_VOL_RATIO,
+    FAST_MOM_VOL_RATIO_FLOOR,
     FAST_MOM_VOL_RATIO_HIGH_RSI,
     FAST_MOM_RSI_VOL_TIER_HIGH,
     FAST_MOM_RSI_BUY_MAX,
@@ -64,9 +67,7 @@ from core.market_structure import (
 
 log = logging.getLogger(__name__)
 
-# FAST tier floors (ops): relaxed ADX; minimum volume vs MA20 for long/short.
-_FAST_MOM_ADX_MIN = 12.0
-_FAST_MOM_VOL_RATIO_FLOOR = 0.7
+# FAST ADX gate + vol floor: FAST_MOM_ADX_THRESHOLD and FAST_MOM_VOL_RATIO_FLOOR from config / .env only.
 
 
 # ── Indicator helpers ─────────────────────────────────────────────────────────
@@ -270,6 +271,7 @@ def analyze(
     symbol: str,
     timeframes: dict,
     *,
+    signal_profile: str | None = None,
     min_confidence_floor: float | None = None,
 ) -> dict | None:
     """
@@ -313,7 +315,7 @@ def analyze(
     else:
         direction = "SELL"
 
-    active_adx_min = float(_FAST_MOM_ADX_MIN)
+    active_adx_min = float(FAST_MOM_ADX_THRESHOLD)
     if adx_val < active_adx_min:
         rej = f"Rejected: Weak Trend (ADX {adx_val:.1f} < {float(active_adx_min):.1f})"
         log.info("[Momentum %s] %s", symbol, rej)
@@ -351,7 +353,7 @@ def analyze(
     sma50_v = float(sma50_15m.iloc[-1])
     
     # CHANGED FOR MORE SIGNALS — FAST MODE ONLY — CONSERVATIVE BALANCED VERSION — based on April 7-8 logs
-    tier = str(signal_profile or "FAST").strip().upper()
+    tier = str(signal_profile or SIGNAL_PROFILE or "FAST").strip().upper()
     # April 7-8 structural logs show frequent SMA20 near-miss rejections; use a *tiny* tolerance in FAST only.
     sma20_tolerance = 0.999 if tier == "FAST" else 1.000
     sma20_tolerance_sell = 1.001 if tier == "FAST" else 1.000
@@ -373,7 +375,7 @@ def analyze(
     ms_ctx = None
     if ENABLE_MARKET_STRUCTURE_FILTERS:
         # CHANGED FOR MORE SIGNALS — FAST MODE ONLY — CONSERVATIVE BALANCED VERSION — based on April 7-8 logs
-        tier = str(signal_profile or "FAST").strip().upper()
+        tier = str(signal_profile or SIGNAL_PROFILE or "FAST").strip().upper()
         ntz_pct = MARKET_STRUCTURE_NO_TRADE_ZONE_PCT
         if tier == "FAST":
             ntz_pct = 0.12  # modest relax from 0.14 (do NOT use 0.08)
@@ -424,17 +426,18 @@ def analyze(
             # Allowed here; final pass depends on AI probability gate in dispatch.
             log.info("[Momentum %s] MACD missing; pending FAST AI bypass gate", symbol)
 
-    # ── Volume vs MA20 (FAST tiered + global floor _FAST_MOM_VOL_RATIO_FLOOR for long/short) ─
+    # ── Volume vs MA20 (FAST tiered; floor from FAST_MOM_VOL_RATIO_FLOOR in .env) ─
     vol_ratio = _volume_ratio(df_15m)
+    _vf = float(FAST_MOM_VOL_RATIO_FLOOR)
     if direction == "SELL":
         if rsi_15m_val <= bearish_rsi_vol_line:
-            vol_min = max(_FAST_MOM_VOL_RATIO_FLOOR, float(FAST_MOM_VOL_RATIO_HIGH_RSI))
+            vol_min = max(_vf, float(FAST_MOM_VOL_RATIO_HIGH_RSI))
         else:
-            vol_min = max(_FAST_MOM_VOL_RATIO_FLOOR, float(FAST_MOM_VOL_RATIO))
+            vol_min = max(_vf, float(FAST_MOM_VOL_RATIO))
     elif rsi_15m_val > float(FAST_MOM_RSI_VOL_TIER_HIGH):
-        vol_min = max(_FAST_MOM_VOL_RATIO_FLOOR, float(FAST_MOM_VOL_RATIO_HIGH_RSI))
+        vol_min = max(_vf, float(FAST_MOM_VOL_RATIO_HIGH_RSI))
     else:
-        vol_min = max(_FAST_MOM_VOL_RATIO_FLOOR, float(FAST_MOM_VOL_RATIO))
+        vol_min = max(_vf, float(FAST_MOM_VOL_RATIO))
     mom_low_vol_entry = (
         (
             direction == "BUY"
