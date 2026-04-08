@@ -314,6 +314,14 @@ def analyze(
     liq = None
     ms_ctx = None
     if ENABLE_MARKET_STRUCTURE_FILTERS:
+        # CHANGED FOR MORE SIGNALS — FAST MODE ONLY — CONSERVATIVE BALANCED VERSION — based on April 7-8 logs
+        # April 7-8 structural logs show very high rejection rates (93–98%).
+        # Relax NTZ slightly in FAST only to reduce false negatives near equilibrium,
+        # without meaningfully increasing chop entries.
+        ntz_pct = MARKET_STRUCTURE_NO_TRADE_ZONE_PCT
+        if tier == "FAST":
+            ntz_pct = 0.12  # modest relax from 0.14 (do NOT use 0.08)
+
         ms_ctx = apply_market_structure_policy(
             direction=direction,
             close_price=close_val,
@@ -321,7 +329,7 @@ def analyze(
             df_4h=df_4h,
             df_15m=df_15m,
             htf_lookback=MARKET_STRUCTURE_HTF_LOOKBACK,
-            no_trade_zone_pct=MARKET_STRUCTURE_NO_TRADE_ZONE_PCT,
+            no_trade_zone_pct=ntz_pct,
             enable_pd_filter=ENABLE_PREMIUM_DISCOUNT_FILTER,
             enable_liquidity_map_filter=ENABLE_LIQUIDITY_MAP_FILTER,
             opening_bars=LIQUIDITY_OPENING_RANGE_BARS,

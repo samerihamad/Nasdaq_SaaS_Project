@@ -349,15 +349,22 @@ def analyze(
     sma50_15m = close_15m.rolling(50).mean()
     sma20_v = float(sma20_15m.iloc[-1])
     sma50_v = float(sma50_15m.iloc[-1])
-    if direction == "BUY" and close_val <= sma20_v:
-        rej = f"Rejected: Price not above SMA20 ({close_val:.2f} <= {sma20_v:.2f})"
+    
+    # CHANGED FOR MORE SIGNALS — FAST MODE ONLY — CONSERVATIVE BALANCED VERSION — based on April 7-8 logs
+    tier = str(signal_profile or "FAST").strip().upper()
+    # April 7-8 structural logs show frequent SMA20 near-miss rejections; use a *tiny* tolerance in FAST only.
+    sma20_tolerance = 0.999 if tier == "FAST" else 1.000
+    sma20_tolerance_sell = 1.001 if tier == "FAST" else 1.000
+
+    if direction == "BUY" and close_val <= sma20_v * sma20_tolerance:
+        rej = f"Rejected: Price not above SMA20 ({close_val:.2f} <= {sma20_v * sma20_tolerance:.2f})"
         log.info("[Momentum %s] %s", symbol, rej)
         return {"rejected": True, "strategy": "Momentum", "reason": rej, "action": direction}
-    if direction == "SELL" and close_val >= sma20_v:
-        rej = f"Rejected: Price not below SMA20 ({close_val:.2f} >= {sma20_v:.2f})"
+    if direction == "SELL" and close_val >= sma20_v * sma20_tolerance_sell:
+        rej = f"Rejected: Price not below SMA20 ({close_val:.2f} >= {sma20_v * sma20_tolerance_sell:.2f})"
         log.info("[Momentum %s] %s", symbol, rej)
         return {"rejected": True, "strategy": "Momentum", "reason": rej, "action": direction}
-    if direction == "BUY" and close_val > sma20_v and close_val <= sma50_v:
+    if direction == "BUY" and close_val > sma20_v * sma20_tolerance and close_val <= sma50_v:
         log.info("[FAST OPTIMIZATION] Trade triggered by Momentum SMA20-only Filter | %s", symbol)
 
     # ── Market structure policy v2 (soft-scoring, no structural hard reject) ─
@@ -365,6 +372,12 @@ def analyze(
     liq = None
     ms_ctx = None
     if ENABLE_MARKET_STRUCTURE_FILTERS:
+        # CHANGED FOR MORE SIGNALS — FAST MODE ONLY — CONSERVATIVE BALANCED VERSION — based on April 7-8 logs
+        tier = str(signal_profile or "FAST").strip().upper()
+        ntz_pct = MARKET_STRUCTURE_NO_TRADE_ZONE_PCT
+        if tier == "FAST":
+            ntz_pct = 0.12  # modest relax from 0.14 (do NOT use 0.08)
+
         ms_ctx = apply_market_structure_policy(
             direction=direction,
             close_price=close_val,
@@ -372,7 +385,7 @@ def analyze(
             df_4h=df_4h,
             df_15m=df_15m,
             htf_lookback=MARKET_STRUCTURE_HTF_LOOKBACK,
-            no_trade_zone_pct=MARKET_STRUCTURE_NO_TRADE_ZONE_PCT,
+            no_trade_zone_pct=ntz_pct,
             enable_pd_filter=ENABLE_PREMIUM_DISCOUNT_FILTER,
             enable_liquidity_map_filter=ENABLE_LIQUIDITY_MAP_FILTER,
             opening_bars=LIQUIDITY_OPENING_RANGE_BARS,

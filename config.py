@@ -44,8 +44,10 @@ FAST_RSI_LIMITS = (45, 70)
 GOLD_RSI_LIMITS = (30, 70)
 
 # FAST Mean Reversion: at/ beyond these 15m RSI levels, FAST tier may skip reversal candle / sweep (GOLDEN never).
-FAST_MR_RSI_EXTREME_OVERSOLD = float(os.getenv("FAST_MR_RSI_EXTREME_OVERSOLD", "45"))
-FAST_MR_RSI_EXTREME_OVERBOUGHT = float(os.getenv("FAST_MR_RSI_EXTREME_OVERBOUGHT", "70"))
+# CHANGED FOR MORE SIGNALS — FAST MODE ONLY — CONSERVATIVE BALANCED VERSION — based on April 7-8 logs
+# Keep RSI extremes meaningful; relax only slightly vs prior strictness.
+FAST_MR_RSI_EXTREME_OVERSOLD = float(os.getenv("FAST_MR_RSI_EXTREME_OVERSOLD", "44"))
+FAST_MR_RSI_EXTREME_OVERBOUGHT = float(os.getenv("FAST_MR_RSI_EXTREME_OVERBOUGHT", "71"))
 
 # Strategy scan defaults: use Fast limits so the engine emits candidates broadly;
 # per-user Gold tier re-validates RSI at execution time in validate_pre_trade().
@@ -88,9 +90,10 @@ MIN_15M_BARS = int(os.getenv("MIN_15M_BARS", "100"))
 
 # Momentum tier gates on 15m (scanner emits FAST-style signals; GOLDEN re-checked in dispatch).
 FAST_MOM_ADX_THRESHOLD = float(os.getenv("FAST_MOM_ADX_THRESHOLD", "18"))
-FAST_MOM_VOL_RATIO = float(os.getenv("FAST_MOM_VOL_RATIO", "0.6"))
+# CHANGED FOR MORE SIGNALS — FAST MODE ONLY — CONSERVATIVE BALANCED VERSION — based on April 7-8 logs
+FAST_MOM_VOL_RATIO = float(os.getenv("FAST_MOM_VOL_RATIO", "0.55"))
 # When 15m RSI > FAST_MOM_RSI_VOL_TIER_HIGH (BUY), allow volume down to this multiple of MA20.
-FAST_MOM_VOL_RATIO_HIGH_RSI = float(os.getenv("FAST_MOM_VOL_RATIO_HIGH_RSI", "0.8"))
+FAST_MOM_VOL_RATIO_HIGH_RSI = float(os.getenv("FAST_MOM_VOL_RATIO_HIGH_RSI", "0.65"))
 FAST_MOM_RSI_VOL_TIER_HIGH = float(os.getenv("FAST_MOM_RSI_VOL_TIER_HIGH", "70"))
 GOLDEN_MOM_VOL_RATIO = float(os.getenv("GOLDEN_MOM_VOL_RATIO", str(MOM_VOL_RATIO)))
 FAST_MOM_RSI_BUY_MAX = float(os.getenv("FAST_MOM_RSI_BUY_MAX", "77"))
@@ -148,13 +151,14 @@ GLOBAL_MIN_AI_CONFIDENCE = float(os.getenv("GLOBAL_MIN_AI_CONFIDENCE", "55.0"))
 # - New SIGNAL_* values are selected by SIGNAL_PROFILE and can be adopted gradually.
 SIGNAL_PROFILE = os.getenv("SIGNAL_PROFILE", "FAST").strip().upper()  # FAST | GOLDEN
 
+# CHANGED FOR MORE SIGNALS — FAST MODE ONLY — CONSERVATIVE BALANCED VERSION — based on April 7-8 logs
 FAST_MIN_CONFIDENCE = float(os.getenv("FAST_MIN_CONFIDENCE", "57.0"))
 GOLDEN_MIN_CONFIDENCE = float(os.getenv("GOLDEN_MIN_CONFIDENCE", "67.0"))
 
-FAST_MR_MIN_SCORE = int(os.getenv("FAST_MR_MIN_SCORE", "52"))
+FAST_MR_MIN_SCORE = int(os.getenv("FAST_MR_MIN_SCORE", "60"))
 GOLDEN_MR_MIN_SCORE = int(os.getenv("GOLDEN_MR_MIN_SCORE", "62"))
 
-FAST_MOM_MIN_SCORE = int(os.getenv("FAST_MOM_MIN_SCORE", "55"))
+FAST_MOM_MIN_SCORE = int(os.getenv("FAST_MOM_MIN_SCORE", "62"))
 GOLDEN_MOM_MIN_SCORE = int(os.getenv("GOLDEN_MOM_MIN_SCORE", "65"))
 
 if SIGNAL_PROFILE == "GOLDEN":
@@ -256,15 +260,22 @@ PREMARKET_ALERT_WINDOW_MIN = 30
 #
 # Per-strategy minimum AI probability thresholds (%).
 # These apply in dispatch_signal() as an execution gate after strategy confidence.
-AI_MIN_PROB_RF = float(os.getenv("AI_MIN_PROB_RF", "62.0"))
-AI_MIN_PROB_MOMENTUM = float(os.getenv("AI_MIN_PROB_MOMENTUM", "65.0"))
-AI_MIN_PROB_MEANREV = float(os.getenv("AI_MIN_PROB_MEANREV", "64.0"))
+# CHANGED FOR MORE SIGNALS — FAST MODE ONLY — CONSERVATIVE BALANCED VERSION — based on April 7-8 logs
+# April 7-8 AI telemetry shows RF probabilities mostly 9–48% while thresholds were ~64–65%,
+# causing near-total AI blocks. Lower thresholds *modestly* and rely on soft override for only
+# genuinely high-confidence strategy setups.
+AI_MIN_PROB_RF = float(os.getenv("AI_MIN_PROB_RF", "58.0"))
+AI_MIN_PROB_MOMENTUM = float(os.getenv("AI_MIN_PROB_MOMENTUM", "60.0"))
+AI_MIN_PROB_MEANREV = float(os.getenv("AI_MIN_PROB_MEANREV", "58.0"))
 
 # Soft override:
 # Allow high-confidence Momentum/MeanRev signals to pass even if AI probability
 # is below the per-strategy threshold (override is intentionally harder to reach).
-AI_SOFT_OVERRIDE_CONFIDENCE = float(os.getenv("AI_SOFT_OVERRIDE_CONFIDENCE", "63.0"))
-AI_SOFT_OVERRIDE_MIN_PROB = float(os.getenv("AI_SOFT_OVERRIDE_MIN_PROB", "40.0"))
+# CHANGED FOR MORE SIGNALS — FAST MODE ONLY — CONSERVATIVE BALANCED VERSION — based on April 7-8 logs
+# Tighten override back up vs the aggressive version: only let through high strategy confidence
+# while still requiring non-trivial AI probability.
+AI_SOFT_OVERRIDE_CONFIDENCE = float(os.getenv("AI_SOFT_OVERRIDE_CONFIDENCE", "72.0"))
+AI_SOFT_OVERRIDE_MIN_PROB = float(os.getenv("AI_SOFT_OVERRIDE_MIN_PROB", "32.0"))
 ENABLE_AI_SOFT_OVERRIDE = os.getenv("ENABLE_AI_SOFT_OVERRIDE", "true").lower() == "true"
 
 # Optional AI feature: market-structure score blending.

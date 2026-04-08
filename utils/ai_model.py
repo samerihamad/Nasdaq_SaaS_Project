@@ -52,11 +52,15 @@ MODEL_DIR             = "models"
 MODEL_VERSION         = 4          # bump to force retrain after provider/feature alignment changes
 AI_PROBABILITY_THRESHOLD = 60.0    # baseline / fallback when regime is unknown (percent 0–100)
 # Adaptive gate thresholds by regime (percent 0–100); applied in evaluate_symbol unless min_probability overrides.
+# CHANGED FOR MORE SIGNALS — FAST MODE ONLY — CONSERVATIVE BALANCED VERSION — based on April 7-8 logs
+# April 7-8 telemetry shows RF probabilities mostly 9–48% while thresholds were ~64–65%,
+# causing near-total AI blocks even when strategy confidence was 70–92%.
+# We lower regime thresholds *modestly* to restore signal flow while keeping the gate meaningful.
 AI_THRESHOLD_TRENDING_PCT = 55.0
-AI_THRESHOLD_RANGING_PCT = 62.0
-AI_THRESHOLD_VOLATILE_PCT = 65.0
+AI_THRESHOLD_RANGING_PCT = 58.0
+AI_THRESHOLD_VOLATILE_PCT = 60.0
 # If blended confidence exceeds this before the volatile dampening, skip the dampening (still vs threshold).
-AI_VOLATILE_CONFIDENCE_BYPASS_MIN_PCT = 65.0
+AI_VOLATILE_CONFIDENCE_BYPASS_MIN_PCT = 62.0
 # Default blend when regime classification is unexpected (matches legacy static mix).
 _GATEKEEPER_TF_WEIGHTS_DEFAULT = {"1d": 0.20, "4h": 0.35, "15m": 0.45}
 # Volatile regime: dampen probability slightly (was 0.90; institutional refinement 0.95).
