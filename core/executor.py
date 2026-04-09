@@ -1982,6 +1982,40 @@ def _broker_positions_state_hash(live_positions: list[dict]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def is_sibling_tp1_leg_closed(parent_session_id: str | None) -> bool:
+    """
+    True if the TP1 leg in this parent_session is already CLOSED or pending broker sync.
+    Used to avoid missing fast TP1 spikes between polling intervals.
+    """
+    ps = str(parent_session_id or "").strip()
+    if not ps:
+        return False
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM trades
+            WHERE COALESCE(parent_session,'') = ?
+              AND UPPER(COALESCE(leg_role,'')) = 'TP1'
+              AND (
+                   UPPER(COALESCE(status,'')) = 'CLOSED'
+                   OR COALESCE(sync_status,'') IN ('PENDING_SYNC','PENDING_FINAL')
+              )
+            LIMIT 1
+            """,
+            (ps,),
+        ).fetchone()
+        conn.close()
+        return bool(row)
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return False
+
+
 # ── Position monitoring — trailing stop + hard fallback ───────────────────────
 
 def monitor_and_close(chat_id):
@@ -2097,11 +2131,14 @@ def monitor_and_close(chat_id):
             if direction == "BUY"
             else entry_price * (1 - TP2_PCT)
         )
-        tp1_hit = (
+        tp1_hit_live = (
             current_price >= tp1_price
             if direction == "BUY"
             else current_price <= tp1_price
         )
+        manage_leg = leg_role.upper() == "TP2"
+        tp1_hit_db = bool(manage_leg and is_sibling_tp1_leg_closed(parent_session))
+        tp1_hit = bool(tp1_hit_live or tp1_hit_db)
         tp2_hit = (
             current_price >= tp2_price
             if direction == "BUY"
@@ -2111,7 +2148,6 @@ def monitor_and_close(chat_id):
         if atr and atr > 0:
             # We only apply "lock after TP1" and "trailing after TP2"
             # to the TP2 leg, because TP1 leg is closed by broker at TP1.
-            manage_leg = leg_role.upper() == "TP2"
             trail_mult = _adaptive_trailing_multiplier(
                 symbol,
                 session_context=_scanner_context_from_creds(str(chat_id), creds),
@@ -2148,30 +2184,34 @@ def monitor_and_close(chat_id):
                 stop_triggered = is_stop_hit(current_price, new_stop, direction)
                 stop_label = f"ATR trailing stop @ {new_stop:.4f} (TP2 passed)"
             elif tp1_hit and manage_leg:
+                if (not tp1_hit_live) and tp1_hit_db:
+                    print(
+                        f"[PROTECTION-ACTIVATE] TP1 fill detected in DB for {symbol}. "
+                        "Moving SL to break-even for remaining leg.",
+                        flush=True,
+                    )
                 # Persist milestone once TP1 threshold is first reached (for TP2 leg).
                 try:
                     if (trade.get("target_reached") or "").strip() not in ("TARGET_1_HIT", "TARGET_2_HIT"):
                         update_trade_target_reached(trade_id, "TARGET_1_HIT")
                 except Exception:
                     pass
-                # After TP1: lock TP2 leg beyond breakeven.
-                # This prevents the trade from reverting back to entry.
-                breakeven_lock = (
-                    entry_price * (1 + BE_LOCK_BUFFER_PCT)
-                    if direction == "BUY"
-                    else entry_price * (1 - BE_LOCK_BUFFER_PCT)
-                )
+                # After TP1: move SL of TP2 leg to true break-even (entry), idempotently.
+                # Only attempt broker update if SL is not already at/through break-even.
+                breakeven = float(entry_price)
+                already_be = False
                 if base_stop is not None:
-                    # Ratchet in the profitable direction only.
-                    new_stop = (
-                        max(float(base_stop), breakeven_lock)
-                        if direction == "BUY"
-                        else min(float(base_stop), breakeven_lock)
-                    )
-                else:
-                    new_stop = breakeven_lock
-
-                if base_stop != new_stop:
+                    try:
+                        already_be = (
+                            float(base_stop) >= breakeven
+                            if direction == "BUY"
+                            else float(base_stop) <= breakeven
+                        )
+                    except Exception:
+                        already_be = False
+                new_stop = float(base_stop) if base_stop is not None else breakeven
+                if not already_be:
+                    new_stop = breakeven
                     update_trade_stop(trade['trade_id'], new_stop)
                     ok, info = _sync_stop_to_broker(
                         base_url,
@@ -2204,18 +2244,20 @@ def monitor_and_close(chat_id):
                 manage_leg = leg_role.upper() == "TP2"
                 new_stop = float(base_stop)
                 if manage_leg and tp1_hit:
-                    breakeven_lock = (
-                        entry_price * (1 + BE_LOCK_BUFFER_PCT)
+                    if (not tp1_hit_live) and tp1_hit_db:
+                        print(
+                            f"[PROTECTION-ACTIVATE] TP1 fill detected in DB for {symbol}. "
+                            "Moving SL to break-even for remaining leg.",
+                            flush=True,
+                        )
+                    breakeven = float(entry_price)
+                    already_be = (
+                        float(base_stop) >= breakeven
                         if direction == "BUY"
-                        else entry_price * (1 - BE_LOCK_BUFFER_PCT)
+                        else float(base_stop) <= breakeven
                     )
-                    # Ratchet only in profitable direction.
-                    new_stop = (
-                        max(new_stop, breakeven_lock)
-                        if direction == "BUY"
-                        else min(new_stop, breakeven_lock)
-                    )
-                    if float(base_stop) != new_stop:
+                    if not already_be:
+                        new_stop = breakeven
                         update_trade_stop(trade['trade_id'], new_stop)
                         ok, info = _sync_stop_to_broker(
                             base_url,
