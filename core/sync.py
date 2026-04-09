@@ -21,7 +21,7 @@ import re
 import threading
 import time
 from datetime import datetime as _dt
-from datetime import timezone
+from datetime import timezone, timedelta
 
 from core.trade_session_finalize import after_trade_leg_closed
 from core.trade_close_messages import (
@@ -253,14 +253,25 @@ def _broker_fetch_and_finalize_trade(trade_id: int, *, notify: bool = True) -> b
     c = conn.cursor()
     row = c.execute(
         "SELECT chat_id, deal_id, COALESCE(deal_reference,''), COALESCE(capital_order_id,''), "
-        "symbol, direction, entry_price, size, COALESCE(sync_status,'') "
+        "symbol, direction, entry_price, size, closed_at, COALESCE(sync_status,'') "
         "FROM trades WHERE trade_id=?",
         (tid,),
     ).fetchone()
     conn.close()
     if not row:
         return False
-    chat_id, deal_id, deal_reference, capital_order_id, symbol, direction, entry_price, size, sync_st = row
+    (
+        chat_id,
+        deal_id,
+        deal_reference,
+        capital_order_id,
+        symbol,
+        direction,
+        entry_price,
+        size,
+        closed_at,
+        sync_st,
+    ) = row
     if not deal_id:
         return False
     st = str(sync_st or "").strip()
@@ -316,10 +327,18 @@ def _broker_fetch_and_finalize_trade(trade_id: int, *, notify: bool = True) -> b
 
     dr = str(deal_reference or "").strip()
     co = str(capital_order_id or "").strip()
+    try:
+        size_f = float(size) if size is not None else None
+    except (TypeError, ValueError):
+        size_f = None
     final = fetch_closed_deal_final_data(
         base_url,
         session_headers,
         str(deal_id),
+        symbol=str(symbol or ""),
+        direction=str(direction or ""),
+        size=size_f,
+        closed_at=str(closed_at or "").strip() or None,
         wait_for_realized=True,
         identifiers=[dr] if dr else None,
         capital_order_id=co or None,
@@ -775,6 +794,10 @@ def fetch_closed_deal_final_data(
     headers: dict,
     deal_id: str,
     *,
+    symbol: str | None = None,
+    direction: str | None = None,
+    size: float | None = None,
+    closed_at: str | None = None,
     wait_for_realized: bool = True,
     identifiers: list[str] | None = None,
     capital_order_id: str | None = None,
@@ -883,6 +906,81 @@ def fetch_closed_deal_final_data(
                     return px
         return None
 
+    def _to_utc_iso_z(dt: _dt) -> str:
+        return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    def _norm_symbol(v: str | None) -> str:
+        return str(v or "").strip().upper()
+
+    def _symbol_tokens(v: str | None) -> set[str]:
+        s = _norm_symbol(v)
+        if not s:
+            return set()
+        toks = {s}
+        for sep in (".", ":", "/"):
+            parts = [p for p in s.split(sep) if p]
+            if parts:
+                toks.add(parts[-1])
+        return {t for t in toks if t}
+
+    def _tx_symbol(tx: dict) -> str:
+        for k in ("instrumentName", "epic", "symbol", "market"):
+            v = tx.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+            if isinstance(v, dict):
+                vv = v.get("instrumentName") or v.get("epic") or v.get("symbol")
+                if vv is not None:
+                    return str(vv).strip()
+        return ""
+
+    def _tx_direction(tx: dict) -> str:
+        d = tx.get("direction") or tx.get("side")
+        if d is None and isinstance(tx.get("position"), dict):
+            d = (tx.get("position") or {}).get("direction")
+        return str(d or "").strip().upper()
+
+    def _expected_close_side(open_side: str | None) -> str:
+        s = str(open_side or "").strip().upper()
+        if s == "BUY":
+            return "SELL"
+        if s == "SELL":
+            return "BUY"
+        return ""
+
+    def _tx_size(tx: dict) -> float | None:
+        return _parse_float(tx.get("size") or tx.get("quantity") or tx.get("dealSize"))
+
+    def _tx_has_valid_rpl(tx: dict) -> bool:
+        for k in ("rpl", "Rpl", "RPL"):
+            if k in tx and tx.get(k) is not None:
+                return _parse_float(tx.get(k)) is not None
+        return False
+
+    def _tx_fuzzy_matches(tx: dict) -> bool:
+        # Fuzzy fallback uses Symbol + opposite side + volume + valid realized PnL.
+        tx_sym = _norm_symbol(_tx_symbol(tx))
+        want_sym_tokens = _symbol_tokens(symbol)
+        if not tx_sym or not want_sym_tokens:
+            return False
+        if not any(tok in tx_sym for tok in want_sym_tokens):
+            return False
+
+        if size is None:
+            return False
+        tx_sz = _tx_size(tx)
+        if tx_sz is None or abs(float(tx_sz) - float(size)) >= 0.0001:
+            return False
+
+        if not _tx_has_valid_rpl(tx):
+            return False
+
+        expected_close = _expected_close_side(direction)
+        tx_side = _tx_direction(tx)
+        if expected_close and tx_side and tx_side != expected_close:
+            return False
+        return True
+
     def _fetch(params: dict | None) -> tuple[bool, list, int, str]:
         try:
             res = requests.get(
@@ -972,10 +1070,18 @@ def fetch_closed_deal_final_data(
                     return True
         return False
 
-    def _collect_merged_transactions() -> tuple[list[dict], str]:
+    closed_at_dt = _parse_iso_utc(closed_at)
+    fuzzy_window_from = None
+    fuzzy_window_to = None
+    if closed_at_dt is not None:
+        fuzzy_window_from = _to_utc_iso_z(closed_at_dt - timedelta(hours=24))
+        fuzzy_window_to = _to_utc_iso_z(closed_at_dt + timedelta(hours=1))
+
+    def _collect_merged_transactions() -> tuple[list[dict], str, list[dict]]:
         seen_keys: set[str] = set()
         merged: list[dict] = []
         last_err = ""
+        fuzzy_matches: list[dict] = []
 
         def _add_batch(raw: list) -> None:
             for tx in raw or []:
@@ -999,6 +1105,23 @@ def fetch_closed_deal_final_data(
             last_err = f"history/transactions failed status={st} info={info}"
         elif txs:
             _add_batch(txs)
+        elif fuzzy_window_from and fuzzy_window_to:
+            ok_f, txs_f, st_f, info_f = _fetch(
+                {
+                    "from": str(fuzzy_window_from),
+                    "to": str(fuzzy_window_to),
+                    "max": int(lookback_max),
+                }
+            )
+            if not ok_f:
+                last_err = str(
+                    last_err
+                    or f"history/transactions(fuzzy-window) failed status={st_f} info={info_f}"
+                )
+            elif txs_f:
+                fuzzy_matches = [tx for tx in txs_f if isinstance(tx, dict) and _tx_fuzzy_matches(tx)]
+                if fuzzy_matches:
+                    _add_batch(fuzzy_matches)
 
         for oid in ids:
             if not oid or oid == str(deal_id):
@@ -1018,7 +1141,7 @@ def fetch_closed_deal_final_data(
         elif txs_max:
             _add_batch(txs_max)
 
-        return merged, last_err
+        return merged, last_err, fuzzy_matches
 
     t0 = time.monotonic()
     attempt_idx = 0
@@ -1029,7 +1152,7 @@ def fetch_closed_deal_final_data(
         if elapsed >= wall:
             break
 
-        merged, fetch_err = _collect_merged_transactions()
+        merged, fetch_err, fuzzy_matches = _collect_merged_transactions()
         if fetch_err and not merged:
             last_issue = fetch_err
             if not quiet:
@@ -1039,8 +1162,13 @@ def fetch_closed_deal_final_data(
             last_issue = fetch_err
 
         matched = [tx for tx in merged if _tx_matches_any_hook(tx)]
+        matched_via_fuzzy = False
         if not matched:
-            last_issue = last_issue or "no_matching_transactions"
+            if fuzzy_matches:
+                matched = list(fuzzy_matches)
+                matched_via_fuzzy = True
+            else:
+                last_issue = last_issue or "no_matching_transactions"
         if matched:
             total_pnl = 0.0
             parsed_rows = 0
@@ -1077,10 +1205,17 @@ def fetch_closed_deal_final_data(
                 if wait_for_realized and float(total_pnl) == 0.0:
                     found_zero_hold = True
                 if not found_zero_hold:
+                    if matched_via_fuzzy:
+                        print(
+                            f"[SYNC-SUCCESS] Fuzzy match found for {str(symbol or '').strip() or 'UNKNOWN'} "
+                            "using Time+Volume",
+                            flush=True,
+                        )
                     return {
                         "actual_pnl": float(total_pnl),
                         "exit_price": exit_price,
                         "part_count": int(part_count),
+                        "matched_via_fuzzy": bool(matched_via_fuzzy),
                     }
                 last_issue = "pnl_zero_placeholder_retry"
 
@@ -1223,13 +1358,13 @@ def try_sync_final_for_trade_id(
     c = conn.cursor()
     row = c.execute(
         "SELECT chat_id, deal_id, COALESCE(deal_reference,''), COALESCE(capital_order_id,''), "
-        "symbol, direction, entry_price, size FROM trades WHERE trade_id=?",
+        "symbol, direction, entry_price, size, closed_at FROM trades WHERE trade_id=?",
         (tid,),
     ).fetchone()
     if not row:
         conn.close()
         return None
-    chat_id, deal_id, deal_reference, capital_order_id, symbol, direction, entry_price, size = row
+    chat_id, deal_id, deal_reference, capital_order_id, symbol, direction, entry_price, size, closed_at = row
     if not deal_id:
         conn.close()
         return None
@@ -1290,10 +1425,18 @@ def try_sync_final_for_trade_id(
 
     dr = str(deal_reference or "").strip()
     co = str(capital_order_id or "").strip()
+    try:
+        size_f = float(size) if size is not None else None
+    except (TypeError, ValueError):
+        size_f = None
     final = fetch_closed_deal_final_data(
         base_url,
         session_headers,
         str(deal_id),
+        symbol=str(symbol or ""),
+        direction=str(direction or ""),
+        size=size_f,
+        closed_at=str(closed_at or "").strip() or None,
         wait_for_realized=wait_realized,
         identifiers=[dr] if dr else None,
         capital_order_id=co or None,
@@ -1577,7 +1720,7 @@ def backfill_closed_pnls(chat_id, base_url, headers, lookback: int = 200) -> int
     c = conn.cursor()
     c.execute(
         "SELECT trade_id, deal_id, COALESCE(deal_reference,''), COALESCE(capital_order_id,''), "
-        "pnl, direction, entry_price, size FROM trades "
+        "pnl, direction, entry_price, size, symbol, closed_at FROM trades "
         "WHERE chat_id=? AND status='CLOSED' "
         "AND deal_id IS NOT NULL AND TRIM(deal_id) != '' "
         "ORDER BY trade_id DESC LIMIT ?",
@@ -1589,16 +1732,24 @@ def backfill_closed_pnls(chat_id, base_url, headers, lookback: int = 200) -> int
         return 0
 
     updated = 0
-    for trade_id, deal_id, deal_reference, capital_order_id, pnl, direction, entry_price, size in rows:
+    for trade_id, deal_id, deal_reference, capital_order_id, pnl, direction, entry_price, size, symbol, closed_at in rows:
         # Backfill only unknown/zero rows.
         if pnl is not None and float(pnl) != 0.0:
             continue
         dr = str(deal_reference or "").strip()
         co = str(capital_order_id or "").strip()
+        try:
+            size_f = float(size) if size is not None else None
+        except (TypeError, ValueError):
+            size_f = None
         final = fetch_closed_deal_final_data(
             base_url,
             headers,
             str(deal_id),
+            symbol=str(symbol or ""),
+            direction=str(direction or ""),
+            size=size_f,
+            closed_at=str(closed_at or "").strip() or None,
             wait_for_realized=True,
             identifiers=[dr] if dr else None,
             capital_order_id=co or None,

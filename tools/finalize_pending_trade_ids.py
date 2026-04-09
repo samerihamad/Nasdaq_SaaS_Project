@@ -29,7 +29,7 @@ def main():
         row = c.execute(
             "SELECT chat_id, deal_id, COALESCE(deal_reference,''), COALESCE(capital_order_id,''), "
             "symbol, direction, entry_price, size, COALESCE(leg_role,''), COALESCE(parent_session,''), "
-            "stop_distance, trailing_stop "
+            "stop_distance, trailing_stop, closed_at "
             "FROM trades WHERE trade_id=? AND status='CLOSED' "
             "AND COALESCE(sync_status,'')='PENDING_FINAL'",
             (tid,),
@@ -50,6 +50,7 @@ def main():
             parent_session,
             stop_distance,
             trailing_stop,
+            closed_at,
         ) = row
         creds = get_user_credentials(str(chat_id))
         if not creds:
@@ -61,10 +62,18 @@ def main():
             continue
         dr = str(deal_reference or "").strip()
         co = str(capital_order_id or "").strip()
+        try:
+            size_f = float(size) if size is not None else None
+        except (TypeError, ValueError):
+            size_f = None
         final = fetch_closed_deal_final_data(
             base_url,
             headers,
             str(deal_id),
+            symbol=str(symbol or ""),
+            direction=str(direction or ""),
+            size=size_f,
+            closed_at=str(closed_at or "").strip() or None,
             wait_for_realized=True,
             identifiers=[dr] if dr else None,
             capital_order_id=co or None,

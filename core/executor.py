@@ -80,6 +80,11 @@ _CORRELATED_GROUPS: dict[str, set[str]] = {
     "TECH": {"AAPL", "MSFT", "GOOGL", "NVDA", "QQQ"},
 }
 _VOLATILE_LIMIT_ATR_FRAC = 0.12
+_TP_DISTANCE_TRIGGER_PCT = 0.003
+_TP_BUFFER_REGULAR_PCT = 0.005
+_TP_BUFFER_PENNY_PCT = 0.010
+_BROKER_TARGET_RR = 2.0
+_SPREAD_PROXY_PCT = 0.0005
 _ADX_STRONG_TREND = 25.0
 _ADX_RANGING = 20.0
 _TRAIL_MULT_STRONG = 1.6
@@ -1400,6 +1405,100 @@ def _apply_min_distance_to_protection(
         if profit_level is not None:
             profit_level = min(float(profit_level), float(entry_price) - md)
     return stop_level, profit_level
+
+
+def _adaptive_tp_buffer_pct(entry_price: float) -> float:
+    """Penny stocks (<$10) require wider TP safety buffer."""
+    return float(_TP_BUFFER_PENNY_PCT) if float(entry_price) < 10.0 else float(_TP_BUFFER_REGULAR_PCT)
+
+
+def _adjust_tp_for_broker_limits(
+    *,
+    action: str,
+    entry_price: float,
+    tp_level: float,
+    symbol: str,
+    min_dist: float | None = None,
+    atr_value: float | None = None,
+) -> tuple[float, bool, float]:
+    """
+    Ensure TP is far enough to avoid broker min-value rejections.
+    Uses adaptive % floor, broker min distance, and a small ATR safety cushion.
+    """
+    if entry_price <= 0:
+        return float(tp_level), False, 0.0
+    tp = float(tp_level)
+    current_dist = abs(float(tp) - float(entry_price))
+    adaptive_floor = float(entry_price) * _adaptive_tp_buffer_pct(float(entry_price))
+    trigger_floor = float(entry_price) * float(_TP_DISTANCE_TRIGGER_PCT)
+    broker_floor = float(min_dist) if (min_dist is not None and float(min_dist) > 0) else 0.0
+    atr_floor = float(atr_value) * 0.05 if (atr_value is not None and float(atr_value) > 0) else 0.0
+    required_dist = max(adaptive_floor, broker_floor, atr_floor)
+    if current_dist >= max(trigger_floor, required_dist):
+        return tp, False, required_dist
+    if str(action).upper() == "BUY":
+        return float(entry_price) + float(required_dist), True, required_dist
+    return float(entry_price) - float(required_dist), True, required_dist
+
+
+def _rebalance_sl_for_target_rr(
+    *,
+    action: str,
+    entry_price: float,
+    stop_level: float,
+    tp_level: float,
+    target_rr: float = _BROKER_TARGET_RR,
+    min_dist: float | None = None,
+    max_dist: float | None = None,
+) -> tuple[float, bool]:
+    """
+    Rebalance stop to keep R:R near target after TP widening.
+    """
+    if entry_price <= 0 or target_rr <= 0:
+        return float(stop_level), False
+    tp_dist = abs(float(tp_level) - float(entry_price))
+    if tp_dist <= 0:
+        return float(stop_level), False
+    desired_sl_dist = float(tp_dist) / float(target_rr)
+    if min_dist is not None and float(min_dist) > 0:
+        desired_sl_dist = max(desired_sl_dist, float(min_dist))
+    if max_dist is not None and float(max_dist) > 0:
+        desired_sl_dist = min(desired_sl_dist, float(max_dist))
+    if desired_sl_dist <= 0:
+        return float(stop_level), False
+    current_sl_dist = abs(float(entry_price) - float(stop_level))
+    if abs(current_sl_dist - desired_sl_dist) <= max(1e-8, float(entry_price) * 0.0001):
+        return float(stop_level), False
+    if str(action).upper() == "BUY":
+        return float(entry_price) - float(desired_sl_dist), True
+    return float(entry_price) + float(desired_sl_dist), True
+
+
+def validate_broker_limits(entry: float, sl: float, tp: float, symbol: str) -> tuple[bool, dict]:
+    """
+    Lightweight broker-legality check before order submission.
+    Rule of thumb: protection levels should be at least ~2x spread away.
+    """
+    try:
+        e = float(entry)
+        sl_v = float(sl)
+        tp_v = float(tp)
+    except Exception:
+        return False, {"reason": "invalid_numeric_levels"}
+    if e <= 0:
+        return False, {"reason": "entry_not_positive"}
+    spread_proxy = max(float(e) * float(_SPREAD_PROXY_PCT), 0.01 if e < 10.0 else 0.02)
+    min_legal = float(spread_proxy) * 2.0
+    sl_dist = abs(float(e) - float(sl_v))
+    tp_dist = abs(float(tp_v) - float(e))
+    ok = bool(sl_dist >= min_legal and tp_dist >= min_legal)
+    return ok, {
+        "symbol": str(symbol or ""),
+        "spread_proxy": float(spread_proxy),
+        "min_legal_distance": float(min_legal),
+        "sl_distance": float(sl_dist),
+        "tp_distance": float(tp_dist),
+    }
 
 
 def resolve_epic_for_user(chat_id, symbol, base_url=None, headers=None, is_demo=None):
@@ -2941,6 +3040,7 @@ def place_trade_for_user(
     #   instead of skipping strong signals.
     min_dist = _get_min_stop_profit_distance(base_url, headers, order_epic)
     tp_adjust_note = ""
+    rr_adjust_note = ""
     if min_dist and float(min_dist) > 0 and entry_price > 0:
         md = float(min_dist)
         # Enforce broker minimum stop distance as well (not only TP widening).
@@ -2988,6 +3088,96 @@ def place_trade_for_user(
         stop_level, target1, target2 = _sanitize_protection_levels(
             action, entry_price, stop_level, target1, target2
         )
+
+    # Adaptive TP floor by price tier (penny vs regular), plus ATR safety cushion.
+    target1, t1_adj, t1_req = _adjust_tp_for_broker_limits(
+        action=action,
+        entry_price=float(entry_price),
+        tp_level=float(target1),
+        symbol=str(symbol),
+        min_dist=(float(min_dist) if min_dist else None),
+        atr_value=(float(atr) if atr is not None and math.isfinite(float(atr)) else None),
+    )
+    if t1_adj:
+        print(
+            f"[LIMIT-ADJUST] Adjusting TP for {symbol} to meet broker min_distance requirements.",
+            flush=True,
+        )
+        if lang == "en":
+            tp_adjust_note += f"\nℹ️ Adjusted: TP1 buffered to safe minimum distance ({float(t1_req):.4f})."
+        else:
+            tp_adjust_note += f"\nℹ️ تم التعديل: تمت زيادة الهدف 1 لمسافة أمان مناسبة ({float(t1_req):.4f})."
+
+    target2, t2_adj, t2_req = _adjust_tp_for_broker_limits(
+        action=action,
+        entry_price=float(entry_price),
+        tp_level=float(target2),
+        symbol=str(symbol),
+        min_dist=(float(min_dist) if min_dist else None),
+        atr_value=(float(atr) if atr is not None and math.isfinite(float(atr)) else None),
+    )
+    if t2_adj:
+        print(
+            f"[LIMIT-ADJUST] Adjusting TP for {symbol} to meet broker min_distance requirements.",
+            flush=True,
+        )
+        if lang == "en":
+            tp_adjust_note += f"\nℹ️ Adjusted: TP2 buffered to safe minimum distance ({float(t2_req):.4f})."
+        else:
+            tp_adjust_note += f"\nℹ️ تم التعديل: تمت زيادة الهدف 2 لمسافة أمان مناسبة ({float(t2_req):.4f})."
+
+    # Keep trade math coherent after TP push: rebalance SL near target R:R (default 2.0).
+    if t1_adj or t2_adj:
+        stop_level_rr, rr_adj = _rebalance_sl_for_target_rr(
+            action=str(action),
+            entry_price=float(entry_price),
+            stop_level=float(stop_level),
+            tp_level=float(target1),
+            target_rr=float(_BROKER_TARGET_RR),
+            min_dist=(float(min_dist) if min_dist else None),
+            max_dist=(float(max_dist) if max_dist else None),
+        )
+        if rr_adj:
+            stop_level = float(stop_level_rr)
+            if lang == "en":
+                rr_adjust_note = "\nℹ️ Adjusted: SL rebalanced to preserve target R:R near 2.0."
+            else:
+                rr_adjust_note = "\nℹ️ تم التعديل: إعادة موازنة وقف الخسارة للحفاظ على نسبة عائد/مخاطرة قرب 2.0."
+
+    # Final sanitize before broker submission.
+    stop_level, target1, target2 = _sanitize_protection_levels(
+        action, entry_price, stop_level, target1, target2
+    )
+
+    # Pre-submit broker legality check to reduce order_leg_failed rejections.
+    ok_t1, lim_t1 = validate_broker_limits(float(entry_price), float(stop_level), float(target1), str(symbol))
+    ok_t2, lim_t2 = validate_broker_limits(float(entry_price), float(stop_level), float(target2), str(symbol))
+    if not ok_t1 or not ok_t2:
+        min_need = 0.0
+        for lim in (lim_t1, lim_t2):
+            if isinstance(lim, dict):
+                min_need = max(min_need, float(lim.get("min_legal_distance") or 0.0))
+        if min_need > 0 and entry_price > 0:
+            if action == "BUY":
+                target1 = max(float(target1), float(entry_price) + float(min_need))
+                target2 = max(float(target2), float(entry_price) + float(min_need))
+            else:
+                target1 = min(float(target1), float(entry_price) - float(min_need))
+                target2 = min(float(target2), float(entry_price) - float(min_need))
+            print(
+                f"[LIMIT-ADJUST] Adjusting TP for {symbol} to meet broker min_distance requirements.",
+                flush=True,
+            )
+            stop_level, target1, target2 = _sanitize_protection_levels(
+                action, entry_price, stop_level, target1, target2
+            )
+            ok_t1, _ = validate_broker_limits(float(entry_price), float(stop_level), float(target1), str(symbol))
+            ok_t2, _ = validate_broker_limits(float(entry_price), float(stop_level), float(target2), str(symbol))
+    if not ok_t1 or not ok_t2:
+        msg = f"❌ Order blocked ({symbol} {action}): protection levels violate broker distance constraints"
+        _log_trade_rejection(chat_id, symbol, action, "broker_limits_validation", msg, f"lim_t1={lim_t1} lim_t2={lim_t2}")
+        _maybe_notify_rejection(chat_id, msg, symbol=symbol, action=action, stage="broker_limits_validation")
+        return msg
 
     # Split into two positions to support TP1 + TP2 on broker.
     # Capital applies one TP per position, so we split size intentionally.
@@ -3180,6 +3370,7 @@ def place_trade_for_user(
             f"{partial_note_en}"
             f"{sl_adjust_note}"
             f"{tp_adjust_note}"
+            f"{rr_adjust_note}"
         )
     else:
         override_line = "⚠️ تجاوز يدوي — جاري فتح صفقة جديدة\n\n" if is_override else ""
@@ -3202,6 +3393,7 @@ def place_trade_for_user(
             f"{partial_note_ar}"
             f"{sl_adjust_note}"
             f"{tp_adjust_note}"
+            f"{rr_adjust_note}"
         )
 
     tg_res = send_telegram_message(chat_id, msg)
