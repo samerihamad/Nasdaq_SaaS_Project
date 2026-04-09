@@ -623,6 +623,7 @@ def generate_institutional_stop_loss(
     df_15m,
     liquidity_levels: dict | None = None,
     atr_value: float | None = None,
+    atr_mult_override: float | None = None,
     min_stop_distance: float | None = None,
     max_stop_distance: float | None = None,
 ) -> tuple[float, str, dict]:
@@ -641,6 +642,13 @@ def generate_institutional_stop_loss(
     atr = float(atr_value or 0.0)
     high_vol = bool(atr > 0 and (atr / entry) >= 0.02)
     atr_mult = ATR_SL_MULT_HIGH_VOL if high_vol else ATR_SL_MULT_LOW_VOL
+    if atr_mult_override is not None:
+        try:
+            ov = float(atr_mult_override)
+            if math.isfinite(ov) and ov > 0:
+                atr_mult = ov
+        except Exception:
+            pass
     atr_dist = atr * atr_mult if atr > 0 else 0.0
     if atr_dist <= 0:
         atr_dist = entry * 0.01

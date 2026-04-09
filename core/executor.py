@@ -46,7 +46,7 @@ from core.risk_manager import (
     can_open_trade,
     calculate_position_size, STATE_MANUAL_OVERRIDE,
     check_daily_drawdown, check_rr_ratio,
-    get_effective_leverage, validate_pre_trade, generate_institutional_stop_loss,
+    get_effective_leverage, validate_pre_trade, generate_institutional_stop_loss, ATR_SL_MULT_LOW_VOL,
     compute_last_rsi,
 )
 from core.trade_session_finalize import after_trade_leg_closed
@@ -2610,6 +2610,14 @@ def _generate_protection_levels(
 
     try:
         if df_15m_sl is not None and len(df_15m_sl) > 0:
+            dynamic_atr_mult = float(ATR_SL_MULT_LOW_VOL)
+            if float(entry_price) < 10.0:
+                dynamic_atr_mult = float(ATR_SL_MULT_LOW_VOL) * 1.35
+                print(
+                    f"[VOL-ADAPTIVE] Symbol {symbol} priced below $10. "
+                    f"Boosting ATR Multiplier to {dynamic_atr_mult} for extra breathing room.",
+                    flush=True,
+                )
             from core.market_structure import build_liquidity_map
             liq = build_liquidity_map(df_15m_sl)
             liq_levels = {
@@ -2624,6 +2632,7 @@ def _generate_protection_levels(
                 df_15m=df_15m_sl,
                 liquidity_levels=liq_levels,
                 atr_value=float(atr) if atr is not None else None,
+                atr_mult_override=float(dynamic_atr_mult),
                 min_stop_distance=min_dist,
                 max_stop_distance=max_dist,
             )
@@ -2631,6 +2640,29 @@ def _generate_protection_levels(
             stop_price, stop_reason, stop_meta = base_stop_price, "fallback_base_stop", {}
     except Exception:
         stop_price, stop_reason, stop_meta = base_stop_price, "fallback_base_stop_exception", {}
+
+    # Penny-stock safety floor: never allow SL distance < 1.5% of price.
+    try:
+        if float(entry_price) < 10.0:
+            min_floor = float(entry_price) * 0.015
+            dist = abs(float(entry_price) - float(stop_price))
+            if dist < float(min_floor):
+                if str(action).upper() == "BUY":
+                    stop_price = float(entry_price) - float(min_floor)
+                else:
+                    stop_price = float(entry_price) + float(min_floor)
+                stop_reason = str(stop_reason or "") + "|penny_floor_1p5"
+                if isinstance(stop_meta, dict):
+                    stop_meta = dict(stop_meta)
+                    stop_meta["penny_floor_min_dist"] = float(min_floor)
+    except Exception:
+        pass
+
+    # Ensure effective_sl_pct reflects the final stop distance (for sizing/slippage/risk).
+    try:
+        effective_sl_pct = abs(float(entry_price) - float(stop_price)) / float(entry_price)
+    except Exception:
+        pass
 
     rr_ok, rr_ratio, rr_reason = check_rr_ratio(
         float(entry_price),
@@ -3070,6 +3102,22 @@ def place_trade_for_user(
         target2 = entry_price * (1 - TP2_PCT)
         dir_ar   = 'بيع'
         sq_color = '🟥'
+
+    # Maintain RR≈2.0 consistency: if SL is widened (e.g., penny floor / adaptive ATR),
+    # ensure TP distances are not too tight relative to stop distance.
+    try:
+        rr_stop_dist = abs(float(entry_price) - float(stop_level))
+        if rr_stop_dist > 0:
+            tp1_min_dist = rr_stop_dist * 1.0
+            tp2_min_dist = rr_stop_dist * 2.0
+            if action == "BUY":
+                target1 = max(float(target1), float(entry_price) + float(tp1_min_dist))
+                target2 = max(float(target2), float(entry_price) + float(tp2_min_dist))
+            else:
+                target1 = min(float(target1), float(entry_price) - float(tp1_min_dist))
+                target2 = min(float(target2), float(entry_price) - float(tp2_min_dist))
+    except Exception:
+        pass
 
     # Capital requires valid absolute levels; sanitize defensively.
     stop_level, target1, target2 = _sanitize_protection_levels(
