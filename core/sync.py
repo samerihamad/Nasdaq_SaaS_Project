@@ -253,7 +253,8 @@ def _broker_fetch_and_finalize_trade(trade_id: int, *, notify: bool = True) -> b
     c = conn.cursor()
     row = c.execute(
         "SELECT chat_id, deal_id, COALESCE(deal_reference,''), COALESCE(capital_order_id,''), "
-        "symbol, direction, entry_price, size, closed_at, COALESCE(sync_status,'') "
+        "symbol, direction, entry_price, size, closed_at, COALESCE(sync_status,''), "
+        "COALESCE(risk_outcome_recorded,0) "
         "FROM trades WHERE trade_id=?",
         (tid,),
     ).fetchone()
@@ -271,6 +272,7 @@ def _broker_fetch_and_finalize_trade(trade_id: int, *, notify: bool = True) -> b
         size,
         closed_at,
         sync_st,
+        risk_already,
     ) = row
     if not deal_id:
         return False
@@ -401,7 +403,8 @@ def _broker_fetch_and_finalize_trade(trade_id: int, *, notify: bool = True) -> b
     ).fetchone()
     conn_ps.close()
     ps = str(ps_row[0] or "").strip() if ps_row else ""
-    after_trade_leg_closed(str(chat_id), ps, float(pnl))
+    if not int(risk_already or 0):
+        after_trade_leg_closed(str(chat_id), ps, float(pnl))
 
     print(
         f"[PROFIT_FIX] Trade {int(tid)} closed at "
@@ -758,17 +761,64 @@ def mark_trade_closed_pending(
     deal_reference: str | None = None,
     reason: str = "awaiting_broker_history",
     notify: bool = True,
+    provisional_pnl: float | None = None,
+    apply_fast_risk: bool = True,
 ):
     """
     Mark as CLOSED immediately when broker no longer has the position, even if
     final realized PnL is delayed in history.
+
+    When apply_fast_risk is True, writes provisional P&L (from last broker UPL or
+    caller) and runs trade_session_finalize / record_trade_result immediately so
+    the circuit breaker does not wait for history sync.
     """
+    tid = int(trade_id)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+
+    if not apply_fast_risk and provisional_pnl is None:
+        c.execute(
+            "UPDATE trades SET status='CLOSED', closed_at=?, sync_status=?, "
+            "close_sync_last_error=?, close_reason=COALESCE(close_reason, ?), "
+            "deal_reference=COALESCE(NULLIF(?,''), deal_reference), close_sync_notified=1 "
+            "WHERE trade_id=? AND status='OPEN'",
+            (
+                _now_utc().isoformat(),
+                PENDING_SYNC,
+                str(reason),
+                "pending_final_sync",
+                str(deal_reference or "").strip(),
+                tid,
+            ),
+        )
+        changed = c.rowcount == 1
+        if changed:
+            conn.commit()
+        conn.close()
+        if changed and notify and ENABLE_CLOSE_PENDING_NOTIFY:
+            _send_pending_close_notice(chat_id, symbol, direction, trade_id)
+        return changed
+
+    eff_pnl: float | None = provisional_pnl
+    if eff_pnl is None:
+        row_lb = c.execute(
+            "SELECT COALESCE(last_broker_upl, pnl) FROM trades WHERE trade_id=?",
+            (tid,),
+        ).fetchone()
+        if row_lb and row_lb[0] is not None:
+            try:
+                eff_pnl = float(row_lb[0])
+            except (TypeError, ValueError):
+                eff_pnl = None
+    if eff_pnl is None:
+        eff_pnl = 0.0
+
+    risk_flag = 1 if apply_fast_risk else 0
     c.execute(
         "UPDATE trades SET status='CLOSED', closed_at=?, sync_status=?, "
         "close_sync_last_error=?, close_reason=COALESCE(close_reason, ?), "
-        "deal_reference=COALESCE(NULLIF(?,''), deal_reference), close_sync_notified=1 "
+        "deal_reference=COALESCE(NULLIF(?,''), deal_reference), close_sync_notified=1, "
+        "pnl=?, actual_pnl=?, risk_outcome_recorded=? "
         "WHERE trade_id=? AND status='OPEN'",
         (
             _now_utc().isoformat(),
@@ -776,13 +826,29 @@ def mark_trade_closed_pending(
             str(reason),
             "pending_final_sync",
             str(deal_reference or "").strip(),
-            int(trade_id),
+            float(eff_pnl),
+            float(eff_pnl),
+            int(risk_flag),
+            tid,
         ),
     )
     changed = c.rowcount == 1
+    ps_row = None
     if changed:
+        ps_row = c.execute(
+            "SELECT COALESCE(parent_session,'') FROM trades WHERE trade_id=?",
+            (tid,),
+        ).fetchone()
         conn.commit()
     conn.close()
+
+    if changed and apply_fast_risk:
+        ps = str((ps_row or ("",))[0] or "").strip()
+        try:
+            after_trade_leg_closed(str(chat_id), ps, float(eff_pnl))
+        except Exception:
+            pass
+
     # User-facing "pending sync" close notices are optional and disabled by default.
     if changed and notify and ENABLE_CLOSE_PENDING_NOTIFY:
         _send_pending_close_notice(chat_id, symbol, direction, trade_id)
@@ -1291,15 +1357,17 @@ def _finalize_trade_close_notifications(trade_id: int) -> None:
     try:
         conn = sqlite3.connect(DB_PATH)
         row = conn.execute(
-            "SELECT chat_id, COALESCE(parent_session,''), COALESCE(actual_pnl, pnl, 0) "
+            "SELECT chat_id, COALESCE(parent_session,''), COALESCE(actual_pnl, pnl, 0), "
+            "COALESCE(risk_outcome_recorded,0) "
             "FROM trades WHERE trade_id=?",
             (int(trade_id),),
         ).fetchone()
         conn.close()
         if not row:
             return
-        chat_id, parent_session, pnl_v = row
-        after_trade_leg_closed(str(chat_id), str(parent_session or "").strip(), float(pnl_v or 0.0))
+        chat_id, parent_session, pnl_v, risk_done = row
+        if not int(risk_done or 0):
+            after_trade_leg_closed(str(chat_id), str(parent_session or "").strip(), float(pnl_v or 0.0))
     except Exception:
         pass
     try:

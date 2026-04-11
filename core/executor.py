@@ -2017,6 +2017,54 @@ def is_sibling_tp1_leg_closed(parent_session_id: str | None) -> bool:
         return False
 
 
+def _sum_positions_upl(live_positions: list) -> float:
+    """Aggregate unrealized P&L across all open broker positions (account scope)."""
+    t = 0.0
+    for p in live_positions or []:
+        pos = p.get("position") or {}
+        try:
+            t += float(pos.get("upl") or 0.0)
+        except (TypeError, ValueError):
+            pass
+    return t
+
+
+def _emergency_close_all_broker_positions(
+    chat_id,
+    base_url: str,
+    headers: dict,
+    creds,
+    live_positions: list,
+) -> bool:
+    """Issue DELETE for every listed open position (3% aggregate UPL shield)."""
+    closed_any = False
+    seen: set[str] = set()
+    for p in live_positions or []:
+        for deal_id in _capital_all_ids_from_row(p):
+            did = str(deal_id).strip()
+            if not did or did in seen:
+                continue
+            seen.add(did)
+            ok_del, _payload, _err, _st = _broker_request(
+                "DELETE",
+                f"{base_url}/positions/{did}",
+                headers=headers,
+                timeout=20,
+                creds=creds,
+                chat_id=str(chat_id),
+            )
+            if ok_del:
+                closed_any = True
+                _audit_exec_event(
+                    stage="emergency_close_all_position",
+                    chat_id=str(chat_id),
+                    symbol=None,
+                    action=None,
+                    details=f"deal_id={did} aggregate_upl_shield=1",
+                )
+    return closed_any
+
+
 # ── Position monitoring — trailing stop + hard fallback ───────────────────────
 
 def monitor_and_close(chat_id):
@@ -2064,7 +2112,28 @@ def monitor_and_close(chat_id):
     live_positions  = pos_res.json().get('positions', [])
     balance         = _get_balance(base_url, headers)
     hard_stop_limit = -(balance * 0.03)   # -3% of balance
-    # Optional state-sync guard: skip close attempts on hard local/broker divergence.
+    # Emergency 3% shield: total unrealized P&L vs balance — close ALL positions, no hash/sync gates.
+    try:
+        total_upl = _sum_positions_upl(live_positions)
+        if balance and float(balance) > 0 and total_upl <= float(hard_stop_limit):
+            _audit_exec_event(
+                stage="emergency_3pct_total_upl_close_all",
+                chat_id=str(chat_id),
+                symbol=None,
+                action=None,
+                details=(
+                    f"total_upl={total_upl:.2f} limit={float(hard_stop_limit):.2f} "
+                    f"balance={float(balance):.2f}"
+                ),
+            )
+            _emergency_close_all_broker_positions(
+                chat_id, base_url, headers, creds, live_positions
+            )
+            reconcile(chat_id, base_url, headers, notify=True)
+            return True
+    except Exception:
+        pass
+    # Optional state-sync guard: on divergence, force reconcile and continue; never freeze the cycle.
     local_hash = _local_positions_state_hash(str(chat_id))
     broker_hash = _broker_positions_state_hash(live_positions)
     if local_hash != broker_hash:
@@ -2076,18 +2145,25 @@ def monitor_and_close(chat_id):
             details=f"local_hash={local_hash[:12]} broker_hash={broker_hash[:12]} force_reconcile=1",
         )
         force_reconcile(chat_id, base_url, headers, notify=True)
-        pos_res, headers = _resilient_capital_get(
+        pos_res2, headers = _resilient_capital_get(
             f"{base_url}/positions",
             headers=headers,
             timeout=20,
             chat_id=str(chat_id),
             creds=creds,
         )
-        if pos_res is None or pos_res.status_code != 200:
-            return False
-        live_positions = pos_res.json().get("positions", [])
-        local_hash = _local_positions_state_hash(str(chat_id))
-        broker_hash = _broker_positions_state_hash(live_positions)
+        if pos_res2 is not None and pos_res2.status_code == 200:
+            live_positions = pos_res2.json().get("positions", [])
+            local_hash = _local_positions_state_hash(str(chat_id))
+            broker_hash = _broker_positions_state_hash(live_positions)
+        else:
+            _audit_exec_event(
+                stage="state_hash_reconcile_refresh_failed",
+                chat_id=str(chat_id),
+                symbol=None,
+                action=None,
+                details="keeping prior /positions snapshot; per-trade skip if no live row",
+            )
         if local_hash != broker_hash:
             _audit_exec_event(
                 stage="state_hash_post_reconcile_mismatch",
@@ -2129,6 +2205,16 @@ def monitor_and_close(chat_id):
             else live['market']['offer']
         )
         upl = float(live['position']['upl'])
+        try:
+            conn_snap = sqlite3.connect(DB_PATH)
+            conn_snap.execute(
+                "UPDATE trades SET last_broker_upl=? WHERE trade_id=? AND status='OPEN'",
+                (float(upl), int(trade_id)),
+            )
+            conn_snap.commit()
+            conn_snap.close()
+        except Exception:
+            pass
 
         # Calculate ATR from unified scanner provider data
         atr = calculate_atr(
@@ -2393,6 +2479,8 @@ def monitor_and_close(chat_id):
                     deal_reference=str(deal_ref).strip() if deal_ref else None,
                     reason="awaiting_background_final_sync",
                     notify=False,
+                    provisional_pnl=float(upl),
+                    apply_fast_risk=True,
                 )
                 spawn_background_final_sync(int(trade["trade_id"]))
                 closed_any = True
@@ -2737,6 +2825,7 @@ def _calculate_position_sizing(
     stop_price: float,
     effective_sl_pct: float,
     rsi_15m_gate,
+    regime_type: str | None = None,
 ) -> tuple[bool, str, dict]:
     """Validate exposure/margin then produce pre-trade position size."""
     lev = get_effective_leverage(str(chat_id))
@@ -2761,13 +2850,19 @@ def _calculate_position_sizing(
         action=str(action),
         strategy_label=str(strategy_label or ""),
         rsi_15m=rsi_15m_gate,
+        regime=str(regime_type) if regime_type else None,
     )
     if not approved_pre:
         msg = str(pre_reason or "Trade rejected: pre-trade validation failed")
         return False, msg, {}
     pretrade_size = float(pre_details.get("position_size") or 0.0)
     size = pretrade_size if pretrade_size >= 1.0 else calculate_position_size(
-        float(balance), float(confidence), float(entry_price), float(effective_sl_pct), str(chat_id)
+        float(balance),
+        float(confidence),
+        float(entry_price),
+        float(effective_sl_pct),
+        str(chat_id),
+        regime=str(regime_type) if regime_type else None,
     )
     return True, "", {
         "leverage": float(lev),
@@ -2991,6 +3086,7 @@ def place_trade_for_user(
         stop_price=float(stop_price),
         effective_sl_pct=float(effective_sl_pct),
         rsi_15m_gate=rsi_15m_gate,
+        regime_type=regime_type,
     )
     if not size_ok:
         _audit_exec_event(
@@ -3082,7 +3178,12 @@ def place_trade_for_user(
 
     # ── Position size (1–2% risk, confidence-scaled) ──────────────────────────
     size = pretrade_size if pretrade_size >= 1.0 else calculate_position_size(
-        balance, confidence, entry_price, effective_sl_pct, chat_id
+        balance,
+        confidence,
+        entry_price,
+        effective_sl_pct,
+        chat_id,
+        regime=str(regime_type) if regime_type else None,
     )
     # Protection levels used BOTH for broker order and Telegram report.
     # Stop comes from institutional SL synthesis done pre-trade.

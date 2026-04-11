@@ -59,8 +59,6 @@ AI_PROBABILITY_THRESHOLD = 60.0    # baseline / fallback when regime is unknown 
 AI_THRESHOLD_TRENDING_PCT = 55.0
 AI_THRESHOLD_RANGING_PCT = 58.0
 AI_THRESHOLD_VOLATILE_PCT = 60.0
-# If blended confidence exceeds this before the volatile dampening, skip the dampening (still vs threshold).
-AI_VOLATILE_CONFIDENCE_BYPASS_MIN_PCT = 62.0
 # Default blend when regime classification is unexpected (matches legacy static mix).
 _GATEKEEPER_TF_WEIGHTS_DEFAULT = {"1d": 0.20, "4h": 0.35, "15m": 0.45}
 # Volatile regime: dampen probability slightly (was 0.90; institutional refinement 0.95).
@@ -757,23 +755,14 @@ def evaluate_symbol(
             pass
 
     if regime["type"] == "VOLATILE":
-        prob_pre_vol = float(probability)
-        if prob_pre_vol > float(AI_VOLATILE_CONFIDENCE_BYPASS_MIN_PCT):
-            probability = round(prob_pre_vol, 1)
-            log.info(
-                "[AI Gate %s] VOLATILE regime: confidence %.1f%% > %.1f%% — skipping dampening",
-                symbol,
-                prob_pre_vol,
-                float(AI_VOLATILE_CONFIDENCE_BYPASS_MIN_PCT),
-            )
-        else:
-            probability = round(probability * float(AI_VOLATILE_PROBABILITY_MULT), 1)
-            log.info(
-                "[AI Gate %s] VOLATILE regime penalty applied (×%.2f) → probability=%.1f%%",
-                symbol,
-                float(AI_VOLATILE_PROBABILITY_MULT),
-                probability,
-            )
+        # Always apply volatility dampening in VOLATILE — no high-confidence bypass.
+        probability = round(float(probability) * float(AI_VOLATILE_PROBABILITY_MULT), 1)
+        log.info(
+            "[AI Gate %s] VOLATILE regime penalty applied (×%.2f) → probability=%.1f%%",
+            symbol,
+            float(AI_VOLATILE_PROBABILITY_MULT),
+            probability,
+        )
     else:
         probability = round(float(probability), 1)
 

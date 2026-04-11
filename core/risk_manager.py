@@ -49,6 +49,8 @@ CONSECUTIVE_LOSS_LIMIT = 2
 # Risk scaling: confidence 70% → 1.0% risk, 100% → 2.0% risk  (hard cap at 2%)
 MIN_CONF, MAX_CONF = 70.0, 100.0
 MIN_RISK, MAX_RISK = 1.0,  2.0
+# In VOLATILE regime, effective risk_pct is never above 1% regardless of AI confidence.
+MAX_RISK_PCT_VOLATILE = 1.0
 
 # Institutional risk controls
 DAILY_DRAWDOWN_LIMIT = float(MAX_DAILY_LOSS_PCT)   # % drawdown from session start → hard stop
@@ -280,6 +282,10 @@ def record_trade_result(chat_id, pnl: float):
     """
     Call when a *risk outcome* is final for the user.
 
+    Fast path: `mark_trade_closed_pending(..., apply_fast_risk=True)` may invoke
+    `after_trade_leg_closed` with provisional UPL before broker history sync; the
+    P&L sync worker skips duplicate risk updates when `risk_outcome_recorded` is set.
+
     For split TP1/TP2 positions sharing `parent_session`, call this **once** with
     the session total P&L (after all legs are closed), not per leg — see
     `trade_session_finalize.after_trade_leg_closed`.
@@ -418,7 +424,8 @@ def apply_stop_today(chat_id):
 
 def calculate_position_size(balance: float, confidence: float,
                              entry_price: float, stop_loss_pct: float = 0.01,
-                             chat_id: str = None):
+                             chat_id: str = None,
+                             regime: str | None = None):
     """
     Per-user dynamic risk sizing.
 
@@ -439,6 +446,8 @@ def calculate_position_size(balance: float, confidence: float,
       We never multiply the post-risk position size by leverage — that would
       exceed the intended risk percentage.
 
+    When `regime` is VOLATILE, effective risk_pct is capped at MAX_RISK_PCT_VOLATILE (1%).
+
     size = risk_budget / (entry_price * stop_loss_pct)
     Minimum 1 unit.
     """
@@ -452,6 +461,8 @@ def calculate_position_size(balance: float, confidence: float,
     # Convex curve (>1 exponent) => stronger emphasis on high confidence.
     conf_weight = conf_norm ** 1.8
     risk_pct = user_min + (user_max - user_min) * conf_weight
+    if str(regime or "").strip().upper() == "VOLATILE":
+        risk_pct = min(float(risk_pct), float(MAX_RISK_PCT_VOLATILE))
 
     risk_budget = balance * (risk_pct / 100)
     if chat_id:
@@ -821,6 +832,7 @@ def validate_pre_trade(
     action: str | None = None,
     strategy_label: str | None = None,
     rsi_15m: float | None = None,
+    regime: str | None = None,
 ) -> tuple[bool, str, dict]:
     """
     Mandatory pre-trade validation.
@@ -942,6 +954,7 @@ def validate_pre_trade(
             entry_price=entry,
             stop_loss_pct=stop_loss_pct,
             chat_id=chat_id,
+            regime=regime,
         )
     )
     if proposed_size < 1.0 or not (proposed_size == proposed_size):

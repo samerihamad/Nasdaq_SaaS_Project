@@ -188,6 +188,10 @@ def create_db():
         ('exit_price', 'REAL'),
         ('target_reached', "TEXT"),
         ('close_reason', "TEXT"),
+        # Last broker floating P&L snapshot while OPEN (for fast risk on external close).
+        ('last_broker_upl', "REAL"),
+        # 1 = record_trade_result / session finalize already applied before broker history PnL sync.
+        ('risk_outcome_recorded', "INTEGER DEFAULT 0"),
     ]:
         try:
             c.execute(f"ALTER TABLE trades ADD COLUMN {col} {definition}")
