@@ -56,6 +56,7 @@ from core.trailing_stop import (
     close_trade_in_db, record_open_trade,
 )
 from core.sync import reconcile
+from core.sync import force_reconcile
 from core.sync import mark_trade_closed_pending
 from core.sync import spawn_background_final_sync
 from core.sync import capital_verify_deal_closed_after_close_request
@@ -2072,9 +2073,29 @@ def monitor_and_close(chat_id):
             chat_id=str(chat_id),
             symbol=None,
             action=None,
-            details=f"local_hash={local_hash[:12]} broker_hash={broker_hash[:12]} skip_close_cycle=1",
+            details=f"local_hash={local_hash[:12]} broker_hash={broker_hash[:12]} force_reconcile=1",
         )
-        return False
+        force_reconcile(chat_id, base_url, headers, notify=True)
+        pos_res, headers = _resilient_capital_get(
+            f"{base_url}/positions",
+            headers=headers,
+            timeout=20,
+            chat_id=str(chat_id),
+            creds=creds,
+        )
+        if pos_res is None or pos_res.status_code != 200:
+            return False
+        live_positions = pos_res.json().get("positions", [])
+        local_hash = _local_positions_state_hash(str(chat_id))
+        broker_hash = _broker_positions_state_hash(live_positions)
+        if local_hash != broker_hash:
+            _audit_exec_event(
+                stage="state_hash_post_reconcile_mismatch",
+                chat_id=str(chat_id),
+                symbol=None,
+                action=None,
+                details=f"local_hash={local_hash[:12]} broker_hash={broker_hash[:12]} proceed_close_cycle=1",
+            )
 
     # Index by every dealId/positionId Capital exposes (DB may store either).
     live_by_id = {}

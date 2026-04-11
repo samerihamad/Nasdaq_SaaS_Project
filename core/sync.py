@@ -981,6 +981,30 @@ def fetch_closed_deal_final_data(
             return False
         return True
 
+    def _tx_datetime_utc(tx: dict) -> _dt | None:
+        for k in ("date", "timestamp", "createdDate", "createdTime", "time"):
+            raw = tx.get(k)
+            if raw is None:
+                continue
+            if isinstance(raw, (int, float)):
+                try:
+                    val = float(raw)
+                    if val > 1e12:  # epoch milliseconds
+                        val = val / 1000.0
+                    return _dt.fromtimestamp(val, tz=timezone.utc)
+                except Exception:
+                    continue
+            try:
+                s = str(raw).strip()
+                if s.endswith("Z"):
+                    s = s[:-1] + "+00:00"
+                parsed = _parse_iso_utc(s)
+                if parsed is not None:
+                    return parsed
+            except Exception:
+                continue
+        return None
+
     def _fetch(params: dict | None) -> tuple[bool, list, int, str]:
         try:
             res = requests.get(
@@ -1068,14 +1092,37 @@ def fetch_closed_deal_final_data(
             for hid in ids:
                 if _id_match(c, hid):
                     return True
-        return False
+        tx_sym = _norm_symbol(_tx_symbol(tx))
+        want_sym_tokens = _symbol_tokens(symbol)
+        if not tx_sym or not want_sym_tokens:
+            return False
+        if not any(tok in tx_sym for tok in want_sym_tokens):
+            return False
+        if size is None:
+            return False
+        tx_sz = _tx_size(tx)
+        if tx_sz is None or abs(float(tx_sz) - float(size)) >= 0.0001:
+            return False
+        # Closing transactions are the opposite side of the original open trade.
+        expected_close = _expected_close_side(direction)
+        tx_side = _tx_direction(tx)
+        if expected_close and tx_side and tx_side != expected_close:
+            return False
+        if closed_at_dt is not None:
+            tx_dt = _tx_datetime_utc(tx)
+            if tx_dt is not None:
+                from_dt = closed_at_dt - timedelta(hours=24)
+                to_dt = closed_at_dt + timedelta(hours=24)
+                if tx_dt < from_dt or tx_dt > to_dt:
+                    return False
+        return True
 
     closed_at_dt = _parse_iso_utc(closed_at)
     fuzzy_window_from = None
     fuzzy_window_to = None
     if closed_at_dt is not None:
         fuzzy_window_from = _to_utc_iso_z(closed_at_dt - timedelta(hours=24))
-        fuzzy_window_to = _to_utc_iso_z(closed_at_dt + timedelta(hours=1))
+        fuzzy_window_to = _to_utc_iso_z(closed_at_dt + timedelta(hours=24))
 
     def _collect_merged_transactions() -> tuple[list[dict], str, list[dict]]:
         seen_keys: set[str] = set()
@@ -1207,8 +1254,8 @@ def fetch_closed_deal_final_data(
                 if not found_zero_hold:
                     if matched_via_fuzzy:
                         print(
-                            f"[SYNC-SUCCESS] Fuzzy match found for {str(symbol or '').strip() or 'UNKNOWN'} "
-                            "using Time+Volume",
+                            f"[MANUAL-SYNC-SUCCESS] Found manual closure for "
+                            f"{str(symbol or '').strip() or 'UNKNOWN'} in history. P&L updated.",
                             flush=True,
                         )
                     return {
@@ -1708,6 +1755,17 @@ def reconcile(chat_id, base_url, headers, *, notify: bool = True):
 
     conn.commit()
     conn.close()
+
+
+def force_reconcile(chat_id, base_url, headers, *, notify: bool = True) -> None:
+    """
+    Explicit reconciliation pass used to recover from local/broker state hash drift.
+    Never raises to caller.
+    """
+    try:
+        reconcile(chat_id, base_url, headers, notify=notify)
+    except Exception as exc:
+        print(f"[FORCE-RECONCILE] chat_id={chat_id} failed: {exc!s}", flush=True)
 
 
 def backfill_closed_pnls(chat_id, base_url, headers, lookback: int = 200) -> int:
