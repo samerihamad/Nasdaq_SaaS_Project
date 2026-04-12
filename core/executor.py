@@ -49,6 +49,7 @@ from core.risk_manager import (
     check_daily_drawdown, check_rr_ratio,
     get_effective_leverage, validate_pre_trade, generate_institutional_stop_loss, ATR_SL_MULT_LOW_VOL,
     compute_last_rsi,
+    record_trade_result,
 )
 from core.trade_session_finalize import after_trade_leg_closed
 from core.trailing_stop import (
@@ -71,7 +72,7 @@ log = logging.getLogger(__name__)
 # repeating broker lookups for every signal cycle.
 _EPIC_CACHE = {}
 SESSION_TTL_SECONDS = 45
-LOG_ROOT = os.getenv("ENGINE_LOG_ROOT", "logs")
+LOG_ROOT = "logs"
 _REJECTION_NOTIFY_CACHE: dict[str, float] = {}
 _EXEC_ATR_PERIOD = 14
 _EXEC_ATR_W_15M = 0.60
@@ -2133,45 +2134,6 @@ def monitor_and_close(chat_id):
             return True
     except Exception:
         pass
-    # Optional state-sync guard: on divergence, force reconcile and continue; never freeze the cycle.
-    local_hash = _local_positions_state_hash(str(chat_id))
-    broker_hash = _broker_positions_state_hash(live_positions)
-    if local_hash != broker_hash:
-        _audit_exec_event(
-            stage="state_hash_mismatch",
-            chat_id=str(chat_id),
-            symbol=None,
-            action=None,
-            details=f"local_hash={local_hash[:12]} broker_hash={broker_hash[:12]} force_reconcile=1",
-        )
-        force_reconcile(chat_id, base_url, headers, notify=True)
-        pos_res2, headers = _resilient_capital_get(
-            f"{base_url}/positions",
-            headers=headers,
-            timeout=20,
-            chat_id=str(chat_id),
-            creds=creds,
-        )
-        if pos_res2 is not None and pos_res2.status_code == 200:
-            live_positions = pos_res2.json().get("positions", [])
-            local_hash = _local_positions_state_hash(str(chat_id))
-            broker_hash = _broker_positions_state_hash(live_positions)
-        else:
-            _audit_exec_event(
-                stage="state_hash_reconcile_refresh_failed",
-                chat_id=str(chat_id),
-                symbol=None,
-                action=None,
-                details="keeping prior /positions snapshot; per-trade skip if no live row",
-            )
-        if local_hash != broker_hash:
-            _audit_exec_event(
-                stage="state_hash_post_reconcile_mismatch",
-                chat_id=str(chat_id),
-                symbol=None,
-                action=None,
-                details=f"local_hash={local_hash[:12]} broker_hash={broker_hash[:12]} proceed_close_cycle=1",
-            )
 
     # Index by every dealId/positionId Capital exposes (DB may store either).
     live_by_id = {}
@@ -2186,6 +2148,43 @@ def monitor_and_close(chat_id):
 
     # ── Step 2: ATR trailing stop logic ──────────────────────────────────────
     for trade in get_open_trades(chat_id):
+        lh = _local_positions_state_hash(str(chat_id))
+        bh = _broker_positions_state_hash(live_positions)
+        if lh != bh:
+            _audit_exec_event(
+                stage="state_hash_mismatch",
+                chat_id=str(chat_id),
+                symbol=None,
+                action=None,
+                details=f"local_hash={lh[:12]} broker_hash={bh[:12]} force_reconcile=1",
+            )
+            force_reconcile(chat_id, base_url, headers, notify=True)
+            pos_res2, headers = _resilient_capital_get(
+                f"{base_url}/positions",
+                headers=headers,
+                timeout=20,
+                chat_id=str(chat_id),
+                creds=creds,
+            )
+            if pos_res2 is not None and pos_res2.status_code == 200:
+                live_positions = pos_res2.json().get("positions", [])
+                live_by_id = {}
+                for p in live_positions:
+                    ids = _capital_all_ids_from_row(p)
+                    if not ids and p.get("position", {}).get("dealId") is not None:
+                        ids = {str(p["position"]["dealId"]).strip()}
+                    for rid in ids:
+                        live_by_id[str(rid).strip()] = p
+            else:
+                _audit_exec_event(
+                    stage="state_hash_reconcile_refresh_failed",
+                    chat_id=str(chat_id),
+                    symbol=None,
+                    action=None,
+                    details="positions_refresh_failed_skip_trade",
+                )
+            continue
+
         deal_id   = trade['deal_id']
         symbol    = trade['symbol']
         direction = trade['direction']
@@ -2471,15 +2470,17 @@ def monitor_and_close(chat_id):
                 conn_u.commit()
                 conn_u.close()
 
-                ps_leg = str(trade.get("parent_session") or "").strip()
-                risk_hint = None
-                if not ps_leg and str(target_label) == "STOP_LOSS":
+                is_stop_loss_exit = str(target_label) == "STOP_LOSS"
+                if is_stop_loss_exit:
                     try:
-                        _upl_v = float(upl)
-                    except (TypeError, ValueError):
-                        _upl_v = None
-                    if _upl_v is None or _upl_v <= 0:
-                        risk_hint = "loss"
+                        record_trade_result(
+                            str(chat_id),
+                            float(upl),
+                            outcome_hint="loss",
+                        )
+                    except Exception:
+                        pass
+
                 mark_trade_closed_pending(
                     chat_id,
                     int(trade["trade_id"]),
@@ -2489,9 +2490,21 @@ def monitor_and_close(chat_id):
                     reason="awaiting_background_final_sync",
                     notify=False,
                     provisional_pnl=float(upl),
-                    apply_fast_risk=True,
-                    risk_outcome_hint=risk_hint,
+                    apply_fast_risk=(not is_stop_loss_exit),
+                    risk_outcome_hint=None,
                 )
+                if is_stop_loss_exit:
+                    try:
+                        conn_r = sqlite3.connect(DB_PATH)
+                        conn_r.execute(
+                            "UPDATE trades SET risk_outcome_recorded=1 WHERE trade_id=?",
+                            (int(trade["trade_id"]),),
+                        )
+                        conn_r.commit()
+                        conn_r.close()
+                    except Exception:
+                        pass
+
                 spawn_background_final_sync(int(trade["trade_id"]))
                 closed_any = True
             else:

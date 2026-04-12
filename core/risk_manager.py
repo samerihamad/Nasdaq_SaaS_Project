@@ -12,6 +12,7 @@ Open positions are NEVER touched during a Circuit Breaker or Hard Block.
 They stay active until they hit TP or SL.
 """
 
+import logging
 import sqlite3
 import math
 import requests
@@ -52,6 +53,8 @@ from database.db_manager import (
     is_master_kill_switch, get_user_kill_switch, get_user_risk_params,
     get_preferred_leverage, set_trading_enabled, get_user_signal_profile,
 )
+
+log = logging.getLogger(__name__)
 
 STATE_NORMAL          = 'NORMAL'
 STATE_CIRCUIT_BREAKER = 'CIRCUIT_BREAKER'
@@ -436,55 +439,65 @@ def calculate_position_size(balance: float, confidence: float,
                              chat_id: str = None,
                              regime: str | None = None):
     """
-    Per-user dynamic risk sizing.
+    Per-user dynamic risk sizing. Tunables come from ``config`` (imported names).
 
-    Uses this user's risk_percent / max_risk_percent from the DB if chat_id
-    is supplied; falls back to global MIN_RISK / MAX_RISK constants otherwise.
+    Regime handling (Sizing Shield):
+      If ``regime`` normalizes to ``VOLATILE``, ``risk_pct`` is capped by
+      ``MAX_RISK_PCT_VOLATILE`` from config before computing dollar risk.
 
-    Scaling (stronger convex curve):
-      confidence at MIN_CONF (70%)  → user's min_risk %
-      confidence at MAX_CONF (100%) → user's max_risk %  (hard cap)
-      Mid-range confidence gets modest increases, while high-confidence
-      setups accelerate faster toward max risk.
+    Convex confidence mapping → [user_min, user_max] risk %, then leverage scaling.
 
-    Leverage (cap vs user preference):
-      Dollar risk at the stop is budgeted as
-      balance × risk_pct × (effective_leverage / cap_leverage).
-      Choosing the maximum uses the full risk band; choosing a lower
-      leverage (e.g. 1× vs 2× cap) scales risk and size down in proportion.
-      We never multiply the post-risk position size by leverage — that would
-      exceed the intended risk percentage.
-
-    When `regime` is VOLATILE, effective risk_pct is capped at MAX_RISK_PCT_VOLATILE (1%).
-
-    size = risk_budget / (entry_price * stop_loss_pct)
-    Minimum 1 unit.
+    Size = risk_budget / (entry_price * stop_loss_pct). Broker min is typically 1 unit;
+    if the formula yields < 1.0, we clamp to 1.0 and emit a **critical** log because
+    effective exposure exceeds the intended risk budget at that stop distance.
     """
     if chat_id:
         user_min, user_max = get_user_risk_params(chat_id)
     else:
         user_min, user_max = MIN_RISK, MAX_RISK
 
-    clamped = max(MIN_CONF, min(MAX_CONF, confidence))
-    conf_norm = (clamped - MIN_CONF) / (MAX_CONF - MIN_CONF)  # 0..1
-    # Convex curve (>1 exponent) => stronger emphasis on high confidence.
+    clamped = max(MIN_CONF, min(MAX_CONF, float(confidence)))
+    conf_norm = (clamped - MIN_CONF) / (MAX_CONF - MIN_CONF)
     conf_weight = conf_norm ** 1.8
-    risk_pct = user_min + (user_max - user_min) * conf_weight
-    if str(regime or "").strip().upper() == "VOLATILE":
-        risk_pct = min(float(risk_pct), float(MAX_RISK_PCT_VOLATILE))
+    risk_pct = float(user_min) + (float(user_max) - float(user_min)) * conf_weight
 
-    risk_budget = balance * (risk_pct / 100)
+    reg = str(regime or "").strip().upper()
+    if reg == "VOLATILE":
+        risk_pct = min(risk_pct, float(MAX_RISK_PCT_VOLATILE))
+
+    risk_budget = float(balance) * (risk_pct / 100.0)
     if chat_id:
         cap = get_user_max_leverage(chat_id)
         lev = get_effective_leverage(chat_id)
         if cap > 0:
-            risk_budget *= lev / cap
+            risk_budget *= float(lev) / float(cap)
 
-    if entry_price <= 0 or stop_loss_pct <= 0:
+    ep = float(entry_price)
+    slp = float(stop_loss_pct)
+    if ep <= 0 or slp <= 0 or not math.isfinite(risk_budget):
         return 1.0
 
-    size = risk_budget / (entry_price * stop_loss_pct)
-    return max(1.0, round(size, 2))
+    denom = ep * slp
+    raw_size = risk_budget / denom
+    rounded = round(float(raw_size), 2)
+
+    if rounded < 1.0:
+        log.critical(
+            "POSITION_SIZE_RISK_CLAMP: raw_computed_size=%.8f < 1.0 — clamped to 1.0; "
+            "intended_risk_budget=%.6f implies risk above configured cap at this stop "
+            "(balance=%.6f risk_pct=%.6f regime=%r chat_id=%s entry=%.8f stop_loss_pct=%.8f)",
+            float(raw_size),
+            float(risk_budget),
+            float(balance),
+            float(risk_pct),
+            regime,
+            str(chat_id or ""),
+            ep,
+            slp,
+        )
+        return 1.0
+
+    return float(rounded)
 
 
 # ── Daily drawdown guard ──────────────────────────────────────────────────────
