@@ -13,7 +13,6 @@ Runs at the start of every monitoring cycle to fix any discrepancies:
     → Insert into DB so the trailing stop engine starts tracking it.
 """
 
-import os
 import queue
 import sqlite3
 import requests
@@ -30,26 +29,31 @@ from core.trade_close_messages import (
     send_reconcile_tp2_final,
 )
 from database.db_manager import get_subscriber_lang, DB_PATH
-from config import FINAL_SYNC_FALLBACK_ENABLED
+from config import (
+    FINAL_SYNC_FALLBACK_ENABLED,
+    ENABLE_CLOSE_PENDING_NOTIFY,
+    SYNC_RETRY_COOLDOWN_SEC,
+    SYNC_MAX_ATTEMPTS,
+    FINAL_SYNC_MAX_WALL_SEC,
+    RECONCILE_FINAL_SYNC_WALL_SEC,
+    STALLED_PNL_RETRY_INTERVAL_SEC,
+    STALLED_PNL_RETRY_MAX_ROUNDS,
+    VERIFY_CLOSE_MAX_POLLS,
+    VERIFY_CLOSE_POLL_SEC,
+    VERIFY_CLOSE_CONSECUTIVE_ABSENT,
+    FINAL_SYNC_HOURLY_RETRY_SEC,
+    FINAL_SYNC_CONSOLE_WARN_AFTER_SEC,
+)
 from utils.market_hours import utc_now
-ENABLE_CLOSE_PENDING_NOTIFY = (os.getenv("ENABLE_CLOSE_PENDING_NOTIFY", "false").strip().lower() == "true")
-SYNC_RETRY_COOLDOWN_SEC = int(os.getenv("CLOSE_SYNC_RETRY_COOLDOWN_SEC", "30"))
-SYNC_MAX_ATTEMPTS = int(os.getenv("CLOSE_SYNC_MAX_ATTEMPTS", "120"))
+
 PENDING_FINAL = "PENDING_FINAL"
 # New canonical: waiting for broker history (preferred on write).
 PENDING_SYNC = "PENDING_SYNC"
 SYNCED = "SYNCED"
 FINALIZED_NO_PNL = "FINALIZED_NO_PNL"
 
-# Final close history sync: wall-clock budget and exponential-style backoff (seconds).
-FINAL_SYNC_MAX_WALL_SEC = float(os.getenv("FINAL_SYNC_MAX_WALL_SEC", "300"))
-# Per monitoring-cycle reconcile: avoid blocking the whole loop for the full budget.
-RECONCILE_FINAL_SYNC_WALL_SEC = float(os.getenv("RECONCILE_FINAL_SYNC_WALL_SEC", "300"))
 # Capital can take ~60s to populate realized rpl in history after close — space retries out.
 FINAL_SYNC_BACKOFF_SEC = [15.0, 30.0, 45.0, 60.0, 60.0, 60.0]
-# Closed trades with missing/zero P&L: extra background attempts (5 min × 12 = 1 h).
-STALLED_PNL_RETRY_INTERVAL_SEC = float(os.getenv("STALLED_PNL_RETRY_INTERVAL_SEC", "300"))
-STALLED_PNL_RETRY_MAX_ROUNDS = int(os.getenv("STALLED_PNL_RETRY_MAX_ROUNDS", "12"))
 
 # Background P&L sync: reconcile enqueues trade_ids; worker runs fetch_closed_deal_final_data
 # (including internal backoff sleeps) off the main / watcher / scanner thread.
@@ -346,6 +350,7 @@ def _broker_fetch_and_finalize_trade(trade_id: int, *, notify: bool = True) -> b
         capital_order_id=co or None,
         max_wall_sec=RECONCILE_FINAL_SYNC_WALL_SEC,
         quiet=True,
+        db_trade_id=int(tid),
     )
     if not final:
         try:
@@ -470,12 +475,6 @@ def _pending_sync_max_attempts() -> int:
     return max(1, int(STALLED_PNL_RETRY_MAX_ROUNDS))
 
 
-# After DELETE / manual close, poll /positions before trusting "closed" (2s, 5s, 10s gaps in fetch_closed_deal_final_data).
-VERIFY_CLOSE_MAX_POLLS = int(os.getenv("VERIFY_CLOSE_MAX_POLLS", "10"))
-VERIFY_CLOSE_POLL_SEC = float(os.getenv("VERIFY_CLOSE_POLL_SEC", "0.6"))
-VERIFY_CLOSE_CONSECUTIVE_ABSENT = max(1, int(os.getenv("VERIFY_CLOSE_CONSECUTIVE_ABSENT", "2")))
-
-
 def _capital_norm_id(v) -> str:
     if v is None:
         return ""
@@ -494,6 +493,45 @@ def _capital_ids_match(a: str, b: str) -> bool:
         return True
     if len(nb) >= 8 and na.endswith(nb):
         return True
+    return False
+
+
+def _broker_tx_deal_id_for_dedup(tx: dict) -> str:
+    """Primary broker id on a history transaction (for dedup against trades.deal_id)."""
+    if not isinstance(tx, dict):
+        return ""
+    for k in ("dealId", "positionId", "orderId"):
+        v = tx.get(k)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    pos = tx.get("position")
+    if isinstance(pos, dict):
+        for k in ("dealId", "positionId", "orderId"):
+            v = pos.get(k)
+            if v is not None and str(v).strip():
+                return str(v).strip()
+    return ""
+
+
+def _fuzzy_tx_deal_claimed_by_other_row(tx: dict, db_trade_id: int | None) -> bool:
+    """True if this transaction's deal id is already linked to a different DB trade row."""
+    if db_trade_id is None:
+        return False
+    cand = _broker_tx_deal_id_for_dedup(tx)
+    if not cand:
+        return False
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute(
+            "SELECT deal_id FROM trades WHERE trade_id!=? AND deal_id IS NOT NULL AND TRIM(deal_id)!=''",
+            (int(db_trade_id),),
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return False
+    for (did,) in rows:
+        if _capital_ids_match(cand, str(did or "")):
+            return True
     return False
 
 
@@ -763,6 +801,7 @@ def mark_trade_closed_pending(
     notify: bool = True,
     provisional_pnl: float | None = None,
     apply_fast_risk: bool = True,
+    risk_outcome_hint: str | None = None,
 ):
     """
     Mark as CLOSED immediately when broker no longer has the position, even if
@@ -771,6 +810,9 @@ def mark_trade_closed_pending(
     When apply_fast_risk is True, writes provisional P&L (from last broker UPL or
     caller) and runs trade_session_finalize / record_trade_result immediately so
     the circuit breaker does not wait for history sync.
+
+    risk_outcome_hint: optional 'loss'/'win' for single-leg trades when outcome must
+    be inferred before broker rpl (e.g. stop-loss with flat provisional UPL).
     """
     tid = int(trade_id)
     conn = sqlite3.connect(DB_PATH)
@@ -845,7 +887,12 @@ def mark_trade_closed_pending(
     if changed and apply_fast_risk:
         ps = str((ps_row or ("",))[0] or "").strip()
         try:
-            after_trade_leg_closed(str(chat_id), ps, float(eff_pnl))
+            after_trade_leg_closed(
+                str(chat_id),
+                ps,
+                float(eff_pnl),
+                outcome_hint=risk_outcome_hint,
+            )
         except Exception:
             pass
 
@@ -870,6 +917,7 @@ def fetch_closed_deal_final_data(
     lookback_max: int = 2000,
     max_wall_sec: float | None = None,
     quiet: bool = True,
+    db_trade_id: int | None = None,
 ) -> dict | None:
     """
     Fetch broker-truth final close data from Capital.com /history/transactions.
@@ -1190,6 +1238,38 @@ def fetch_closed_deal_final_data(
         fuzzy_window_from = _to_utc_iso_z(closed_at_dt - timedelta(hours=24))
         fuzzy_window_to = _to_utc_iso_z(closed_at_dt + timedelta(hours=24))
 
+    def _refine_fuzzy_manual_matches(raw: list[dict]) -> list[dict]:
+        """
+        Drop broker rows whose deal id is already bound to another trade, then pick the
+        transaction whose timestamp is closest to our DB closed_at (manual-close path).
+        """
+        if not raw:
+            return []
+        deduped = [
+            tx
+            for tx in raw
+            if isinstance(tx, dict) and not _fuzzy_tx_deal_claimed_by_other_row(tx, db_trade_id)
+        ]
+        if not deduped:
+            return []
+        if closed_at_dt is None:
+            return [deduped[0]]
+        best_tx = None
+        best_sec = float("inf")
+        undated: list[dict] = []
+        for tx in deduped:
+            tdt = _tx_datetime_utc(tx)
+            if tdt is None:
+                undated.append(tx)
+                continue
+            delta = abs((tdt - closed_at_dt).total_seconds())
+            if delta < best_sec:
+                best_sec = delta
+                best_tx = tx
+        if best_tx is not None:
+            return [best_tx]
+        return [undated[0]] if undated else [deduped[0]]
+
     def _collect_merged_transactions() -> tuple[list[dict], str, list[dict]]:
         seen_keys: set[str] = set()
         merged: list[dict] = []
@@ -1278,8 +1358,12 @@ def fetch_closed_deal_final_data(
         matched_via_fuzzy = False
         if not matched:
             if fuzzy_matches:
-                matched = list(fuzzy_matches)
-                matched_via_fuzzy = True
+                refined = _refine_fuzzy_manual_matches(fuzzy_matches)
+                if refined:
+                    matched = refined
+                    matched_via_fuzzy = True
+                else:
+                    last_issue = last_issue or "fuzzy_deduped_empty"
             else:
                 last_issue = last_issue or "no_matching_transactions"
         if matched:
@@ -1376,10 +1460,6 @@ def _finalize_trade_close_notifications(trade_id: int) -> None:
         send_bot_automated_close_from_db(int(trade_id))
     except Exception:
         pass
-
-
-FINAL_SYNC_HOURLY_RETRY_SEC = float(os.getenv("FINAL_SYNC_HOURLY_RETRY_SEC", "3600"))
-FINAL_SYNC_CONSOLE_WARN_AFTER_SEC = float(os.getenv("FINAL_SYNC_CONSOLE_WARN_AFTER_SEC", "86400"))
 
 
 def spawn_background_final_sync(
@@ -1557,6 +1637,7 @@ def try_sync_final_for_trade_id(
         capital_order_id=co or None,
         max_wall_sec=wall,
         quiet=quiet,
+        db_trade_id=int(tid),
     )
     if not final:
         return None
@@ -1879,6 +1960,7 @@ def backfill_closed_pnls(chat_id, base_url, headers, lookback: int = 200) -> int
             wait_for_realized=True,
             identifiers=[dr] if dr else None,
             capital_order_id=co or None,
+            db_trade_id=int(trade_id),
         )
         if not final:
             continue

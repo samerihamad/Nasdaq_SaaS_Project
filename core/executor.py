@@ -26,6 +26,7 @@ from config import (
     LIMIT_ORDER_MEANREV_ATR_OFFSET,
     LIMIT_ORDER_ALLOW_MARKET_FALLBACK,
     EXECUTION_REJECTION_NOTIFY_COOLDOWN_SEC,
+    MAX_SLIPPAGE_PCT,
 )
 from utils.market_scanner import (
     HTTP_429_COOLDOWN_SEC,
@@ -72,7 +73,6 @@ _EPIC_CACHE = {}
 SESSION_TTL_SECONDS = 45
 LOG_ROOT = os.getenv("ENGINE_LOG_ROOT", "logs")
 _REJECTION_NOTIFY_CACHE: dict[str, float] = {}
-MAX_SLIPPAGE_PCT = float(os.getenv("MAX_SLIPPAGE_PCT", "0.003"))
 _EXEC_ATR_PERIOD = 14
 _EXEC_ATR_W_15M = 0.60
 _EXEC_ATR_W_1H = 0.40
@@ -2471,6 +2471,15 @@ def monitor_and_close(chat_id):
                 conn_u.commit()
                 conn_u.close()
 
+                ps_leg = str(trade.get("parent_session") or "").strip()
+                risk_hint = None
+                if not ps_leg and str(target_label) == "STOP_LOSS":
+                    try:
+                        _upl_v = float(upl)
+                    except (TypeError, ValueError):
+                        _upl_v = None
+                    if _upl_v is None or _upl_v <= 0:
+                        risk_hint = "loss"
                 mark_trade_closed_pending(
                     chat_id,
                     int(trade["trade_id"]),
@@ -2481,6 +2490,7 @@ def monitor_and_close(chat_id):
                     notify=False,
                     provisional_pnl=float(upl),
                     apply_fast_risk=True,
+                    risk_outcome_hint=risk_hint,
                 )
                 spawn_background_final_sync(int(trade["trade_id"]))
                 closed_any = True

@@ -94,6 +94,7 @@ from config import (
     STRUCTURAL_REJECTION_NOTIFY_COOLDOWN_SEC,
     STRUCTURAL_REJECTION_NOTIFY_MAX_PER_CYCLE,
     ENABLE_AUTONOMOUS_TRAINING,
+    MAIN_LOOP_MAX_CONSECUTIVE_FAILURES,
 )
 
 # ── Single-instance lock ──────────────────────────────────────────────────────
@@ -1554,6 +1555,8 @@ def run_trading_bot():
 
     _start_background_threads()
 
+    _engine_consecutive_failures = 0
+
     while True:
         try:
             now_utc = synchronized_utc_now()
@@ -1844,6 +1847,20 @@ def run_trading_bot():
                 print(traceback.format_exc())
             except Exception:
                 pass
+            _engine_consecutive_failures += 1
+            print(
+                f"[ENGINE] consecutive failures={_engine_consecutive_failures}/"
+                f"{int(MAIN_LOOP_MAX_CONSECUTIVE_FAILURES)}",
+                flush=True,
+            )
+            if _engine_consecutive_failures >= int(MAIN_LOOP_MAX_CONSECUTIVE_FAILURES):
+                print(
+                    "[ENGINE] FATAL: too many consecutive loop failures — exiting for watchdog restart.",
+                    flush=True,
+                )
+                sys.exit(1)
+        else:
+            _engine_consecutive_failures = 0
 
         print(f"\n⏰ اكتملت الدورة. الانتظار {CHECK_INTERVAL} ثانية...")
         print("=" * 55)

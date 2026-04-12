@@ -22,6 +22,8 @@ def after_trade_leg_closed(
     chat_id: str,
     parent_session: str | None,
     leg_pnl: float,
+    *,
+    outcome_hint: str | None = None,
 ) -> None:
     """
     Call after a trade row is marked CLOSED in the DB.
@@ -29,10 +31,11 @@ def after_trade_leg_closed(
     - Single-leg / legacy (no parent_session): feed leg P&L to risk immediately.
     - Multi-leg: only when *all* legs in the session are closed, compute total P&L,
       persist `trade_sessions`, then call record_trade_result once with the total.
+    outcome_hint: optional 'loss'/'win' for instant circuit-breaker path when PnL is ambiguous (single-leg only).
     """
     ps = (parent_session or "").strip()
     if not ps:
-        record_trade_result(chat_id, float(leg_pnl))
+        record_trade_result(chat_id, float(leg_pnl), outcome_hint=outcome_hint)
         return
     finalize_session_if_complete(chat_id, ps)
 

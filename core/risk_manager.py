@@ -12,7 +12,6 @@ Open positions are NEVER touched during a Circuit Breaker or Hard Block.
 They stay active until they hit TP or SL.
 """
 
-import os
 import sqlite3
 import math
 import requests
@@ -27,6 +26,20 @@ from config import (
     MAX_DAILY_LOSS_PCT,
     CB_LOSS_LIMIT,
     MAX_RISK_PCT_VOLATILE,
+    WEEKLY_DRAWDOWN_LIMIT,
+    MIN_RR_RATIO,
+    MAX_SYMBOL_EXPOSURE_FRACTION,
+    MAX_SECTOR_EXPOSURE_FRACTION,
+    MAX_TOTAL_EXPOSURE_MULT,
+    MAX_TRADES_PER_SYMBOL_DAY,
+    MAX_TRADES_PER_DAY_RISK,
+    MARGIN_CALL_BUFFER_PCT,
+    MAX_STOP_LOSS_PCT,
+    ATR_SL_MULT_LOW_VOL,
+    ATR_SL_MULT_HIGH_VOL,
+    VOL_BAND_MULT,
+    LIQUIDITY_SL_BUFFER_ATR,
+    SWING_LOOKBACK_BARS,
     FAST_RSI_LIMITS,
     GOLD_RSI_LIMITS,
     FAST_SL_RELAX_CONFIDENCE_THRESHOLD,
@@ -53,22 +66,8 @@ MIN_CONF, MAX_CONF = 70.0, 100.0
 MIN_RISK, MAX_RISK = 1.0,  2.0
 # In VOLATILE regime, effective risk_pct is capped (see config MAX_RISK_PCT_VOLATILE).
 
-# Institutional risk controls
+# Institutional risk controls (values from config — single source of truth)
 DAILY_DRAWDOWN_LIMIT = float(MAX_DAILY_LOSS_PCT)   # % drawdown from session start → hard stop
-WEEKLY_DRAWDOWN_LIMIT = float(os.getenv("WEEKLY_DRAWDOWN_LIMIT", "10.0"))
-MIN_RR_RATIO         = 2.0   # minimum reward:risk required (1:2)
-MAX_SYMBOL_EXPOSURE_FRACTION = float(os.getenv("MAX_SYMBOL_EXPOSURE_FRACTION", "0.35"))
-MAX_SECTOR_EXPOSURE_FRACTION = float(os.getenv("MAX_SECTOR_EXPOSURE_FRACTION", "0.55"))
-MAX_TOTAL_EXPOSURE_MULT = float(os.getenv("MAX_TOTAL_EXPOSURE_MULT", "1.00"))
-MAX_TRADES_PER_SYMBOL_DAY = int(os.getenv("MAX_TRADES_PER_SYMBOL_DAY", "2"))
-MAX_TRADES_PER_DAY_RISK = int(os.getenv("MAX_TRADES_PER_DAY_RISK", str(MAX_DAILY_TRADES)))
-MARGIN_CALL_BUFFER_PCT = float(os.getenv("MARGIN_CALL_BUFFER_PCT", "0.15"))
-MAX_STOP_LOSS_PCT = float(os.getenv("MAX_STOP_LOSS_PCT", "0.06"))
-ATR_SL_MULT_LOW_VOL = float(os.getenv("ATR_SL_MULT_LOW_VOL", "2.2"))
-ATR_SL_MULT_HIGH_VOL = float(os.getenv("ATR_SL_MULT_HIGH_VOL", "1.4"))
-VOL_BAND_MULT = float(os.getenv("VOL_BAND_MULT", "2.2"))
-LIQUIDITY_SL_BUFFER_ATR = float(os.getenv("LIQUIDITY_SL_BUFFER_ATR", "0.35"))
-SWING_LOOKBACK_BARS = int(os.getenv("SWING_LOOKBACK_BARS", "20"))
 
 def get_user_max_leverage(chat_id: str) -> int:
     """Return the maximum leverage allowed (single-plan system)."""
@@ -279,7 +278,7 @@ def can_open_trade(chat_id):
 
 # ── Trade outcome recording ───────────────────────────────────────────────────
 
-def record_trade_result(chat_id, pnl: float):
+def record_trade_result(chat_id, pnl: float, *, outcome_hint: str | None = None):
     """
     Call when a *risk outcome* is final for the user.
 
@@ -290,6 +289,9 @@ def record_trade_result(chat_id, pnl: float):
     For split TP1/TP2 positions sharing `parent_session`, call this **once** with
     the session total P&L (after all legs are closed), not per leg — see
     `trade_session_finalize.after_trade_leg_closed`.
+
+    outcome_hint: when PnL is unknown or stale (e.g. SL close before broker rpl),
+    pass 'loss' or 'win' to drive the circuit-breaker counter without waiting for sync.
 
     Transitions:
       NORMAL          + 2nd consecutive loss  → CIRCUIT_BREAKER (sends Telegram prompt)
@@ -303,7 +305,13 @@ def record_trade_result(chat_id, pnl: float):
     prev_state   = data['state']
     consecutive  = data['consecutive_losses']
 
-    is_loss = pnl < 0
+    oh = (outcome_hint or "").strip().lower()
+    if oh == "loss":
+        is_loss = True
+    elif oh == "win":
+        is_loss = False
+    else:
+        is_loss = pnl < 0
     consecutive = (consecutive + 1) if is_loss else 0
 
     # Determine new state

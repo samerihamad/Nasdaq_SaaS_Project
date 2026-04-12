@@ -229,6 +229,42 @@ MAX_RISK_PCT_VOLATILE = float(os.getenv("MAX_RISK_PCT_VOLATILE", "1.0"))
 # Strict minimum volume vs MA20 for liquidity quality (higher = stricter filter).
 STRICT_MIN_VOLUME_RATIO = float(os.getenv("STRICT_MIN_VOLUME_RATIO", "0.8"))
 
+# ── Institutional risk controls (core/risk_manager.py) ─────────────────────────
+WEEKLY_DRAWDOWN_LIMIT = float(os.getenv("WEEKLY_DRAWDOWN_LIMIT", "10.0"))
+MIN_RR_RATIO = float(os.getenv("MIN_RR_RATIO", "2.0"))
+MAX_SYMBOL_EXPOSURE_FRACTION = float(os.getenv("MAX_SYMBOL_EXPOSURE_FRACTION", "0.35"))
+MAX_SECTOR_EXPOSURE_FRACTION = float(os.getenv("MAX_SECTOR_EXPOSURE_FRACTION", "0.55"))
+MAX_TOTAL_EXPOSURE_MULT = float(os.getenv("MAX_TOTAL_EXPOSURE_MULT", "1.00"))
+MAX_TRADES_PER_SYMBOL_DAY = int(os.getenv("MAX_TRADES_PER_SYMBOL_DAY", "2"))
+MAX_TRADES_PER_DAY_RISK = int(os.getenv("MAX_TRADES_PER_DAY_RISK", str(MAX_DAILY_TRADES)))
+MARGIN_CALL_BUFFER_PCT = float(os.getenv("MARGIN_CALL_BUFFER_PCT", "0.15"))
+MAX_STOP_LOSS_PCT = float(os.getenv("MAX_STOP_LOSS_PCT", "0.06"))
+ATR_SL_MULT_LOW_VOL = float(os.getenv("ATR_SL_MULT_LOW_VOL", "2.2"))
+ATR_SL_MULT_HIGH_VOL = float(os.getenv("ATR_SL_MULT_HIGH_VOL", "1.4"))
+VOL_BAND_MULT = float(os.getenv("VOL_BAND_MULT", "2.2"))
+LIQUIDITY_SL_BUFFER_ATR = float(os.getenv("LIQUIDITY_SL_BUFFER_ATR", "0.35"))
+SWING_LOOKBACK_BARS = int(os.getenv("SWING_LOOKBACK_BARS", "20"))
+
+# ── Broker sync / reconciliation (core/sync.py) ──────────────────────────────
+ENABLE_CLOSE_PENDING_NOTIFY = os.getenv("ENABLE_CLOSE_PENDING_NOTIFY", "false").strip().lower() == "true"
+CLOSE_SYNC_RETRY_COOLDOWN_SEC = int(os.getenv("CLOSE_SYNC_RETRY_COOLDOWN_SEC", "30"))
+CLOSE_SYNC_MAX_ATTEMPTS = int(os.getenv("CLOSE_SYNC_MAX_ATTEMPTS", "120"))
+SYNC_RETRY_COOLDOWN_SEC = CLOSE_SYNC_RETRY_COOLDOWN_SEC
+SYNC_MAX_ATTEMPTS = CLOSE_SYNC_MAX_ATTEMPTS
+FINAL_SYNC_MAX_WALL_SEC = float(os.getenv("FINAL_SYNC_MAX_WALL_SEC", "300"))
+RECONCILE_FINAL_SYNC_WALL_SEC = float(os.getenv("RECONCILE_FINAL_SYNC_WALL_SEC", "300"))
+STALLED_PNL_RETRY_INTERVAL_SEC = float(os.getenv("STALLED_PNL_RETRY_INTERVAL_SEC", "300"))
+STALLED_PNL_RETRY_MAX_ROUNDS = int(os.getenv("STALLED_PNL_RETRY_MAX_ROUNDS", "12"))
+VERIFY_CLOSE_MAX_POLLS = int(os.getenv("VERIFY_CLOSE_MAX_POLLS", "10"))
+VERIFY_CLOSE_POLL_SEC = float(os.getenv("VERIFY_CLOSE_POLL_SEC", "0.6"))
+VERIFY_CLOSE_CONSECUTIVE_ABSENT = max(1, int(os.getenv("VERIFY_CLOSE_CONSECUTIVE_ABSENT", "2")))
+FINAL_SYNC_HOURLY_RETRY_SEC = float(os.getenv("FINAL_SYNC_HOURLY_RETRY_SEC", "3600"))
+FINAL_SYNC_CONSOLE_WARN_AFTER_SEC = float(os.getenv("FINAL_SYNC_CONSOLE_WARN_AFTER_SEC", "86400"))
+
+# ── Execution / main loop safety ───────────────────────────────────────────────
+MAX_SLIPPAGE_PCT = float(os.getenv("MAX_SLIPPAGE_PCT", "0.003"))
+MAIN_LOOP_MAX_CONSECUTIVE_FAILURES = int(os.getenv("MAIN_LOOP_MAX_CONSECUTIVE_FAILURES", "3"))
+
 # ── News API (optional — NewsAPI.org) ─────────────────────────────────────────
 
 NEWS_API_KEY         = os.getenv("NEWS_API_KEY", "")
