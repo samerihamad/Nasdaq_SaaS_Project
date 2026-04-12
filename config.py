@@ -216,6 +216,19 @@ GLOBAL_MAX_OPEN_TRADES = int(os.getenv("GLOBAL_MAX_OPEN_TRADES", "7"))
 # Hard stop: if realized daily loss exceeds this % of live equity, block entries.
 MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "3.0"))
 
+# ── Circuit breaker (consecutive-loss guard) ──────────────────────────────────
+# Triggers when consecutive losses reach CB_LOSS_LIMIT within CB_TIME_WINDOW_MINS;
+# optional suspension length is expressed in hours (CB_SUSPENSION_HOURS).
+CB_LOSS_LIMIT = int(os.getenv("CB_LOSS_LIMIT", "2"))
+CB_TIME_WINDOW_MINS = int(os.getenv("CB_TIME_WINDOW_MINS", "60"))
+CB_SUSPENSION_HOURS = int(os.getenv("CB_SUSPENSION_HOURS", "2"))
+
+# Volatile regime: cap effective risk (% of equity) regardless of AI confidence.
+MAX_RISK_PCT_VOLATILE = float(os.getenv("MAX_RISK_PCT_VOLATILE", "1.0"))
+
+# Strict minimum volume vs MA20 for liquidity quality (higher = stricter filter).
+STRICT_MIN_VOLUME_RATIO = float(os.getenv("STRICT_MIN_VOLUME_RATIO", "0.8"))
+
 # ── News API (optional — NewsAPI.org) ─────────────────────────────────────────
 
 NEWS_API_KEY         = os.getenv("NEWS_API_KEY", "")
@@ -286,6 +299,9 @@ ENABLE_MS_SCORE_AI_INTEGRATION = os.getenv("ENABLE_MS_SCORE_AI_INTEGRATION", "tr
 MS_SCORE_AI_NEUTRAL = float(os.getenv("MS_SCORE_AI_NEUTRAL", "50.0"))
 MS_SCORE_AI_SCALE = float(os.getenv("MS_SCORE_AI_SCALE", "0.18"))
 MS_SCORE_AI_MAX_IMPACT = float(os.getenv("MS_SCORE_AI_MAX_IMPACT", "8.0"))
+
+# VOLATILE regime: multiply blended AI probability by this factor (dampening).
+AI_VOLATILE_PROBABILITY_MULT = float(os.getenv("AI_VOLATILE_PROBABILITY_MULT", "0.95"))
 
 # Anti-spam: minimum gap between repeated rejection notifications to the same user.
 EXECUTION_REJECTION_NOTIFY_COOLDOWN_SEC = int(os.getenv("EXECUTION_REJECTION_NOTIFY_COOLDOWN_SEC", "600"))

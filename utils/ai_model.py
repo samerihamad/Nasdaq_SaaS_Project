@@ -43,6 +43,7 @@ from config import (
     MS_SCORE_AI_NEUTRAL,
     MS_SCORE_AI_SCALE,
     MS_SCORE_AI_MAX_IMPACT,
+    AI_VOLATILE_PROBABILITY_MULT,
     MIN_ANALYSIS_BARS,
 )
 
@@ -61,8 +62,7 @@ AI_THRESHOLD_RANGING_PCT = 58.0
 AI_THRESHOLD_VOLATILE_PCT = 60.0
 # Default blend when regime classification is unexpected (matches legacy static mix).
 _GATEKEEPER_TF_WEIGHTS_DEFAULT = {"1d": 0.20, "4h": 0.35, "15m": 0.45}
-# Volatile regime: dampen probability slightly (was 0.90; institutional refinement 0.95).
-AI_VOLATILE_PROBABILITY_MULT = 0.95
+# Volatile regime: dampen probability (default 0.95); see config AI_VOLATILE_PROBABILITY_MULT.
 # When 1d/4h/15m all agree on dominant direction vs proposed, add to blended score.
 AI_AGREEMENT_BONUS_PCT = 5.0
 # Align with config MIN_ANALYSIS_BARS / TARGET_ANALYSIS_BARS (scanner + training gate).

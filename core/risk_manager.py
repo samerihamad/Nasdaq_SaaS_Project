@@ -25,6 +25,8 @@ from config import (
     MAX_DAILY_TRADES,
     GLOBAL_MAX_OPEN_TRADES,
     MAX_DAILY_LOSS_PCT,
+    CB_LOSS_LIMIT,
+    MAX_RISK_PCT_VOLATILE,
     FAST_RSI_LIMITS,
     GOLD_RSI_LIMITS,
     FAST_SL_RELAX_CONFIDENCE_THRESHOLD,
@@ -44,13 +46,12 @@ STATE_MANUAL_OVERRIDE = 'MANUAL_OVERRIDE'
 STATE_HARD_BLOCK      = 'HARD_BLOCK'
 STATE_USER_DAY_HALT   = 'USER_DAY_HALT'
 
-CONSECUTIVE_LOSS_LIMIT = 2
+CONSECUTIVE_LOSS_LIMIT = int(CB_LOSS_LIMIT)
 
 # Risk scaling: confidence 70% → 1.0% risk, 100% → 2.0% risk  (hard cap at 2%)
 MIN_CONF, MAX_CONF = 70.0, 100.0
 MIN_RISK, MAX_RISK = 1.0,  2.0
-# In VOLATILE regime, effective risk_pct is never above 1% regardless of AI confidence.
-MAX_RISK_PCT_VOLATILE = 1.0
+# In VOLATILE regime, effective risk_pct is capped (see config MAX_RISK_PCT_VOLATILE).
 
 # Institutional risk controls
 DAILY_DRAWDOWN_LIMIT = float(MAX_DAILY_LOSS_PCT)   # % drawdown from session start → hard stop
