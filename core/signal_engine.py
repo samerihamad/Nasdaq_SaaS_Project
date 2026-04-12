@@ -4,7 +4,7 @@ Signal Engine — NATB v2.0
 Responsibilities:
   1. Iterate the WATCHLIST and fetch multi-timeframe data for each ticker.
   2. Run Mean Reversion and Momentum strategies in parallel (thread pool).
-  3. Select the best signal per ticker (highest score; must exceed SIGNAL_MIN_CONFIDENCE / dynamic floor).
+  3. Select the best signal per ticker (highest score; must exceed MIN_CONFIDENCE).
   4. Gate every signal through the risk engine (can_open_trade).
   5. Enforce the per-user daily trade cap (MAX_DAILY_TRADES).
   6. Dispatch valid signals to place_trade_for_user for EVERY eligible subscriber.
@@ -25,6 +25,7 @@ import aiohttp
 from utils.market_hours import utc_today, synchronized_utc_now, ET, is_nyse_trading_day
 from config import (
     WATCHLIST,
+    MIN_CONFIDENCE,
     SIGNAL_MIN_CONFIDENCE,
     FAST_MIN_CONFIDENCE,
     GLOBAL_MIN_AI_CONFIDENCE,
@@ -49,7 +50,7 @@ from utils.market_scanner import (
 from utils.ai_model         import analyze_multi_timeframe
 
 log = logging.getLogger(__name__)
-ACTIVE_MIN_CONFIDENCE = float(SIGNAL_MIN_CONFIDENCE)
+ACTIVE_MIN_CONFIDENCE = float(SIGNAL_MIN_CONFIDENCE if SIGNAL_MIN_CONFIDENCE is not None else MIN_CONFIDENCE)
 
 # Dynamic gate (15m ADX/RSI): bonus / choppy targets; neutral uses FAST_MIN_CONFIDENCE from .env.
 _DYNAMIC_TREND_THRESHOLD = 52.0
@@ -383,6 +384,35 @@ def _analyze_one_from_timeframes(
     symbol: str, timeframes: dict, _min_confidence: float
 ) -> dict[str, Any] | None:
     """Strategy stack (sync) given pre-fetched timeframes — MeanRev uses FAST profile by default."""
+    
+    # --- Avoidance Logic Hook ---
+    try:
+        from database.behavioral_db import is_toxic_habit
+        from utils.ai_model import regime_type as _ai_regime_type, _adx, _flatten
+        from datetime import datetime
+        
+        df_15m = timeframes.get("15m")
+        if df_15m is not None and not df_15m.empty:
+            regime = _ai_regime_type(df_15m)
+            adx_val = float(_adx(_flatten(df_15m)).iloc[-1])
+            adx_band = "LOW" if adx_val < 25 else "HIGH"
+            
+            # Simple extraction for 'time_of_day' from local time (as a proxy for scan time)
+            from utils.market_hours import utc_now
+            time_of_day = utc_now().strftime("%H:00 UTC")
+            
+            # Symbol Signature Check: NVDA hard rule
+            if symbol == 'NVDA' and regime == 'VOLATILE' and adx_band == 'LOW':
+                print(f"[BEHAVIORAL BLOCK] Avoided entry for NVDA due to Signature Check (VOLATILE, ADX < 25).")
+                return None
+                
+            if is_toxic_habit(symbol, regime, adx_band, time_of_day):
+                print(f"[BEHAVIORAL BLOCK] Avoided entry for {symbol} due to historical toxic habit in {regime} at {time_of_day}.")
+                return None
+    except Exception as e:
+        print(f"[Behavioral Memory] Error checking toxic habit: {e}")
+        pass
+    
     # Confidence gate uses FAST_MIN_CONFIDENCE-based dynamic threshold (see _dynamic_confidence_threshold).
     eff_min_conf = _dynamic_confidence_threshold(timeframes, symbol)
     candidates: list[
