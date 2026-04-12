@@ -95,7 +95,7 @@ FAST_MOM_VOL_RATIO = float(os.getenv("FAST_MOM_VOL_RATIO", "0.55"))
 # Vol vs MA20 floor: fully from .env — if unset, matches FAST_MOM_VOL_RATIO (no hardcoded 0.7).
 FAST_MOM_VOL_RATIO_FLOOR = float(os.getenv("FAST_MOM_VOL_RATIO_FLOOR", str(FAST_MOM_VOL_RATIO)))
 # When 15m RSI > FAST_MOM_RSI_VOL_TIER_HIGH (BUY), allow volume down to this multiple of MA20.
-FAST_MOM_VOL_RATIO_HIGH_RSI = float(os.getenv("FAST_MOM_VOL_RATIO_HIGH_RSI", "0.65"))
+FAST_MOM_VOL_RATIO_HIGH_RSI = float(os.getenv("FAST_MOM_VOL_RATIO_HIGH_RSI", "0.8"))
 FAST_MOM_RSI_VOL_TIER_HIGH = float(os.getenv("FAST_MOM_RSI_VOL_TIER_HIGH", "70"))
 GOLDEN_MOM_VOL_RATIO = float(os.getenv("GOLDEN_MOM_VOL_RATIO", str(MOM_VOL_RATIO)))
 FAST_MOM_RSI_BUY_MAX = float(os.getenv("FAST_MOM_RSI_BUY_MAX", "77"))
