@@ -12,7 +12,7 @@ Open positions are NEVER touched during a Circuit Breaker or Hard Block.
 They stay active until they hit TP or SL.
 """
 
-import logging
+import os
 import sqlite3
 import math
 import requests
@@ -25,22 +25,6 @@ from config import (
     MAX_DAILY_TRADES,
     GLOBAL_MAX_OPEN_TRADES,
     MAX_DAILY_LOSS_PCT,
-    CB_LOSS_LIMIT,
-    MAX_RISK_PCT_VOLATILE,
-    WEEKLY_DRAWDOWN_LIMIT,
-    MIN_RR_RATIO,
-    MAX_SYMBOL_EXPOSURE_FRACTION,
-    MAX_SECTOR_EXPOSURE_FRACTION,
-    MAX_TOTAL_EXPOSURE_MULT,
-    MAX_TRADES_PER_SYMBOL_DAY,
-    MAX_TRADES_PER_DAY_RISK,
-    MARGIN_CALL_BUFFER_PCT,
-    MAX_STOP_LOSS_PCT,
-    ATR_SL_MULT_LOW_VOL,
-    ATR_SL_MULT_HIGH_VOL,
-    VOL_BAND_MULT,
-    LIQUIDITY_SL_BUFFER_ATR,
-    SWING_LOOKBACK_BARS,
     FAST_RSI_LIMITS,
     GOLD_RSI_LIMITS,
     FAST_SL_RELAX_CONFIDENCE_THRESHOLD,
@@ -54,23 +38,34 @@ from database.db_manager import (
     get_preferred_leverage, set_trading_enabled, get_user_signal_profile,
 )
 
-log = logging.getLogger(__name__)
-
 STATE_NORMAL          = 'NORMAL'
 STATE_CIRCUIT_BREAKER = 'CIRCUIT_BREAKER'
 STATE_MANUAL_OVERRIDE = 'MANUAL_OVERRIDE'
 STATE_HARD_BLOCK      = 'HARD_BLOCK'
 STATE_USER_DAY_HALT   = 'USER_DAY_HALT'
 
-CONSECUTIVE_LOSS_LIMIT = int(CB_LOSS_LIMIT)
+CONSECUTIVE_LOSS_LIMIT = 2
 
 # Risk scaling: confidence 70% → 1.0% risk, 100% → 2.0% risk  (hard cap at 2%)
 MIN_CONF, MAX_CONF = 70.0, 100.0
 MIN_RISK, MAX_RISK = 1.0,  2.0
-# In VOLATILE regime, effective risk_pct is capped (see config MAX_RISK_PCT_VOLATILE).
 
-# Institutional risk controls (values from config — single source of truth)
+# Institutional risk controls
 DAILY_DRAWDOWN_LIMIT = float(MAX_DAILY_LOSS_PCT)   # % drawdown from session start → hard stop
+WEEKLY_DRAWDOWN_LIMIT = float(os.getenv("WEEKLY_DRAWDOWN_LIMIT", "10.0"))
+MIN_RR_RATIO         = 2.0   # minimum reward:risk required (1:2)
+MAX_SYMBOL_EXPOSURE_FRACTION = float(os.getenv("MAX_SYMBOL_EXPOSURE_FRACTION", "0.35"))
+MAX_SECTOR_EXPOSURE_FRACTION = float(os.getenv("MAX_SECTOR_EXPOSURE_FRACTION", "0.55"))
+MAX_TOTAL_EXPOSURE_MULT = float(os.getenv("MAX_TOTAL_EXPOSURE_MULT", "1.00"))
+MAX_TRADES_PER_SYMBOL_DAY = int(os.getenv("MAX_TRADES_PER_SYMBOL_DAY", "2"))
+MAX_TRADES_PER_DAY_RISK = int(os.getenv("MAX_TRADES_PER_DAY_RISK", str(MAX_DAILY_TRADES)))
+MARGIN_CALL_BUFFER_PCT = float(os.getenv("MARGIN_CALL_BUFFER_PCT", "0.15"))
+MAX_STOP_LOSS_PCT = float(os.getenv("MAX_STOP_LOSS_PCT", "0.06"))
+ATR_SL_MULT_LOW_VOL = float(os.getenv("ATR_SL_MULT_LOW_VOL", "2.2"))
+ATR_SL_MULT_HIGH_VOL = float(os.getenv("ATR_SL_MULT_HIGH_VOL", "1.4"))
+VOL_BAND_MULT = float(os.getenv("VOL_BAND_MULT", "2.2"))
+LIQUIDITY_SL_BUFFER_ATR = float(os.getenv("LIQUIDITY_SL_BUFFER_ATR", "0.35"))
+SWING_LOOKBACK_BARS = int(os.getenv("SWING_LOOKBACK_BARS", "20"))
 
 def get_user_max_leverage(chat_id: str) -> int:
     """Return the maximum leverage allowed (single-plan system)."""
@@ -281,20 +276,13 @@ def can_open_trade(chat_id):
 
 # ── Trade outcome recording ───────────────────────────────────────────────────
 
-def record_trade_result(chat_id, pnl: float, *, outcome_hint: str | None = None):
+def record_trade_result(chat_id, pnl: float):
     """
     Call when a *risk outcome* is final for the user.
-
-    Fast path: `mark_trade_closed_pending(..., apply_fast_risk=True)` may invoke
-    `after_trade_leg_closed` with provisional UPL before broker history sync; the
-    P&L sync worker skips duplicate risk updates when `risk_outcome_recorded` is set.
 
     For split TP1/TP2 positions sharing `parent_session`, call this **once** with
     the session total P&L (after all legs are closed), not per leg — see
     `trade_session_finalize.after_trade_leg_closed`.
-
-    outcome_hint: when PnL is unknown or stale (e.g. SL close before broker rpl),
-    pass 'loss' or 'win' to drive the circuit-breaker counter without waiting for sync.
 
     Transitions:
       NORMAL          + 2nd consecutive loss  → CIRCUIT_BREAKER (sends Telegram prompt)
@@ -308,13 +296,7 @@ def record_trade_result(chat_id, pnl: float, *, outcome_hint: str | None = None)
     prev_state   = data['state']
     consecutive  = data['consecutive_losses']
 
-    oh = (outcome_hint or "").strip().lower()
-    if oh == "loss":
-        is_loss = True
-    elif oh == "win":
-        is_loss = False
-    else:
-        is_loss = pnl < 0
+    is_loss = pnl < 0
     consecutive = (consecutive + 1) if is_loss else 0
 
     # Determine new state
@@ -436,68 +418,61 @@ def apply_stop_today(chat_id):
 
 def calculate_position_size(balance: float, confidence: float,
                              entry_price: float, stop_loss_pct: float = 0.01,
-                             chat_id: str = None,
-                             regime: str | None = None):
+                             chat_id: str = None, regime_type: str = "UNKNOWN"):
     """
-    Per-user dynamic risk sizing. Tunables come from ``config`` (imported names).
+    Per-user dynamic risk sizing.
 
-    Regime handling (Sizing Shield):
-      If ``regime`` normalizes to ``VOLATILE``, ``risk_pct`` is capped by
-      ``MAX_RISK_PCT_VOLATILE`` from config before computing dollar risk.
+    Uses this user's risk_percent / max_risk_percent from the DB if chat_id
+    is supplied; falls back to global MIN_RISK / MAX_RISK constants otherwise.
 
-    Convex confidence mapping → [user_min, user_max] risk %, then leverage scaling.
+    Scaling (stronger convex curve):
+      confidence at MIN_CONF (70%)  → user's min_risk %
+      confidence at MAX_CONF (100%) → user's max_risk %  (hard cap)
+      Mid-range confidence gets modest increases, while high-confidence
+      setups accelerate faster toward max risk.
 
-    Size = risk_budget / (entry_price * stop_loss_pct). Broker min is typically 1 unit;
-    if the formula yields < 1.0, we clamp to 1.0 and emit a **critical** log because
-    effective exposure exceeds the intended risk budget at that stop distance.
+    Leverage (cap vs user preference):
+      Dollar risk at the stop is budgeted as
+      balance × risk_pct × (effective_leverage / cap_leverage).
+      Choosing the maximum uses the full risk band; choosing a lower
+      leverage (e.g. 1× vs 2× cap) scales risk and size down in proportion.
+      We never multiply the post-risk position size by leverage — that would
+      exceed the intended risk percentage.
+
+    size = risk_budget / (entry_price * stop_loss_pct)
+    Minimum 1 unit.
     """
+    MAX_RISK_PCT_VOLATILE = 1.0
+
     if chat_id:
         user_min, user_max = get_user_risk_params(chat_id)
     else:
         user_min, user_max = MIN_RISK, MAX_RISK
 
-    clamped = max(MIN_CONF, min(MAX_CONF, float(confidence)))
-    conf_norm = (clamped - MIN_CONF) / (MAX_CONF - MIN_CONF)
+    if regime_type.upper() == "VOLATILE":
+        user_max = min(user_max, MAX_RISK_PCT_VOLATILE)
+
+    clamped = max(MIN_CONF, min(MAX_CONF, confidence))
+    conf_norm = (clamped - MIN_CONF) / (MAX_CONF - MIN_CONF)  # 0..1
+    # Convex curve (>1 exponent) => stronger emphasis on high confidence.
     conf_weight = conf_norm ** 1.8
-    risk_pct = float(user_min) + (float(user_max) - float(user_min)) * conf_weight
+    risk_pct = user_min + (user_max - user_min) * conf_weight
 
-    reg = str(regime or "").strip().upper()
-    if reg == "VOLATILE":
-        risk_pct = min(risk_pct, float(MAX_RISK_PCT_VOLATILE))
+    if regime_type.upper() == "VOLATILE":
+        risk_pct = min(risk_pct, MAX_RISK_PCT_VOLATILE)
 
-    risk_budget = float(balance) * (risk_pct / 100.0)
+    risk_budget = balance * (risk_pct / 100)
     if chat_id:
         cap = get_user_max_leverage(chat_id)
         lev = get_effective_leverage(chat_id)
         if cap > 0:
-            risk_budget *= float(lev) / float(cap)
+            risk_budget *= lev / cap
 
-    ep = float(entry_price)
-    slp = float(stop_loss_pct)
-    if ep <= 0 or slp <= 0 or not math.isfinite(risk_budget):
+    if entry_price <= 0 or stop_loss_pct <= 0:
         return 1.0
 
-    denom = ep * slp
-    raw_size = risk_budget / denom
-    rounded = round(float(raw_size), 2)
-
-    if rounded < 1.0:
-        log.critical(
-            "POSITION_SIZE_RISK_CLAMP: raw_computed_size=%.8f < 1.0 — clamped to 1.0; "
-            "intended_risk_budget=%.6f implies risk above configured cap at this stop "
-            "(balance=%.6f risk_pct=%.6f regime=%r chat_id=%s entry=%.8f stop_loss_pct=%.8f)",
-            float(raw_size),
-            float(risk_budget),
-            float(balance),
-            float(risk_pct),
-            regime,
-            str(chat_id or ""),
-            ep,
-            slp,
-        )
-        return 1.0
-
-    return float(rounded)
+    size = risk_budget / (entry_price * stop_loss_pct)
+    return max(1.0, round(size, 2))
 
 
 # ── Daily drawdown guard ──────────────────────────────────────────────────────
@@ -656,7 +631,6 @@ def generate_institutional_stop_loss(
     df_15m,
     liquidity_levels: dict | None = None,
     atr_value: float | None = None,
-    atr_mult_override: float | None = None,
     min_stop_distance: float | None = None,
     max_stop_distance: float | None = None,
 ) -> tuple[float, str, dict]:
@@ -675,13 +649,6 @@ def generate_institutional_stop_loss(
     atr = float(atr_value or 0.0)
     high_vol = bool(atr > 0 and (atr / entry) >= 0.02)
     atr_mult = ATR_SL_MULT_HIGH_VOL if high_vol else ATR_SL_MULT_LOW_VOL
-    if atr_mult_override is not None:
-        try:
-            ov = float(atr_mult_override)
-            if math.isfinite(ov) and ov > 0:
-                atr_mult = ov
-        except Exception:
-            pass
     atr_dist = atr * atr_mult if atr > 0 else 0.0
     if atr_dist <= 0:
         atr_dist = entry * 0.01
@@ -854,7 +821,7 @@ def validate_pre_trade(
     action: str | None = None,
     strategy_label: str | None = None,
     rsi_15m: float | None = None,
-    regime: str | None = None,
+    regime_type: str = "UNKNOWN",
 ) -> tuple[bool, str, dict]:
     """
     Mandatory pre-trade validation.
@@ -976,7 +943,7 @@ def validate_pre_trade(
             entry_price=entry,
             stop_loss_pct=stop_loss_pct,
             chat_id=chat_id,
-            regime=regime,
+            regime_type=regime_type,
         )
     )
     if proposed_size < 1.0 or not (proposed_size == proposed_size):

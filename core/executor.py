@@ -26,7 +26,6 @@ from config import (
     LIMIT_ORDER_MEANREV_ATR_OFFSET,
     LIMIT_ORDER_ALLOW_MARKET_FALLBACK,
     EXECUTION_REJECTION_NOTIFY_COOLDOWN_SEC,
-    MAX_SLIPPAGE_PCT,
 )
 from utils.market_scanner import (
     HTTP_429_COOLDOWN_SEC,
@@ -47,9 +46,8 @@ from core.risk_manager import (
     can_open_trade,
     calculate_position_size, STATE_MANUAL_OVERRIDE,
     check_daily_drawdown, check_rr_ratio,
-    get_effective_leverage, validate_pre_trade, generate_institutional_stop_loss, ATR_SL_MULT_LOW_VOL,
+    get_effective_leverage, validate_pre_trade, generate_institutional_stop_loss,
     compute_last_rsi,
-    record_trade_result,
 )
 from core.trade_session_finalize import after_trade_leg_closed
 from core.trailing_stop import (
@@ -58,7 +56,6 @@ from core.trailing_stop import (
     close_trade_in_db, record_open_trade,
 )
 from core.sync import reconcile
-from core.sync import force_reconcile
 from core.sync import mark_trade_closed_pending
 from core.sync import spawn_background_final_sync
 from core.sync import capital_verify_deal_closed_after_close_request
@@ -72,8 +69,9 @@ log = logging.getLogger(__name__)
 # repeating broker lookups for every signal cycle.
 _EPIC_CACHE = {}
 SESSION_TTL_SECONDS = 45
-LOG_ROOT = "logs"
+LOG_ROOT = os.getenv("ENGINE_LOG_ROOT", "logs")
 _REJECTION_NOTIFY_CACHE: dict[str, float] = {}
+MAX_SLIPPAGE_PCT = float(os.getenv("MAX_SLIPPAGE_PCT", "0.003"))
 _EXEC_ATR_PERIOD = 14
 _EXEC_ATR_W_15M = 0.60
 _EXEC_ATR_W_1H = 0.40
@@ -82,11 +80,6 @@ _CORRELATED_GROUPS: dict[str, set[str]] = {
     "TECH": {"AAPL", "MSFT", "GOOGL", "NVDA", "QQQ"},
 }
 _VOLATILE_LIMIT_ATR_FRAC = 0.12
-_TP_DISTANCE_TRIGGER_PCT = 0.003
-_TP_BUFFER_REGULAR_PCT = 0.005
-_TP_BUFFER_PENNY_PCT = 0.010
-_BROKER_TARGET_RR = 2.0
-_SPREAD_PROXY_PCT = 0.0005
 _ADX_STRONG_TREND = 25.0
 _ADX_RANGING = 20.0
 _TRAIL_MULT_STRONG = 1.6
@@ -1409,100 +1402,6 @@ def _apply_min_distance_to_protection(
     return stop_level, profit_level
 
 
-def _adaptive_tp_buffer_pct(entry_price: float) -> float:
-    """Penny stocks (<$10) require wider TP safety buffer."""
-    return float(_TP_BUFFER_PENNY_PCT) if float(entry_price) < 10.0 else float(_TP_BUFFER_REGULAR_PCT)
-
-
-def _adjust_tp_for_broker_limits(
-    *,
-    action: str,
-    entry_price: float,
-    tp_level: float,
-    symbol: str,
-    min_dist: float | None = None,
-    atr_value: float | None = None,
-) -> tuple[float, bool, float]:
-    """
-    Ensure TP is far enough to avoid broker min-value rejections.
-    Uses adaptive % floor, broker min distance, and a small ATR safety cushion.
-    """
-    if entry_price <= 0:
-        return float(tp_level), False, 0.0
-    tp = float(tp_level)
-    current_dist = abs(float(tp) - float(entry_price))
-    adaptive_floor = float(entry_price) * _adaptive_tp_buffer_pct(float(entry_price))
-    trigger_floor = float(entry_price) * float(_TP_DISTANCE_TRIGGER_PCT)
-    broker_floor = float(min_dist) if (min_dist is not None and float(min_dist) > 0) else 0.0
-    atr_floor = float(atr_value) * 0.05 if (atr_value is not None and float(atr_value) > 0) else 0.0
-    required_dist = max(adaptive_floor, broker_floor, atr_floor)
-    if current_dist >= max(trigger_floor, required_dist):
-        return tp, False, required_dist
-    if str(action).upper() == "BUY":
-        return float(entry_price) + float(required_dist), True, required_dist
-    return float(entry_price) - float(required_dist), True, required_dist
-
-
-def _rebalance_sl_for_target_rr(
-    *,
-    action: str,
-    entry_price: float,
-    stop_level: float,
-    tp_level: float,
-    target_rr: float = _BROKER_TARGET_RR,
-    min_dist: float | None = None,
-    max_dist: float | None = None,
-) -> tuple[float, bool]:
-    """
-    Rebalance stop to keep R:R near target after TP widening.
-    """
-    if entry_price <= 0 or target_rr <= 0:
-        return float(stop_level), False
-    tp_dist = abs(float(tp_level) - float(entry_price))
-    if tp_dist <= 0:
-        return float(stop_level), False
-    desired_sl_dist = float(tp_dist) / float(target_rr)
-    if min_dist is not None and float(min_dist) > 0:
-        desired_sl_dist = max(desired_sl_dist, float(min_dist))
-    if max_dist is not None and float(max_dist) > 0:
-        desired_sl_dist = min(desired_sl_dist, float(max_dist))
-    if desired_sl_dist <= 0:
-        return float(stop_level), False
-    current_sl_dist = abs(float(entry_price) - float(stop_level))
-    if abs(current_sl_dist - desired_sl_dist) <= max(1e-8, float(entry_price) * 0.0001):
-        return float(stop_level), False
-    if str(action).upper() == "BUY":
-        return float(entry_price) - float(desired_sl_dist), True
-    return float(entry_price) + float(desired_sl_dist), True
-
-
-def validate_broker_limits(entry: float, sl: float, tp: float, symbol: str) -> tuple[bool, dict]:
-    """
-    Lightweight broker-legality check before order submission.
-    Rule of thumb: protection levels should be at least ~2x spread away.
-    """
-    try:
-        e = float(entry)
-        sl_v = float(sl)
-        tp_v = float(tp)
-    except Exception:
-        return False, {"reason": "invalid_numeric_levels"}
-    if e <= 0:
-        return False, {"reason": "entry_not_positive"}
-    spread_proxy = max(float(e) * float(_SPREAD_PROXY_PCT), 0.01 if e < 10.0 else 0.02)
-    min_legal = float(spread_proxy) * 2.0
-    sl_dist = abs(float(e) - float(sl_v))
-    tp_dist = abs(float(tp_v) - float(e))
-    ok = bool(sl_dist >= min_legal and tp_dist >= min_legal)
-    return ok, {
-        "symbol": str(symbol or ""),
-        "spread_proxy": float(spread_proxy),
-        "min_legal_distance": float(min_legal),
-        "sl_distance": float(sl_dist),
-        "tp_distance": float(tp_dist),
-    }
-
-
 def resolve_epic_for_user(chat_id, symbol, base_url=None, headers=None, is_demo=None):
     """
     Resolve and cache broker epic for (chat_id, symbol) per day.
@@ -1984,88 +1883,6 @@ def _broker_positions_state_hash(live_positions: list[dict]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def is_sibling_tp1_leg_closed(parent_session_id: str | None) -> bool:
-    """
-    True if the TP1 leg in this parent_session is already CLOSED or pending broker sync.
-    Used to avoid missing fast TP1 spikes between polling intervals.
-    """
-    ps = str(parent_session_id or "").strip()
-    if not ps:
-        return False
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        row = conn.execute(
-            """
-            SELECT 1
-            FROM trades
-            WHERE COALESCE(parent_session,'') = ?
-              AND UPPER(COALESCE(leg_role,'')) = 'TP1'
-              AND (
-                   UPPER(COALESCE(status,'')) = 'CLOSED'
-                   OR COALESCE(sync_status,'') IN ('PENDING_SYNC','PENDING_FINAL')
-              )
-            LIMIT 1
-            """,
-            (ps,),
-        ).fetchone()
-        conn.close()
-        return bool(row)
-    except Exception:
-        try:
-            conn.close()
-        except Exception:
-            pass
-        return False
-
-
-def _sum_positions_upl(live_positions: list) -> float:
-    """Aggregate unrealized P&L across all open broker positions (account scope)."""
-    t = 0.0
-    for p in live_positions or []:
-        pos = p.get("position") or {}
-        try:
-            t += float(pos.get("upl") or 0.0)
-        except (TypeError, ValueError):
-            pass
-    return t
-
-
-def _emergency_close_all_broker_positions(
-    chat_id,
-    base_url: str,
-    headers: dict,
-    creds,
-    live_positions: list,
-) -> bool:
-    """Issue DELETE for every listed open position (3% aggregate UPL shield)."""
-    closed_any = False
-    seen: set[str] = set()
-    for p in live_positions or []:
-        for deal_id in _capital_all_ids_from_row(p):
-            did = str(deal_id).strip()
-            if not did or did in seen:
-                continue
-            seen.add(did)
-            ok_del, _payload, _err, _st = _broker_request(
-                "DELETE",
-                f"{base_url}/positions/{did}",
-                headers=headers,
-                timeout=20,
-                creds=creds,
-                chat_id=str(chat_id),
-            )
-            if ok_del:
-                closed_any = True
-                _audit_exec_event(
-                    stage="emergency_close_all_position",
-                    chat_id=str(chat_id),
-                    symbol=None,
-                    action=None,
-                    details=f"deal_id={did} aggregate_upl_shield=1",
-                )
-    return closed_any
-
-
 # ── Position monitoring — trailing stop + hard fallback ───────────────────────
 
 def monitor_and_close(chat_id):
@@ -2113,27 +1930,18 @@ def monitor_and_close(chat_id):
     live_positions  = pos_res.json().get('positions', [])
     balance         = _get_balance(base_url, headers)
     hard_stop_limit = -(balance * 0.03)   # -3% of balance
-    # Emergency 3% shield: total unrealized P&L vs balance — close ALL positions, no hash/sync gates.
-    try:
-        total_upl = _sum_positions_upl(live_positions)
-        if balance and float(balance) > 0 and total_upl <= float(hard_stop_limit):
-            _audit_exec_event(
-                stage="emergency_3pct_total_upl_close_all",
-                chat_id=str(chat_id),
-                symbol=None,
-                action=None,
-                details=(
-                    f"total_upl={total_upl:.2f} limit={float(hard_stop_limit):.2f} "
-                    f"balance={float(balance):.2f}"
-                ),
-            )
-            _emergency_close_all_broker_positions(
-                chat_id, base_url, headers, creds, live_positions
-            )
-            reconcile(chat_id, base_url, headers, notify=True)
-            return True
-    except Exception:
-        pass
+    # Optional state-sync guard: skip close attempts on hard local/broker divergence.
+    local_hash = _local_positions_state_hash(str(chat_id))
+    broker_hash = _broker_positions_state_hash(live_positions)
+    if local_hash != broker_hash:
+        _audit_exec_event(
+            stage="state_hash_mismatch",
+            chat_id=str(chat_id),
+            symbol=None,
+            action=None,
+            details=f"local_hash={local_hash[:12]} broker_hash={broker_hash[:12]} skip_close_cycle=1",
+        )
+        return False
 
     # Index by every dealId/positionId Capital exposes (DB may store either).
     live_by_id = {}
@@ -2148,43 +1956,6 @@ def monitor_and_close(chat_id):
 
     # ── Step 2: ATR trailing stop logic ──────────────────────────────────────
     for trade in get_open_trades(chat_id):
-        lh = _local_positions_state_hash(str(chat_id))
-        bh = _broker_positions_state_hash(live_positions)
-        if lh != bh:
-            _audit_exec_event(
-                stage="state_hash_mismatch",
-                chat_id=str(chat_id),
-                symbol=None,
-                action=None,
-                details=f"local_hash={lh[:12]} broker_hash={bh[:12]} force_reconcile=1",
-            )
-            force_reconcile(chat_id, base_url, headers, notify=True)
-            pos_res2, headers = _resilient_capital_get(
-                f"{base_url}/positions",
-                headers=headers,
-                timeout=20,
-                chat_id=str(chat_id),
-                creds=creds,
-            )
-            if pos_res2 is not None and pos_res2.status_code == 200:
-                live_positions = pos_res2.json().get("positions", [])
-                live_by_id = {}
-                for p in live_positions:
-                    ids = _capital_all_ids_from_row(p)
-                    if not ids and p.get("position", {}).get("dealId") is not None:
-                        ids = {str(p["position"]["dealId"]).strip()}
-                    for rid in ids:
-                        live_by_id[str(rid).strip()] = p
-            else:
-                _audit_exec_event(
-                    stage="state_hash_reconcile_refresh_failed",
-                    chat_id=str(chat_id),
-                    symbol=None,
-                    action=None,
-                    details="positions_refresh_failed_skip_trade",
-                )
-            continue
-
         deal_id   = trade['deal_id']
         symbol    = trade['symbol']
         direction = trade['direction']
@@ -2204,16 +1975,6 @@ def monitor_and_close(chat_id):
             else live['market']['offer']
         )
         upl = float(live['position']['upl'])
-        try:
-            conn_snap = sqlite3.connect(DB_PATH)
-            conn_snap.execute(
-                "UPDATE trades SET last_broker_upl=? WHERE trade_id=? AND status='OPEN'",
-                (float(upl), int(trade_id)),
-            )
-            conn_snap.commit()
-            conn_snap.close()
-        except Exception:
-            pass
 
         # Calculate ATR from unified scanner provider data
         atr = calculate_atr(
@@ -2237,14 +1998,11 @@ def monitor_and_close(chat_id):
             if direction == "BUY"
             else entry_price * (1 - TP2_PCT)
         )
-        tp1_hit_live = (
+        tp1_hit = (
             current_price >= tp1_price
             if direction == "BUY"
             else current_price <= tp1_price
         )
-        manage_leg = leg_role.upper() == "TP2"
-        tp1_hit_db = bool(manage_leg and is_sibling_tp1_leg_closed(parent_session))
-        tp1_hit = bool(tp1_hit_live or tp1_hit_db)
         tp2_hit = (
             current_price >= tp2_price
             if direction == "BUY"
@@ -2254,6 +2012,7 @@ def monitor_and_close(chat_id):
         if atr and atr > 0:
             # We only apply "lock after TP1" and "trailing after TP2"
             # to the TP2 leg, because TP1 leg is closed by broker at TP1.
+            manage_leg = leg_role.upper() == "TP2"
             trail_mult = _adaptive_trailing_multiplier(
                 symbol,
                 session_context=_scanner_context_from_creds(str(chat_id), creds),
@@ -2290,34 +2049,30 @@ def monitor_and_close(chat_id):
                 stop_triggered = is_stop_hit(current_price, new_stop, direction)
                 stop_label = f"ATR trailing stop @ {new_stop:.4f} (TP2 passed)"
             elif tp1_hit and manage_leg:
-                if (not tp1_hit_live) and tp1_hit_db:
-                    print(
-                        f"[PROTECTION-ACTIVATE] TP1 fill detected in DB for {symbol}. "
-                        "Moving SL to break-even for remaining leg.",
-                        flush=True,
-                    )
                 # Persist milestone once TP1 threshold is first reached (for TP2 leg).
                 try:
                     if (trade.get("target_reached") or "").strip() not in ("TARGET_1_HIT", "TARGET_2_HIT"):
                         update_trade_target_reached(trade_id, "TARGET_1_HIT")
                 except Exception:
                     pass
-                # After TP1: move SL of TP2 leg to true break-even (entry), idempotently.
-                # Only attempt broker update if SL is not already at/through break-even.
-                breakeven = float(entry_price)
-                already_be = False
+                # After TP1: lock TP2 leg beyond breakeven.
+                # This prevents the trade from reverting back to entry.
+                breakeven_lock = (
+                    entry_price * (1 + BE_LOCK_BUFFER_PCT)
+                    if direction == "BUY"
+                    else entry_price * (1 - BE_LOCK_BUFFER_PCT)
+                )
                 if base_stop is not None:
-                    try:
-                        already_be = (
-                            float(base_stop) >= breakeven
-                            if direction == "BUY"
-                            else float(base_stop) <= breakeven
-                        )
-                    except Exception:
-                        already_be = False
-                new_stop = float(base_stop) if base_stop is not None else breakeven
-                if not already_be:
-                    new_stop = breakeven
+                    # Ratchet in the profitable direction only.
+                    new_stop = (
+                        max(float(base_stop), breakeven_lock)
+                        if direction == "BUY"
+                        else min(float(base_stop), breakeven_lock)
+                    )
+                else:
+                    new_stop = breakeven_lock
+
+                if base_stop != new_stop:
                     update_trade_stop(trade['trade_id'], new_stop)
                     ok, info = _sync_stop_to_broker(
                         base_url,
@@ -2350,20 +2105,18 @@ def monitor_and_close(chat_id):
                 manage_leg = leg_role.upper() == "TP2"
                 new_stop = float(base_stop)
                 if manage_leg and tp1_hit:
-                    if (not tp1_hit_live) and tp1_hit_db:
-                        print(
-                            f"[PROTECTION-ACTIVATE] TP1 fill detected in DB for {symbol}. "
-                            "Moving SL to break-even for remaining leg.",
-                            flush=True,
-                        )
-                    breakeven = float(entry_price)
-                    already_be = (
-                        float(base_stop) >= breakeven
+                    breakeven_lock = (
+                        entry_price * (1 + BE_LOCK_BUFFER_PCT)
                         if direction == "BUY"
-                        else float(base_stop) <= breakeven
+                        else entry_price * (1 - BE_LOCK_BUFFER_PCT)
                     )
-                    if not already_be:
-                        new_stop = breakeven
+                    # Ratchet only in profitable direction.
+                    new_stop = (
+                        max(new_stop, breakeven_lock)
+                        if direction == "BUY"
+                        else min(new_stop, breakeven_lock)
+                    )
+                    if float(base_stop) != new_stop:
                         update_trade_stop(trade['trade_id'], new_stop)
                         ok, info = _sync_stop_to_broker(
                             base_url,
@@ -2470,17 +2223,6 @@ def monitor_and_close(chat_id):
                 conn_u.commit()
                 conn_u.close()
 
-                is_stop_loss_exit = str(target_label) == "STOP_LOSS"
-                if is_stop_loss_exit:
-                    try:
-                        record_trade_result(
-                            str(chat_id),
-                            float(upl),
-                            outcome_hint="loss",
-                        )
-                    except Exception:
-                        pass
-
                 mark_trade_closed_pending(
                     chat_id,
                     int(trade["trade_id"]),
@@ -2489,22 +2231,7 @@ def monitor_and_close(chat_id):
                     deal_reference=str(deal_ref).strip() if deal_ref else None,
                     reason="awaiting_background_final_sync",
                     notify=False,
-                    provisional_pnl=float(upl),
-                    apply_fast_risk=(not is_stop_loss_exit),
-                    risk_outcome_hint=None,
                 )
-                if is_stop_loss_exit:
-                    try:
-                        conn_r = sqlite3.connect(DB_PATH)
-                        conn_r.execute(
-                            "UPDATE trades SET risk_outcome_recorded=1 WHERE trade_id=?",
-                            (int(trade["trade_id"]),),
-                        )
-                        conn_r.commit()
-                        conn_r.close()
-                    except Exception:
-                        pass
-
                 spawn_background_final_sync(int(trade["trade_id"]))
                 closed_any = True
             else:
@@ -2742,14 +2469,6 @@ def _generate_protection_levels(
 
     try:
         if df_15m_sl is not None and len(df_15m_sl) > 0:
-            dynamic_atr_mult = float(ATR_SL_MULT_LOW_VOL)
-            if float(entry_price) < 10.0:
-                dynamic_atr_mult = float(ATR_SL_MULT_LOW_VOL) * 1.35
-                print(
-                    f"[VOL-ADAPTIVE] Symbol {symbol} priced below $10. "
-                    f"Boosting ATR Multiplier to {dynamic_atr_mult} for extra breathing room.",
-                    flush=True,
-                )
             from core.market_structure import build_liquidity_map
             liq = build_liquidity_map(df_15m_sl)
             liq_levels = {
@@ -2764,7 +2483,6 @@ def _generate_protection_levels(
                 df_15m=df_15m_sl,
                 liquidity_levels=liq_levels,
                 atr_value=float(atr) if atr is not None else None,
-                atr_mult_override=float(dynamic_atr_mult),
                 min_stop_distance=min_dist,
                 max_stop_distance=max_dist,
             )
@@ -2772,29 +2490,6 @@ def _generate_protection_levels(
             stop_price, stop_reason, stop_meta = base_stop_price, "fallback_base_stop", {}
     except Exception:
         stop_price, stop_reason, stop_meta = base_stop_price, "fallback_base_stop_exception", {}
-
-    # Penny-stock safety floor: never allow SL distance < 1.5% of price.
-    try:
-        if float(entry_price) < 10.0:
-            min_floor = float(entry_price) * 0.015
-            dist = abs(float(entry_price) - float(stop_price))
-            if dist < float(min_floor):
-                if str(action).upper() == "BUY":
-                    stop_price = float(entry_price) - float(min_floor)
-                else:
-                    stop_price = float(entry_price) + float(min_floor)
-                stop_reason = str(stop_reason or "") + "|penny_floor_1p5"
-                if isinstance(stop_meta, dict):
-                    stop_meta = dict(stop_meta)
-                    stop_meta["penny_floor_min_dist"] = float(min_floor)
-    except Exception:
-        pass
-
-    # Ensure effective_sl_pct reflects the final stop distance (for sizing/slippage/risk).
-    try:
-        effective_sl_pct = abs(float(entry_price) - float(stop_price)) / float(entry_price)
-    except Exception:
-        pass
 
     rr_ok, rr_ratio, rr_reason = check_rr_ratio(
         float(entry_price),
@@ -2848,7 +2543,7 @@ def _calculate_position_sizing(
     stop_price: float,
     effective_sl_pct: float,
     rsi_15m_gate,
-    regime_type: str | None = None,
+    regime_type: str = "UNKNOWN",
 ) -> tuple[bool, str, dict]:
     """Validate exposure/margin then produce pre-trade position size."""
     lev = get_effective_leverage(str(chat_id))
@@ -2873,19 +2568,14 @@ def _calculate_position_sizing(
         action=str(action),
         strategy_label=str(strategy_label or ""),
         rsi_15m=rsi_15m_gate,
-        regime=str(regime_type) if regime_type else None,
+        regime_type=regime_type,
     )
     if not approved_pre:
         msg = str(pre_reason or "Trade rejected: pre-trade validation failed")
         return False, msg, {}
     pretrade_size = float(pre_details.get("position_size") or 0.0)
     size = pretrade_size if pretrade_size >= 1.0 else calculate_position_size(
-        float(balance),
-        float(confidence),
-        float(entry_price),
-        float(effective_sl_pct),
-        str(chat_id),
-        regime=str(regime_type) if regime_type else None,
+        float(balance), float(confidence), float(entry_price), float(effective_sl_pct), str(chat_id), regime_type
     )
     return True, "", {
         "leverage": float(lev),
@@ -3201,12 +2891,7 @@ def place_trade_for_user(
 
     # ── Position size (1–2% risk, confidence-scaled) ──────────────────────────
     size = pretrade_size if pretrade_size >= 1.0 else calculate_position_size(
-        balance,
-        confidence,
-        entry_price,
-        effective_sl_pct,
-        chat_id,
-        regime=str(regime_type) if regime_type else None,
+        balance, confidence, entry_price, effective_sl_pct, chat_id
     )
     # Protection levels used BOTH for broker order and Telegram report.
     # Stop comes from institutional SL synthesis done pre-trade.
@@ -3248,22 +2933,6 @@ def place_trade_for_user(
         dir_ar   = 'بيع'
         sq_color = '🟥'
 
-    # Maintain RR≈2.0 consistency: if SL is widened (e.g., penny floor / adaptive ATR),
-    # ensure TP distances are not too tight relative to stop distance.
-    try:
-        rr_stop_dist = abs(float(entry_price) - float(stop_level))
-        if rr_stop_dist > 0:
-            tp1_min_dist = rr_stop_dist * 1.0
-            tp2_min_dist = rr_stop_dist * 2.0
-            if action == "BUY":
-                target1 = max(float(target1), float(entry_price) + float(tp1_min_dist))
-                target2 = max(float(target2), float(entry_price) + float(tp2_min_dist))
-            else:
-                target1 = min(float(target1), float(entry_price) - float(tp1_min_dist))
-                target2 = min(float(target2), float(entry_price) - float(tp2_min_dist))
-    except Exception:
-        pass
-
     # Capital requires valid absolute levels; sanitize defensively.
     stop_level, target1, target2 = _sanitize_protection_levels(
         action, entry_price, stop_level, target1, target2
@@ -3275,7 +2944,6 @@ def place_trade_for_user(
     #   instead of skipping strong signals.
     min_dist = _get_min_stop_profit_distance(base_url, headers, order_epic)
     tp_adjust_note = ""
-    rr_adjust_note = ""
     if min_dist and float(min_dist) > 0 and entry_price > 0:
         md = float(min_dist)
         # Enforce broker minimum stop distance as well (not only TP widening).
@@ -3323,96 +2991,6 @@ def place_trade_for_user(
         stop_level, target1, target2 = _sanitize_protection_levels(
             action, entry_price, stop_level, target1, target2
         )
-
-    # Adaptive TP floor by price tier (penny vs regular), plus ATR safety cushion.
-    target1, t1_adj, t1_req = _adjust_tp_for_broker_limits(
-        action=action,
-        entry_price=float(entry_price),
-        tp_level=float(target1),
-        symbol=str(symbol),
-        min_dist=(float(min_dist) if min_dist else None),
-        atr_value=(float(atr) if atr is not None and math.isfinite(float(atr)) else None),
-    )
-    if t1_adj:
-        print(
-            f"[LIMIT-ADJUST] Adjusting TP for {symbol} to meet broker min_distance requirements.",
-            flush=True,
-        )
-        if lang == "en":
-            tp_adjust_note += f"\nℹ️ Adjusted: TP1 buffered to safe minimum distance ({float(t1_req):.4f})."
-        else:
-            tp_adjust_note += f"\nℹ️ تم التعديل: تمت زيادة الهدف 1 لمسافة أمان مناسبة ({float(t1_req):.4f})."
-
-    target2, t2_adj, t2_req = _adjust_tp_for_broker_limits(
-        action=action,
-        entry_price=float(entry_price),
-        tp_level=float(target2),
-        symbol=str(symbol),
-        min_dist=(float(min_dist) if min_dist else None),
-        atr_value=(float(atr) if atr is not None and math.isfinite(float(atr)) else None),
-    )
-    if t2_adj:
-        print(
-            f"[LIMIT-ADJUST] Adjusting TP for {symbol} to meet broker min_distance requirements.",
-            flush=True,
-        )
-        if lang == "en":
-            tp_adjust_note += f"\nℹ️ Adjusted: TP2 buffered to safe minimum distance ({float(t2_req):.4f})."
-        else:
-            tp_adjust_note += f"\nℹ️ تم التعديل: تمت زيادة الهدف 2 لمسافة أمان مناسبة ({float(t2_req):.4f})."
-
-    # Keep trade math coherent after TP push: rebalance SL near target R:R (default 2.0).
-    if t1_adj or t2_adj:
-        stop_level_rr, rr_adj = _rebalance_sl_for_target_rr(
-            action=str(action),
-            entry_price=float(entry_price),
-            stop_level=float(stop_level),
-            tp_level=float(target1),
-            target_rr=float(_BROKER_TARGET_RR),
-            min_dist=(float(min_dist) if min_dist else None),
-            max_dist=(float(max_dist) if max_dist else None),
-        )
-        if rr_adj:
-            stop_level = float(stop_level_rr)
-            if lang == "en":
-                rr_adjust_note = "\nℹ️ Adjusted: SL rebalanced to preserve target R:R near 2.0."
-            else:
-                rr_adjust_note = "\nℹ️ تم التعديل: إعادة موازنة وقف الخسارة للحفاظ على نسبة عائد/مخاطرة قرب 2.0."
-
-    # Final sanitize before broker submission.
-    stop_level, target1, target2 = _sanitize_protection_levels(
-        action, entry_price, stop_level, target1, target2
-    )
-
-    # Pre-submit broker legality check to reduce order_leg_failed rejections.
-    ok_t1, lim_t1 = validate_broker_limits(float(entry_price), float(stop_level), float(target1), str(symbol))
-    ok_t2, lim_t2 = validate_broker_limits(float(entry_price), float(stop_level), float(target2), str(symbol))
-    if not ok_t1 or not ok_t2:
-        min_need = 0.0
-        for lim in (lim_t1, lim_t2):
-            if isinstance(lim, dict):
-                min_need = max(min_need, float(lim.get("min_legal_distance") or 0.0))
-        if min_need > 0 and entry_price > 0:
-            if action == "BUY":
-                target1 = max(float(target1), float(entry_price) + float(min_need))
-                target2 = max(float(target2), float(entry_price) + float(min_need))
-            else:
-                target1 = min(float(target1), float(entry_price) - float(min_need))
-                target2 = min(float(target2), float(entry_price) - float(min_need))
-            print(
-                f"[LIMIT-ADJUST] Adjusting TP for {symbol} to meet broker min_distance requirements.",
-                flush=True,
-            )
-            stop_level, target1, target2 = _sanitize_protection_levels(
-                action, entry_price, stop_level, target1, target2
-            )
-            ok_t1, _ = validate_broker_limits(float(entry_price), float(stop_level), float(target1), str(symbol))
-            ok_t2, _ = validate_broker_limits(float(entry_price), float(stop_level), float(target2), str(symbol))
-    if not ok_t1 or not ok_t2:
-        msg = f"❌ Order blocked ({symbol} {action}): protection levels violate broker distance constraints"
-        _log_trade_rejection(chat_id, symbol, action, "broker_limits_validation", msg, f"lim_t1={lim_t1} lim_t2={lim_t2}")
-        _maybe_notify_rejection(chat_id, msg, symbol=symbol, action=action, stage="broker_limits_validation")
-        return msg
 
     # Split into two positions to support TP1 + TP2 on broker.
     # Capital applies one TP per position, so we split size intentionally.
@@ -3605,7 +3183,6 @@ def place_trade_for_user(
             f"{partial_note_en}"
             f"{sl_adjust_note}"
             f"{tp_adjust_note}"
-            f"{rr_adjust_note}"
         )
     else:
         override_line = "⚠️ تجاوز يدوي — جاري فتح صفقة جديدة\n\n" if is_override else ""
@@ -3628,7 +3205,6 @@ def place_trade_for_user(
             f"{partial_note_ar}"
             f"{sl_adjust_note}"
             f"{tp_adjust_note}"
-            f"{rr_adjust_note}"
         )
 
     tg_res = send_telegram_message(chat_id, msg)
