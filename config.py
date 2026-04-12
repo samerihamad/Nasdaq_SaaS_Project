@@ -89,7 +89,7 @@ MOM_MIN_SCORE        = 68
 MIN_15M_BARS = int(os.getenv("MIN_15M_BARS", "100"))
 
 # Momentum tier gates on 15m (scanner emits FAST-style signals; GOLDEN re-checked in dispatch).
-FAST_MOM_ADX_THRESHOLD = float(os.getenv("FAST_MOM_ADX_THRESHOLD", "18"))
+FAST_MOM_ADX_THRESHOLD = float(os.getenv("FAST_MOM_ADX_THRESHOLD", "15"))
 # CHANGED FOR MORE SIGNALS — FAST MODE ONLY — CONSERVATIVE BALANCED VERSION — based on April 7-8 logs
 FAST_MOM_VOL_RATIO = float(os.getenv("FAST_MOM_VOL_RATIO", "0.55"))
 # Vol vs MA20 floor: fully from .env — if unset, matches FAST_MOM_VOL_RATIO (no hardcoded 0.7).
