@@ -25,7 +25,6 @@ import aiohttp
 from utils.market_hours import utc_today, synchronized_utc_now, ET, is_nyse_trading_day
 from config import (
     WATCHLIST,
-    MIN_CONFIDENCE,
     SIGNAL_MIN_CONFIDENCE,
     FAST_MIN_CONFIDENCE,
     GLOBAL_MIN_AI_CONFIDENCE,
@@ -50,8 +49,7 @@ from utils.market_scanner import (
 from utils.ai_model         import analyze_multi_timeframe
 
 log = logging.getLogger(__name__)
-ACTIVE_MIN_CONFIDENCE = float(SIGNAL_MIN_CONFIDENCE if SIGNAL_MIN_CONFIDENCE is not None else MIN_CONFIDENCE)
-
+ACTIVE_MIN_CONFIDENCE = float(SIGNAL_MIN_CONFIDENCE if SIGNAL_MIN_CONFIDENCE is not None else FAST_MIN_CONFIDENCE)
 # Dynamic gate (15m ADX/RSI): bonus / choppy targets; neutral uses FAST_MIN_CONFIDENCE from .env.
 _DYNAMIC_TREND_THRESHOLD = 52.0
 _DYNAMIC_CHOPPY_THRESHOLD = 62.0
