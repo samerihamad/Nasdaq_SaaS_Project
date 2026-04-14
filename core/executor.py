@@ -800,6 +800,7 @@ def process_pending_limit_orders():
             stop_loss_pct=float(stop_loss_pct) if stop_loss_pct is not None else None,
             strategy_label=str(strategy_label or ""),
             force_market=True,
+            is_pending_trigger=True,
         )
         final_status = "FILLED" if isinstance(result, str) and result.startswith("✅ Opened") else "FAILED"
         with sqlite3.connect(DB_PATH) as cx:
@@ -2253,6 +2254,7 @@ def _validate_execution_gate(
     chat_id: str,
     symbol: str,
     action: str,
+    is_pending_trigger: bool = False,
 ) -> tuple[bool, str, dict]:
     """Pre-trade checks: market/session/account/local-duplicate/broker-duplicate."""
     if is_maintenance_mode():
@@ -2310,7 +2312,7 @@ def _validate_execution_gate(
             send_telegram_message(chat_id, msg)
         return False, msg, {"lang": lang}
 
-    allowed, reason = can_open_trade(chat_id)
+    allowed, reason = can_open_trade(chat_id, is_pending_trigger=is_pending_trigger)
     if not allowed:
         return False, f"🚫 {reason}", {"lang": lang}
 
@@ -2716,6 +2718,7 @@ def place_trade_for_user(
     force_market: bool = False,
     ai_prob: float | None = None,
     signal_price: float | None = None,
+    is_pending_trigger: bool = False,
 ):
     """
     Open a new position.
@@ -2731,7 +2734,7 @@ def place_trade_for_user(
       8. Record the initial ATR-based trailing stop in local DB.
     """
     gate_ok, gate_msg, gate_ctx = _validate_execution_gate(
-        str(chat_id), str(symbol), str(action)
+        str(chat_id), str(symbol), str(action), is_pending_trigger=is_pending_trigger
     )
     if not gate_ok:
         _audit_exec_event(
@@ -2751,6 +2754,19 @@ def place_trade_for_user(
     free_margin = float(gate_ctx["free_margin"])
     order_epic = str(gate_ctx["order_epic"])
     scanner_ctx = gate_ctx["scanner_ctx"]
+    
+    # Self-Correction logic: If this is an actual placement (not just checking gates),
+    # and we are at the open trades limit, cancel all remaining pending limit orders.
+    from config import GLOBAL_MAX_OPEN_TRADES
+    from core.risk_manager import _get_global_open_trades_count
+    if _get_global_open_trades_count() >= int(GLOBAL_MAX_OPEN_TRADES) - 1:
+        with sqlite3.connect(DB_PATH) as cx:
+            # Cancel all remaining pending orders since we are at capacity
+            cx.execute(
+                "UPDATE pending_limit_orders SET status='CANCELLED', reason='capacity_pruning' "
+                "WHERE status='PENDING'"
+            )
+            cx.commit()
 
     prot_ok, prot_msg, prot_ctx = _generate_protection_levels(
         chat_id=str(chat_id),
@@ -3099,6 +3115,22 @@ def place_trade_for_user(
             return msg
 
     opened_trade_ids: list[int] = []
+    
+    # We want to pull adx_band and sector_sentiment if available.
+    # In executor, we already know regime_type from prot_ctx, but we might need to recalculate the others or just store them.
+    # We can default to "UNKNOWN" if not available immediately to keep execution fast.
+    adx_band = "UNKNOWN"
+    sector_sentiment = "UNKNOWN"
+    try:
+        from utils.ai_model import _adx, _flatten
+        from utils.market_scanner import _SHARED_SESSION_CACHE
+        df_15m = _SHARED_SESSION_CACHE.get(str(symbol), {}).get("15m")
+        if df_15m is not None and not df_15m.empty:
+            adx_val = float(_adx(_flatten(df_15m)).iloc[-1])
+            adx_band = "LOW" if adx_val < 25 else "HIGH"
+    except Exception:
+        pass
+
     for ob in opened_broker_legs:
         tid = record_open_trade(
             chat_id,
@@ -3113,6 +3145,9 @@ def place_trade_for_user(
             leg_role=str(ob["role"]),
             parent_session=parent_session,
             stop_distance=stop_dist,
+            regime=regime_type,
+            adx_band=adx_band,
+            sector_sentiment=sector_sentiment,
         )
         try:
             if tid is not None:

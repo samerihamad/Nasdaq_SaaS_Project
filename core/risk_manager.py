@@ -151,6 +151,19 @@ def _get_global_open_trades_count() -> int:
     conn.close()
     return int(row[0] or 0) if row else 0
 
+def _get_global_pending_orders_count() -> int:
+    """Count currently pending limit orders across all users."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute("SELECT COUNT(*) FROM pending_limit_orders WHERE status='PENDING'")
+        row = c.fetchone()
+        conn.close()
+        return int(row[0] or 0) if row else 0
+    except Exception:
+        conn.close()
+        return 0
+
 
 def _get_live_balance(chat_id: str) -> float | None:
     """
@@ -219,7 +232,7 @@ def _get_live_balance(chat_id: str) -> float | None:
         return None
 
 
-def can_open_trade(chat_id):
+def can_open_trade(chat_id, is_pending_trigger=False):
     """
     Returns (allowed: bool, reason: str).
 
@@ -253,12 +266,36 @@ def can_open_trade(chat_id):
         return False, f"Max daily trades reached ({trades_today}/{int(MAX_DAILY_TRADES)})"
 
     # ── 5. Global max open positions ──────────────────────────────────────────
+    # Weighted Exposure Logic: 
+    # An Open position counts as 1.0. A Pending Limit Order counts as 0.5.
     open_positions = _get_global_open_trades_count()
+    pending_orders = _get_global_pending_orders_count()
+    
+    # If we are evaluating a pending order that just triggered, it's effectively 
+    # transitioning from pending (0.5) to open (1.0). But more importantly, we 
+    # shouldn't block it just because *other* pending orders make the weighted_exposure high.
+    # Actually, we should just bypass the weighted exposure check and only check open_positions.
+    
+    weighted_exposure = float(open_positions) + (float(pending_orders) * 0.5)
+    
+    # We still enforce the strict integer cap on actual OPEN trades
     if open_positions >= int(GLOBAL_MAX_OPEN_TRADES):
         return False, (
             f"Global max open trades reached "
             f"({open_positions}/{int(GLOBAL_MAX_OPEN_TRADES)})"
         )
+        
+    if not is_pending_trigger:
+        if weighted_exposure >= float(GLOBAL_MAX_OPEN_TRADES):
+            return False, f"Global weighted exposure reached ({weighted_exposure}/{float(GLOBAL_MAX_OPEN_TRADES)})"
+
+        # Shadow cap for pending orders
+        max_pending_shadow_cap = 12
+        if pending_orders >= max_pending_shadow_cap:
+            return False, (
+                f"Max Pending Orders Shadow Cap reached "
+                f"({pending_orders}/{max_pending_shadow_cap})"
+            )
 
     # ── 6. Daily realized loss % guard ────────────────────────────────────────
     live_balance = _get_live_balance(str(chat_id))

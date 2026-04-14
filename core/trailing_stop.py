@@ -211,6 +211,9 @@ def record_open_trade(
     leg_role=None,
     parent_session=None,
     stop_distance=None,
+    regime=None,
+    adx_band=None,
+    sector_sentiment=None,
 ):
     """Insert a new trade into the local DB when a position is opened (UTC timestamp)."""
     from utils.market_hours import utc_now
@@ -218,8 +221,8 @@ def record_open_trade(
     cur = conn.execute(
         '''INSERT INTO trades
            (chat_id, symbol, direction, entry_price, size, deal_id, deal_reference, capital_order_id, trailing_stop, status, opened_at,
-            leg_role, parent_session, stop_distance)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?)''',
+            leg_role, parent_session, stop_distance, regime, adx_band, sector_sentiment)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?)''',
         (
             chat_id,
             symbol,
@@ -234,6 +237,9 @@ def record_open_trade(
             leg_role,
             parent_session,
             stop_distance,
+            regime,
+            adx_band,
+            sector_sentiment,
         ),
     )
     trade_id = cur.lastrowid

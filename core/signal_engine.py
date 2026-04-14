@@ -50,6 +50,7 @@ from utils.ai_model         import analyze_multi_timeframe
 
 log = logging.getLogger(__name__)
 ACTIVE_MIN_CONFIDENCE = float(SIGNAL_MIN_CONFIDENCE if SIGNAL_MIN_CONFIDENCE is not None else FAST_MIN_CONFIDENCE)
+
 # Dynamic gate (15m ADX/RSI): bonus / choppy targets; neutral uses FAST_MIN_CONFIDENCE from .env.
 _DYNAMIC_TREND_THRESHOLD = 52.0
 _DYNAMIC_CHOPPY_THRESHOLD = 62.0
@@ -396,8 +397,8 @@ def _analyze_one_from_timeframes(
             adx_band = "LOW" if adx_val < 25 else "HIGH"
             
             # Simple extraction for 'time_of_day' from local time (as a proxy for scan time)
-            from utils.market_hours import utc_now
-            time_of_day = utc_now().strftime("%H:00 UTC")
+            from utils.market_hours import synchronized_utc_now
+            time_of_day = synchronized_utc_now().strftime("%H:00 UTC")
             
             # Symbol Signature Check: NVDA hard rule
             if symbol == 'NVDA' and regime == 'VOLATILE' and adx_band == 'LOW':

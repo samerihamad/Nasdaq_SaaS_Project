@@ -100,8 +100,8 @@ def finalize_session_if_complete(chat_id: str, parent_session: str) -> None:
     tp2_hit = 1 if tp2_pnl is not None and tp2_pnl > 0 else 0
 
     c.execute(
-        "SELECT symbol, direction, opened_at FROM trades WHERE parent_session=? "
-        "ORDER BY trade_id LIMIT 1",
+        "SELECT symbol, direction, opened_at, regime, adx_band, sector_sentiment "
+        "FROM trades WHERE parent_session=? ORDER BY trade_id LIMIT 1",
         (parent_session,),
     )
     row = c.fetchone()
@@ -109,6 +109,9 @@ def finalize_session_if_complete(chat_id: str, parent_session: str) -> None:
         conn.close()
         return
     symbol, direction, opened_at = row[0], row[1], row[2]
+    regime = row[3] or "UNKNOWN"
+    adx_band = row[4] or "UNKNOWN"
+    sector_sentiment = row[5] or "UNKNOWN"
 
     c.execute(
         "SELECT COUNT(*) FROM trades WHERE parent_session=? AND status='CLOSED'",
@@ -141,14 +144,13 @@ def finalize_session_if_complete(chat_id: str, parent_session: str) -> None:
                 except:
                     pass
             
-            # Record fingerprint. Real implementation would fetch these from DB or scanner cache.
             record_negative_habit(
                 symbol=symbol,
                 direction=direction,
-                regime="UNKNOWN_REGIME_CACHE", # Placeholder for actual historical DB mapping
-                adx_band="UNKNOWN_ADX_CACHE", 
+                regime=regime,
+                adx_band=adx_band, 
                 time_of_day=time_of_day,
-                sector_sentiment="UNKNOWN_SECTOR_CACHE"
+                sector_sentiment=sector_sentiment
             )
         except Exception as e:
             print(f"[Behavioral Memory] Error recording negative habit: {e}")
