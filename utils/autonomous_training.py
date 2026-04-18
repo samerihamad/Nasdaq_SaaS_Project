@@ -61,6 +61,9 @@ DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 COOLDOWN_FILE_PATH = os.path.join(DATA_DIR, "training_cooldown.json")
 
+# Ensure logs/ai_training directory exists (prevents FileNotFoundError crashes)
+os.makedirs(AUTOTRAIN_LOG_ROOT, exist_ok=True)
+
 # DEBUG: Print the exact path where cooldown file will be stored
 print(f"DEBUG: Cooldown file path = {COOLDOWN_FILE_PATH}")
 
@@ -754,9 +757,14 @@ class AutonomousTrainingManager:
         _save_json_atomic(STATUS_PATH, status)
 
     def _update_status(self, patch: dict):
-        status = _read_status()
-        status.update(patch or {})
-        _save_json_atomic(STATUS_PATH, status)
+        """Update status file with error handling to prevent thread crashes."""
+        try:
+            status = _read_status()
+            status.update(patch or {})
+            _save_json_atomic(STATUS_PATH, status)
+        except Exception as exc:
+            # Log error but never crash the scheduler thread
+            log.error(f"Failed to update status file: {exc}")
 
     def _notify_admin(self, run: dict):
         if not (AUTOTRAIN_NOTIFY_ADMIN and self.admin_chat_id):
