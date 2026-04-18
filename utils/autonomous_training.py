@@ -47,22 +47,26 @@ import logging
 
 log = logging.getLogger(__name__)
 
-MODELS_DIR = "models"
+# ── HARDCODED ABSOLUTE PATHS ─────────────────────────────────────────────────
+# Force absolute paths to prevent FileNotFoundError in any OS environment
+ABSOLUTE_PROJECT_ROOT = "/root/Nasdaq_SaaS_Project"
+
+DATA_DIR = os.path.join(ABSOLUTE_PROJECT_ROOT, "data")
+LOGS_DIR = os.path.join(ABSOLUTE_PROJECT_ROOT, "logs/ai_training")
+MODELS_DIR = os.path.join(ABSOLUTE_PROJECT_ROOT, "models")
 STABLE_DIR = os.path.join(MODELS_DIR, "stable")
 REGISTRY_PATH = os.path.join(MODELS_DIR, "deep_model_registry.json")
-STATUS_PATH = os.path.join(AUTOTRAIN_LOG_ROOT, "autonomous_training_status.json")
-RUNS_PATH = os.path.join(AUTOTRAIN_LOG_ROOT, "training_runs.jsonl")
-SELF_LEARNING_DATASET_PATH = os.path.join(AUTOTRAIN_LOG_ROOT, "reinforcement_dataset.jsonl")
+STATUS_PATH = os.path.join(LOGS_DIR, "autonomous_training_status.json")
+RUNS_PATH = os.path.join(LOGS_DIR, "training_runs.jsonl")
+SELF_LEARNING_DATASET_PATH = os.path.join(LOGS_DIR, "reinforcement_dataset.jsonl")
 
 # Persistent cooldown storage - survives server restarts
-# Use absolute path based on project root to ensure file is created in correct location
-PROJECT_ROOT = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
-DATA_DIR = os.path.join(PROJECT_ROOT, "data")
-os.makedirs(DATA_DIR, exist_ok=True)
 COOLDOWN_FILE_PATH = os.path.join(DATA_DIR, "training_cooldown.json")
 
-# Ensure logs/ai_training directory exists (prevents FileNotFoundError crashes)
-os.makedirs(AUTOTRAIN_LOG_ROOT, exist_ok=True)
+# Ensure all directories exist (prevents FileNotFoundError crashes)
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(LOGS_DIR, exist_ok=True)
+os.makedirs(STABLE_DIR, exist_ok=True)
 
 # DEBUG: Print the exact path where cooldown file will be stored
 print(f"DEBUG: Cooldown file path = {COOLDOWN_FILE_PATH}")
@@ -156,7 +160,10 @@ def _load_json(path: str, default):
 
 
 def _save_json_atomic(path: str, payload):
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    # Ensure parent directory exists before writing
+    parent_dir = os.path.dirname(path)
+    if parent_dir and not os.path.exists(parent_dir):
+        os.makedirs(parent_dir, exist_ok=True)
     tmp = f"{path}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=True, indent=2)
