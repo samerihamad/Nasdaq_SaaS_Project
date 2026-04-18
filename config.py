@@ -211,7 +211,8 @@ MAX_TRADES_PER_DAY_PER_USER = int(os.getenv("MAX_TRADES_PER_DAY_PER_USER", "15")
 MAX_DAILY_TRADES = MAX_TRADES_PER_DAY_PER_USER
 
 # Global cap on concurrent open trades.
-GLOBAL_MAX_OPEN_TRADES = int(os.getenv("GLOBAL_MAX_OPEN_TRADES", "7"))
+# FIX: Increased from 7 to 10 to reduce "Global max open trades reached" errors
+GLOBAL_MAX_OPEN_TRADES = int(os.getenv("GLOBAL_MAX_OPEN_TRADES", "10"))
 
 # Hard stop: if realized daily loss exceeds this % of live equity, block entries.
 MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "3.0"))

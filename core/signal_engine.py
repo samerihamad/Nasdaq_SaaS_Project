@@ -31,6 +31,7 @@ from config import (
     GLOBAL_MIN_AI_CONFIDENCE,
     MAX_DAILY_TRADES,
     SCAN_INTERVAL_SEC,
+    GLOBAL_MAX_OPEN_TRADES,
 )
 from core.strategy_meanrev  import analyze as analyze_meanrev
 from core.strategy_momentum import analyze as analyze_momentum
@@ -400,6 +401,42 @@ def _dispatch_signal(signal: dict, subscribers: list[str]) -> int:
                 symbol, chat_id, today_count, MAX_DAILY_TRADES,
             )
             continue
+
+        # ── FIX: Cancel oldest pending limit order if at max trades and high-confidence ──
+        try:
+            from core.risk_manager import _get_global_open_trades_count
+            current_open = _get_global_open_trades_count()
+            
+            # If we're at capacity and this is a high-confidence signal, make room
+            if current_open >= GLOBAL_MAX_OPEN_TRADES and confidence >= 0.75:
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                
+                # Find oldest pending limit order (by created_at timestamp)
+                c.execute(
+                    "SELECT id, symbol, created_at FROM pending_limit_orders "
+                    "WHERE status='PENDING' ORDER BY created_at ASC LIMIT 1"
+                )
+                oldest = c.fetchone()
+                
+                if oldest:
+                    order_id, order_symbol, created_at = oldest
+                    log.info(
+                        f"[CAPACITY PRUNING] At max trades ({current_open}/{GLOBAL_MAX_OPEN_TRADES}). "
+                        f"Cancelling oldest pending order #{order_id} for {order_symbol} (created {created_at}) "
+                        f"to make room for high-confidence {symbol} signal ({confidence:.1%})"
+                    )
+                    c.execute(
+                        "UPDATE pending_limit_orders SET status='CANCELLED', reason='capacity_high_conf_priority' "
+                        "WHERE id=?",
+                        (order_id,),
+                    )
+                    conn.commit()
+                    log.info(f"[CAPACITY PRUNING] Successfully cancelled order #{order_id}")
+                
+                conn.close()
+        except Exception as exc:
+            log.warning(f"[CAPACITY PRUNING] Error checking/cancelling pending orders: {exc}")
 
         # ── Place order ───────────────────────────────────────────────────────
         try:

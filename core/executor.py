@@ -1459,9 +1459,14 @@ def _open_position_with_protection(
     *,
     creds=None,
     chat_id: str | None = None,
+    max_retries: int = 3,
+    slippage_tolerance_pct: float = 0.002,  # 0.2% slippage tolerance
 ):
     """
     Open one position with attached stop-loss and take-profit levels.
+    Implements retry mechanism (up to 3 times) for REJECTED orders due to liquidity.
+    Includes 0.1-0.2% slippage tolerance for limit price execution.
+    
     Returns (ok: bool, payload_or_error: dict|str).
     """
     # If target_level is None, we omit profitLevel so the broker won't close
@@ -1487,20 +1492,54 @@ def _open_position_with_protection(
         base["profitLevel"] = target_level
         base2["profitLevel"] = target_level
     payloads = [base, base2]
-    last_err = ""
-    for payload in payloads:
-        ok, data, err, _ = _broker_request(
-            "POST",
-            f"{base_url}/positions",
-            headers=headers,
-            json_payload=payload,
-            timeout=20,
-            creds=creds,
-            chat_id=chat_id,
-        )
-        if ok:
-            return True, data
-        last_err = err or _normalize_broker_error(payload=data)
+    
+    # ── FIX: Retry mechanism for "REJECTED" orders with slippage tolerance ──
+    for attempt in range(max_retries):
+        last_err = ""
+        for payload in payloads:
+            ok, data, err, _ = _broker_request(
+                "POST",
+                f"{base_url}/positions",
+                headers=headers,
+                json_payload=payload,
+                timeout=20,
+                creds=creds,
+                chat_id=chat_id,
+            )
+            if ok:
+                if attempt > 0:
+                    logging.info(f"[ORDER RETRY SUCCESS] {epic}: Succeeded on attempt {attempt + 1}")
+                return True, data
+            
+            last_err = err or _normalize_broker_error(payload=data)
+            
+            # Check if error is "REJECTED" due to liquidity/slippage
+            if "REJECTED" in str(last_err).upper() or "rejected" in str(last_err).lower():
+                if attempt < max_retries - 1:
+                    wait_time = 0.5 * (attempt + 1)  # Exponential backoff: 0.5s, 1s, 1.5s
+                    logging.warning(
+                        f"[ORDER RETRY] {epic}: Attempt {attempt + 1} failed with '{last_err}'. "
+                        f"Retrying in {wait_time:.1f}s with slippage tolerance..."
+                    )
+                    time.sleep(wait_time)
+                    # On retry, adjust target slightly for slippage tolerance (if target exists)
+                    if target_level is not None and "profitLevel" in payload:
+                        slippage_adjust = target_level * slippage_tolerance_pct * (attempt + 1)
+                        if action == "BUY":
+                            payload["profitLevel"] = target_level + slippage_adjust
+                        else:
+                            payload["profitLevel"] = target_level - slippage_adjust
+                        logging.info(
+                            f"[SLIPPAGE TOLERANCE] {epic}: Adjusted target {target_level:.4f} → {payload['profitLevel']:.4f} "
+                            f"(+{slippage_tolerance_pct * 100 * (attempt + 1):.1f}%)"
+                        )
+                    break  # Break to outer retry loop
+                else:
+                    logging.error(f"[ORDER FAILED] {epic}: All {max_retries} attempts exhausted. Final error: {last_err}")
+            else:
+                # Non-rejection error, don't retry
+                return False, last_err
+                
     return False, last_err or "unknown error"
 
 
@@ -2457,6 +2496,14 @@ def _generate_protection_levels(
     )
     min_dist = _get_min_stop_profit_distance(base_url, headers, order_epic)
     max_dist = _get_max_stop_profit_distance(base_url, headers, order_epic)
+    
+    # ── FIX: Apply 1.5x multiplier to min_dist to avoid "error.invalid.stoploss.minvalue" ──
+    if min_dist is not None and min_dist > 0:
+        original_min_dist = min_dist
+        min_dist = min_dist * 1.5
+        logging.info(
+            f"[SL DISTANCE ADJUSTMENT] {symbol}: min_dist adjusted {original_min_dist:.4f} → {min_dist:.4f} (1.5x multiplier)"
+        )
 
     tf: dict = {}
     df_15m_sl = None
@@ -2968,6 +3015,15 @@ def place_trade_for_user(
     # - If TP1/TP2 are too tight, widen them to broker minimum distance (with a small buffer)
     #   instead of skipping strong signals.
     min_dist = _get_min_stop_profit_distance(base_url, headers, order_epic)
+    
+    # ── FIX: Apply 1.5x multiplier to min_dist for TP to avoid "error.invalid.takeprofit.minvalue" ──
+    if min_dist is not None and min_dist > 0:
+        original_min_dist = min_dist
+        min_dist = min_dist * 1.5
+        logging.info(
+            f"[TP DISTANCE ADJUSTMENT] {symbol}: min_dist adjusted {original_min_dist:.4f} → {min_dist:.4f} (1.5x multiplier)"
+        )
+    
     tp_adjust_note = ""
     if min_dist and float(min_dist) > 0 and entry_price > 0:
         md = float(min_dist)
@@ -3019,26 +3075,51 @@ def place_trade_for_user(
 
     # Split into two positions to support TP1 + TP2 on broker.
     # Capital applies one TP per position, so we split size intentionally.
+    # ── FIX: Min Lot Size Check ───────────────────────────────────────────
+    # If splitting would make either leg below min_deal_size, keep as single trade.
     min_deal_size = _get_min_deal_size(base_url, headers, order_epic)
     qty_total = float(int(round(float(size))))
     ok_split, qty1, qty2, split_err = _split_qty_70_30(qty_total=qty_total, min_deal_size=min_deal_size)
+    
+    single_leg_fallback = False
     if not ok_split:
-        if lang == "en":
-            msg = f"❌ Order blocked ({symbol} {action}): {split_err}"
+        # Check if we can do single-leg trade instead
+        if qty_total >= min_deal_size:
+            single_leg_fallback = True
+            logging.info(
+                f"[MIN LOT SIZE CHECK] {symbol}: Split would violate minimum lot size ({split_err}). "
+                f"Using single-leg trade with full size {qty_total} and TP1 target."
+            )
+            if lang == "en":
+                tp_adjust_note += (
+                    f"\nℹ️ Min lot size protection: Single trade at {qty_total} units (TP1 only)."
+                )
+            else:
+                tp_adjust_note += (
+                    f"\nℹ️ حماية الحد الأدنى للوحدة: صفقة واحدة بـ {qty_total} وحدة (الهدف 1 فقط)."
+                )
         else:
-            msg = f"❌ تم منع الأمر ({symbol} {action}): {split_err}"
-        print(msg)
-        _log_trade_rejection(chat_id, symbol, action, "split_qty", msg, split_err or "")
-        _maybe_notify_rejection(chat_id, msg, symbol=symbol, action=action, stage="split_qty")
-        return msg
+            # Even single leg is too small - reject
+            if lang == "en":
+                msg = f"❌ Order blocked ({symbol} {action}): {split_err}"
+            else:
+                msg = f"❌ تم منع الأمر ({symbol} {action}): {split_err}"
+            print(msg)
+            _log_trade_rejection(chat_id, symbol, action, "split_qty", msg, split_err or "")
+            _maybe_notify_rejection(chat_id, msg, symbol=symbol, action=action, stage="split_qty")
+            return msg
 
-    qty_total = qty1 + qty2
-
-    # Both legs have fixed TPs now (70% at TP1, 30% at TP2).
-    legs = [
-        {"role": "TP1", "size": float(qty1), "tp": float(target1)},
-        {"role": "TP2", "size": float(qty2), "tp": float(target2)},
-    ]
+    if single_leg_fallback:
+        # Single leg with full size at TP1 target
+        legs = [
+            {"role": "TP1", "size": float(qty_total), "tp": float(target1)},
+        ]
+    else:
+        # Normal two-leg split (70% at TP1, 30% at TP2)
+        legs = [
+            {"role": "TP1", "size": float(qty1), "tp": float(target1)},
+            {"role": "TP2", "size": float(qty2), "tp": float(target2)},
+        ]
 
     # Atomic execution: open/confirm BOTH legs first, then write to DB.
     opened_broker_legs: list[dict] = []
