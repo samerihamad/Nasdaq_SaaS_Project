@@ -147,43 +147,48 @@ def _flatten(df: pd.DataFrame) -> pd.DataFrame:
 
 def _macd_crossover(macd_line: pd.Series, signal_line: pd.Series, direction: str) -> bool:
     """
-    Returns True if a fresh crossover occurred on the LAST bar.
-    BUY : macd_line crossed ABOVE signal_line (prev bar was below, curr bar is above)
+    Returns True if a fresh crossover occurred on the LAST CLOSED candle (iloc[-2]).
+    STRICT POLICY: Only evaluate on fully closed candles, never live forming candles.
+    BUY : macd_line crossed ABOVE signal_line (prev closed bar was below, last closed is above)
     SELL: macd_line crossed BELOW signal_line
     """
-    if len(macd_line) < 2:
+    if len(macd_line) < 3:
         return False
-    prev_diff = float(macd_line.iloc[-2]) - float(signal_line.iloc[-2])
-    curr_diff = float(macd_line.iloc[-1]) - float(signal_line.iloc[-1])
+    # Use iloc[-3] vs iloc[-2] to detect crossover on the last CLOSED candle
+    prior_diff = float(macd_line.iloc[-3]) - float(signal_line.iloc[-3])
+    last_closed_diff = float(macd_line.iloc[-2]) - float(signal_line.iloc[-2])
 
     if direction == "BUY":
-        return prev_diff < 0 < curr_diff          # crossed from below to above
+        return prior_diff < 0 < last_closed_diff          # crossed from below to above on closed candle
     else:
-        return prev_diff > 0 > curr_diff          # crossed from above to below
+        return prior_diff > 0 > last_closed_diff          # crossed from above to below on closed candle
 
 
 # ── Volume spike ─────────────────────────────────────────────────────────────
 
 def _volume_ratio(df: pd.DataFrame) -> float:
-    """Current bar volume / 20-bar rolling average volume."""
+    """Last CLOSED bar volume / 20-bar rolling average volume. STRICT: use iloc[-2]."""
     vol = df["Volume"].squeeze().astype(float)
-    avg = float(vol.rolling(20).mean().iloc[-1])
+    if len(vol) < 2:
+        return 0.0
+    avg = float(vol.rolling(20).mean().iloc[-2])
     if avg == 0:
         return 0.0
-    return float(vol.iloc[-1]) / avg
+    return float(vol.iloc[-2]) / avg
 
 
 # ── Gap detector ─────────────────────────────────────────────────────────────
 
 def _gap_pct(df: pd.DataFrame) -> float:
     """
-    Returns the gap % between the previous close and current open.
-    Positive = gap up, negative = gap down.
+    Overnight/session gap % based on last two CLOSED candles.
+    STRICT: Uses iloc[-2] (last closed) vs iloc[-3] (prior closed).
+    Returns (Open[last_closed] - Close[prev_closed]) / Close[prev_closed] * 100
     """
-    if len(df) < 2:
+    if len(df) < 3:
         return 0.0
-    prev_close = float(df["Close"].iloc[-2])
-    curr_open  = float(df["Open"].iloc[-1])
+    prev_close = float(df["Close"].iloc[-3])  # Candle before last closed
+    curr_open  = float(df["Open"].iloc[-2])   # Last closed candle's open
     if prev_close == 0:
         return 0.0
     return (curr_open - prev_close) / prev_close * 100
@@ -193,11 +198,12 @@ def _gap_pct(df: pd.DataFrame) -> float:
 
 def _check_1d_trend(df_1d: pd.DataFrame, direction: str) -> bool:
     """
-    1D must show a clear trend:
+    1D must show a clear trend (evaluated on CLOSED candle only).
+    STRICT: Uses iloc[-2] for last closed candle.
       BUY : RSI > 50 AND EMA20 > EMA50
       SELL: RSI < 50 AND EMA20 < EMA50
     """
-    if df_1d is None or df_1d.empty:
+    if df_1d is None or df_1d.empty or len(df_1d) < 2:
         return False
     df_1d  = _flatten(df_1d)
     close  = df_1d["Close"].squeeze().astype(float)
@@ -205,14 +211,54 @@ def _check_1d_trend(df_1d: pd.DataFrame, direction: str) -> bool:
     ema20  = _ema(close, 20)
     ema50  = _ema(close, 50)
 
-    rsi_v   = float(rsi.iloc[-1])
-    ema20_v = float(ema20.iloc[-1])
-    ema50_v = float(ema50.iloc[-1])
+    # STRICT: Use last CLOSED candle (iloc[-2]), never live forming candle
+    rsi_v   = float(rsi.iloc[-2])
+    ema20_v = float(ema20.iloc[-2])
+    ema50_v = float(ema50.iloc[-2])
 
     if direction == "BUY":
         return rsi_v > 50 and ema20_v > ema50_v
     else:
         return rsi_v < 50 and ema20_v < ema50_v
+
+
+# ── Price Action Confirmation ────────────────────────────────────────────────
+
+def _price_action_confirmed(df: pd.DataFrame, direction: str) -> bool:
+    """
+    STRICT Price Action Confirmation Filter.
+    
+    BUY: Current price (live candle) MUST break above the High of the setup candle (iloc[-2]).
+    SELL: Current price (live candle) MUST break below the Low of the setup candle (iloc[-2]).
+    
+    This prevents premature entries by requiring the market to CONFIRM the signal
+    by breaking the setup candle's extreme before we enter.
+    """
+    if df is None or len(df) < 2:
+        return False
+    
+    df = _flatten(df)
+    
+    # Setup candle is the last CLOSED candle (iloc[-2])
+    setup_high = float(df["High"].iloc[-2])
+    setup_low = float(df["Low"].iloc[-2])
+    
+    # Current/live candle is iloc[-1] - we check if it has broken the setup candle's extreme
+    current_high = float(df["High"].iloc[-1])
+    current_low = float(df["Low"].iloc[-1])
+    
+    if direction == "BUY":
+        # For BUY: current candle must break above setup candle's high
+        confirmed = current_high > setup_high
+        if not confirmed:
+            log.info("[PA Confirm] BUY rejected: current High %.3f <= setup High %.3f", current_high, setup_high)
+        return confirmed
+    else:
+        # For SELL: current candle must break below setup candle's low
+        confirmed = current_low < setup_low
+        if not confirmed:
+            log.info("[PA Confirm] SELL rejected: current Low %.3f >= setup Low %.3f", current_low, setup_low)
+        return confirmed
 
 
 # ── News quality check ────────────────────────────────────────────────────────
@@ -292,22 +338,25 @@ def analyze(
     df_4h  = _flatten(timeframes.get("4h",  pd.DataFrame()))
     df_15m = _flatten(timeframes.get("15m", pd.DataFrame()))
 
+    # STRICT POLICY: Require at least 3 bars to have 2 closed candles (iloc[-3] and iloc[-2])
     min_bars = max(55, int(MIN_15M_BARS))
-    if df_15m.empty or len(df_15m) < min_bars:
+    if df_15m.empty or len(df_15m) < max(3, min_bars):
         log.debug("[Momentum %s] Insufficient 15m data (need %d bars)", symbol, min_bars)
         return None
 
     close_15m = df_15m["Close"].squeeze().astype(float)
     rsi_15m_series = _rsi(close_15m)
-    rsi_15m_val = float(rsi_15m_series.iloc[-1])
+    # STRICT: Use last CLOSED candle (iloc[-2]), never live forming candle (iloc[-1])
+    rsi_15m_val = float(rsi_15m_series.iloc[-2])
     # Mirror of bullish high-RSI volume tier: very low RSI → relaxed vol floor on SELL.
     bearish_rsi_vol_line = 100.0 - float(FAST_MOM_RSI_VOL_TIER_HIGH)
 
     # ── ADX ───────────────────────────────────────────────────────────────────
+    # STRICT: All indicators evaluated on CLOSED candle (iloc[-2])
     adx_series, plus_di, minus_di = _adx(df_15m)
-    adx_val      = float(adx_series.iloc[-1])
-    plus_di_val  = float(plus_di.iloc[-1])
-    minus_di_val = float(minus_di.iloc[-1])
+    adx_val      = float(adx_series.iloc[-2])
+    plus_di_val  = float(plus_di.iloc[-2])
+    minus_di_val = float(minus_di.iloc[-2])
 
     # Direction first so every rejection can log Long/Short consistently.
     if plus_di_val > minus_di_val:
@@ -344,13 +393,15 @@ def analyze(
             log.info("[Momentum %s] %s", symbol, rej)
             return {"rejected": True, "strategy": "Momentum", "reason": rej, "action": direction}
 
-    close_val = float(close_15m.iloc[-1])
+    # STRICT: Use last CLOSED candle price (iloc[-2])
+    close_val = float(close_15m.iloc[-2])
 
     # FAST SMA flexibility: require SMA20 alignment only (no SMA50 hard gate).
     sma20_15m = close_15m.rolling(20).mean()
     sma50_15m = close_15m.rolling(50).mean()
-    sma20_v = float(sma20_15m.iloc[-1])
-    sma50_v = float(sma50_15m.iloc[-1])
+    # STRICT: SMA evaluated on CLOSED candle (iloc[-2])
+    sma20_v = float(sma20_15m.iloc[-2])
+    sma50_v = float(sma50_15m.iloc[-2])
     
     # CHANGED FOR MORE SIGNALS — FAST MODE ONLY — CONSERVATIVE BALANCED VERSION — based on April 7-8 logs
     tier = str(signal_profile or SIGNAL_PROFILE or "FAST").strip().upper()
@@ -442,6 +493,14 @@ def analyze(
         rej = f"Rejected: Low Volume ({vol_ratio:.1f}x < {vol_min:.1f}x)"
         log.info("[Momentum %s] %s", symbol, rej)
         return {"rejected": True, "strategy": "Momentum", "reason": rej, "action": direction}
+
+    # ── Price Action Confirmation ─────────────────────────────────────────────
+    # STRICT: Signal candle (iloc[-2]) must be confirmed by live candle breaking its extreme
+    if not _price_action_confirmed(df_15m, direction):
+        rej = f"Rejected: Price Action Confirmation failed (current candle did not break setup candle extreme)"
+        log.info("[Momentum %s] %s", symbol, rej)
+        return {"rejected": True, "strategy": "Momentum", "reason": rej, "action": direction}
+    log.info("[Momentum %s] Price Action Confirmation passed", symbol)
 
     # ── Composite scoring ─────────────────────────────────────────────────────
     score   = 0

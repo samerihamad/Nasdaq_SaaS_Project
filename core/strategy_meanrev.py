@@ -165,13 +165,15 @@ def _is_shooting_star(df: pd.DataFrame, idx: int) -> bool:
 
 def _news_trap(df_15m: pd.DataFrame) -> bool:
     """
-    True if the most recent bar opened with a gap > MR_NEWS_TRAP_GAP_PCT.
+    True if the most recent CLOSED bar opened with a gap > MR_NEWS_TRAP_GAP_PCT.
+    STRICT: Uses closed candles only (iloc[-3] vs iloc[-2]).
     A large gap indicates a news-driven move where reversals are unreliable.
     """
-    if len(df_15m) < 2:
+    if len(df_15m) < 3:
         return False
-    prev_close = float(df_15m["Close"].iloc[-2])
-    curr_open  = float(df_15m["Open"].iloc[-1])
+    # STRICT: Use closed candles only
+    prev_close = float(df_15m["Close"].iloc[-3])  # Candle before last closed
+    curr_open  = float(df_15m["Open"].iloc[-2])     # Last closed candle's open
     if prev_close == 0:
         return False
     gap_pct = abs(curr_open - prev_close) / prev_close * 100
@@ -180,20 +182,24 @@ def _news_trap(df_15m: pd.DataFrame) -> bool:
 
 def _liquidity_sweep(df_15m: pd.DataFrame, direction: str) -> bool:
     """
-    Detects a Liquidity Sweep:
+    Detects a Liquidity Sweep on CLOSED candles:
       BUY : Price briefly broke below a recent swing low then closed ABOVE it
             → trapped shorts, likely reversal up.
       SELL: Price briefly broke above a recent swing high then closed BELOW it
             → trapped longs, likely reversal down.
 
+    STRICT: Uses last CLOSED candle (iloc[-2]) as trigger, never live forming candle.
     We look at the last MR_SWEEP_LOOKBACK bars (excluding the trigger bar).
     """
     lookback = MR_SWEEP_LOOKBACK
-    if len(df_15m) < lookback + 2:
+    # Need: lookback bars + trigger bar (closed) + current forming bar
+    if len(df_15m) < lookback + 3:
         return False
 
-    reference = df_15m.iloc[-(lookback + 1):-1]  # bars before trigger
-    trigger   = df_15m.iloc[-1]
+    # bars before trigger (excluding current forming candle at iloc[-1])
+    reference = df_15m.iloc[-(lookback + 2):-2]
+    # Trigger is the last CLOSED candle (iloc[-2])
+    trigger   = df_15m.iloc[-2]
 
     if direction == "BUY":
         swing_low = float(reference["Low"].min())
@@ -212,14 +218,16 @@ def _liquidity_sweep(df_15m: pd.DataFrame, direction: str) -> bool:
 def _check_1d_alignment(df_1d: pd.DataFrame, direction: str) -> bool:
     """
     1D alignment check — daily RSI must not be sharply contrary to our direction.
+    STRICT: Uses iloc[-2] for last closed candle.
     BUY : daily RSI <= MR_1D_RSI_BUY_ALIGN_MAX (allows oversold and mid-range; rejects only overbought)
     SELL: daily RSI >= 32 (allows overbought and mid-range; rejects only oversold)
     """
-    if df_1d is None or df_1d.empty:
+    if df_1d is None or df_1d.empty or len(df_1d) < 2:
         return False
     df_1d = _flatten(df_1d)
     rsi_1d = _rsi(df_1d["Close"].squeeze())
-    val    = float(rsi_1d.iloc[-1])
+    # STRICT: Use last CLOSED candle (iloc[-2])
+    val    = float(rsi_1d.iloc[-2])
 
     if direction == "BUY":
         # Allow oversold (RSI < 35) — those are prime mean-reversion candidates
@@ -233,13 +241,15 @@ def _check_4h_zone(df_4h: pd.DataFrame, direction: str) -> bool:
     """
     4H: Price must be meaningfully below (BUY) or above (SELL) the 4H VWAP,
     confirming it is in a zone where a reversal is credible.
+    STRICT: Uses iloc[-2] for last closed candle.
     """
-    if df_4h is None or df_4h.empty:
+    if df_4h is None or df_4h.empty or len(df_4h) < 2:
         return False
     df_4h  = _flatten(df_4h)
     vwap   = _vwap(df_4h)
-    close  = float(df_4h["Close"].squeeze().iloc[-1])
-    vwap_v = float(vwap.iloc[-1])
+    # STRICT: Use last CLOSED candle (iloc[-2])
+    close  = float(df_4h["Close"].squeeze().iloc[-2])
+    vwap_v = float(vwap.iloc[-2])
     if vwap_v == 0:
         return False
     dev_pct = (close - vwap_v) / vwap_v * 100
@@ -248,6 +258,45 @@ def _check_4h_zone(df_4h: pd.DataFrame, direction: str) -> bool:
         return dev_pct <= -MR_VWAP_DEV_PCT   # price below VWAP
     else:
         return dev_pct >= MR_VWAP_DEV_PCT    # price above VWAP
+
+
+# ── Price Action Confirmation ────────────────────────────────────────────────
+
+def _price_action_confirmed(df: pd.DataFrame, direction: str) -> bool:
+    """
+    STRICT Price Action Confirmation Filter for Mean Reversion.
+    
+    BUY: Current price MUST break above the High of the setup candle (iloc[-2]).
+    SELL: Current price MUST break below the Low of the setup candle (iloc[-2]).
+    
+    This prevents premature entries by requiring the market to CONFIRM the reversal
+    by breaking the setup candle's extreme before we enter.
+    """
+    if df is None or len(df) < 2:
+        return False
+    
+    df = _flatten(df)
+    
+    # Setup candle is the last CLOSED candle (iloc[-2])
+    setup_high = float(df["High"].iloc[-2])
+    setup_low = float(df["Low"].iloc[-2])
+    
+    # Current/live candle is iloc[-1] - we check if it has broken the setup candle's extreme
+    current_high = float(df["High"].iloc[-1])
+    current_low = float(df["Low"].iloc[-1])
+    
+    if direction == "BUY":
+        # For BUY: current candle must break above setup candle's high
+        confirmed = current_high > setup_high
+        if not confirmed:
+            log.info("[MeanRev PA Confirm] BUY rejected: current High %.3f <= setup High %.3f", current_high, setup_high)
+        return confirmed
+    else:
+        # For SELL: current candle must break below setup candle's low
+        confirmed = current_low < setup_low
+        if not confirmed:
+            log.info("[MeanRev PA Confirm] SELL rejected: current Low %.3f >= setup Low %.3f", current_low, setup_low)
+        return confirmed
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -276,7 +325,8 @@ def analyze(
     df_4h  = _flatten(timeframes.get("4h",  pd.DataFrame()))
     df_15m = _flatten(timeframes.get("15m", pd.DataFrame()))
 
-    if df_15m.empty or len(df_15m) < 20:
+    # STRICT: Require at least 3 bars to have 2 closed candles (iloc[-3] and iloc[-2])
+    if df_15m.empty or len(df_15m) < max(3, 20):
         log.debug("[MeanRev %s] Insufficient 15m data", symbol)
         return None
 
@@ -284,9 +334,10 @@ def analyze(
     rsi_15m   = _rsi(close_15m)
     vwap_15m  = _vwap(df_15m)
 
-    rsi_val   = float(rsi_15m.iloc[-1])
-    close_val = float(close_15m.iloc[-1])
-    vwap_val  = float(vwap_15m.iloc[-1])
+    # STRICT: All indicators evaluated on CLOSED candle (iloc[-2])
+    rsi_val   = float(rsi_15m.iloc[-2])
+    close_val = float(close_15m.iloc[-2])
+    vwap_val  = float(vwap_15m.iloc[-2])
 
     tier = str(signal_profile or "FAST").strip().upper()
     # FAST: shorts require clear overbought (default 75, env FAST_MR_RSI_EXTREME_OVERBOUGHT); LONG uses MR_RSI_OVERSOLD.
@@ -343,49 +394,45 @@ def analyze(
         log.info("[MeanRev %s] %s", symbol, rej)
         return {"rejected": True, "strategy": "MeanRev", "reason": rej, "action": direction}
 
-    # ── Reversal candle check (preferred but not mandatory) ──────────────────
-    # A reversal candle OR a liquidity sweep is sufficient to proceed.
-    # If neither is present the signal is rejected (low-quality setup).
-    last_idx = len(df_15m) - 1
+    # ── Reversal candle check (evaluated on CLOSED candle only) ─────────────
+    # STRICT POLICY: Reversal candle must be fully formed (closed candle at iloc[-2]).
+    # The live candle (iloc[-1]) is NOT evaluated for patterns until it closes.
+    closed_idx = len(df_15m) - 2  # Last CLOSED candle
     if direction == "BUY":
         has_reversal_candle = (
-            _is_hammer(df_15m, last_idx) or
-            _is_bullish_engulfing(df_15m, last_idx)
+            _is_hammer(df_15m, closed_idx) or
+            _is_bullish_engulfing(df_15m, closed_idx)
         )
         candle_label = "Hammer / Bullish Engulfing"
     else:
         has_reversal_candle = (
-            _is_shooting_star(df_15m, last_idx) or
-            _is_bearish_engulfing(df_15m, last_idx)
+            _is_shooting_star(df_15m, closed_idx) or
+            _is_bearish_engulfing(df_15m, closed_idx)
         )
         candle_label = "Shooting Star / Bearish Engulfing"
 
     has_sweep = _liquidity_sweep(df_15m, direction)
 
-    mr_fast_bypass: bool = False
+    # REMOVED: Extreme RSI Bypass — all signals must have confirmation per strict policy
     if tier == "GOLDEN":
         if not has_reversal_candle and not has_sweep:
             rej = "Rejected: No Reversal Candle/Sweep Confirmation"
             log.info("[MeanRev %s] %s", symbol, rej)
             return {"rejected": True, "strategy": "MeanRev", "reason": rej, "action": direction}
     else:
-        # FAST: deep RSI extreme may proceed without reversal candle or sweep; otherwise require confirmation.
-        extreme_buy = direction == "BUY" and rsi_val <= float(FAST_MR_RSI_EXTREME_OVERSOLD)
-        extreme_sell = direction == "SELL" and rsi_val >= float(FAST_MR_RSI_EXTREME_OVERBOUGHT)
-        if extreme_buy or extreme_sell:
-            mr_fast_bypass = True
-            log.info(
-                "[FAST EXECUTION] RSI Extreme (%.1f) - Bypassing Reversal Confirmation",
-                rsi_val,
-            )
-            log.info(
-                "[FAST OPTIMIZATION] Trade triggered by MeanRev RSI Extreme Bypass | %s",
-                symbol,
-            )
-        elif not has_reversal_candle and not has_sweep:
+        # FAST: Reversal confirmation is MANDATORY — no RSI extreme bypass allowed
+        if not has_reversal_candle and not has_sweep:
             rej = "Rejected: No Reversal Candle/Sweep Confirmation"
             log.info("[MeanRev %s] %s", symbol, rej)
             return {"rejected": True, "strategy": "MeanRev", "reason": rej, "action": direction}
+
+    # ── Price Action Confirmation ─────────────────────────────────────────────
+    # STRICT: Signal candle (iloc[-2]) must be confirmed by live candle breaking its extreme
+    if not _price_action_confirmed(df_15m, direction):
+        rej = f"Rejected: Price Action Confirmation failed (current candle did not break setup candle extreme)"
+        log.info("[MeanRev %s] %s", symbol, rej)
+        return {"rejected": True, "strategy": "MeanRev", "reason": rej, "action": direction}
+    log.info("[MeanRev %s] Price Action Confirmation passed", symbol)
 
     # ── Composite scoring ─────────────────────────────────────────────────────
     score = 0
@@ -497,6 +544,6 @@ def analyze(
         "stop_loss_pct": stop_pct,
         "ms_score":     (int(ms_ctx.ms_score) if ms_ctx is not None else None),
         "reason":       " | ".join(reasons),
-        "mr_fast_bypass": bool(mr_fast_bypass),
+        # REMOVED: "mr_fast_bypass" — eliminated per strict confirmation policy
         "rsi_15m":      rsi_val,
     }

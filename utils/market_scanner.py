@@ -62,6 +62,14 @@ CHUNKED_SCAN_BATCH_SIZE = max(1, min(3, int(os.getenv("CHUNKED_SCAN_BATCH_SIZE",
 CHUNKED_SCAN_INTER_BATCH_SLEEP_SEC = float(os.getenv("CHUNKED_SCAN_INTER_BATCH_SLEEP_SEC", "0.2"))
 # Full pause after HTTP 429 so the broker can reset rate-limit counters.
 HTTP_429_COOLDOWN_SEC = float(os.getenv("HTTP_429_COOLDOWN_SEC", "60"))
+
+
+class RateLimitError(Exception):
+    """
+    Raised when Capital.com API returns HTTP 429 (Too Many Requests)
+    after all retry attempts are exhausted.
+    """
+    pass
 # Global minimum interval between any Capital HTTP requests (GET/POST) across BOTH:
 # - async aiohttp scanner calls
 # - sync requests-based executor calls
@@ -352,15 +360,21 @@ async def _aio_get(
                             data = None
                         await _after_capital_success()
                         return status, data
-                    if status == 429 and attempt < max_attempts - 1:
-                        cooldown = _next_429_cooldown()
-                        print(
-                            "[API] HTTP 429 Too Many Requests (Capital.com GET) — "
-                            f"rate limited; cooling down {cooldown:.0f}s before retry.",
-                            flush=True,
-                        )
-                        await asyncio.sleep(cooldown)
-                        continue
+                    if status == 429:
+                        if attempt < max_attempts - 1:
+                            cooldown = _next_429_cooldown()
+                            print(
+                                "[API] HTTP 429 Too Many Requests (Capital.com GET) — "
+                                f"rate limited; cooling down {cooldown:.0f}s before retry.",
+                                flush=True,
+                            )
+                            await asyncio.sleep(cooldown)
+                            continue
+                        else:
+                            # Final attempt failed with 429 - raise RateLimitError to abort training
+                            raise RateLimitError(
+                                f"HTTP 429 Too Many Requests after {max_attempts} attempts"
+                            )
                     if attempt == 0:
                         await asyncio.sleep(0.12)
                         continue
@@ -967,6 +981,9 @@ async def scan_market_async(
             f"insufficient Capital.com history after retries (last_http={last_status})",
         )
         return None
+    except RateLimitError:
+        # Re-raise RateLimitError so training loop can detect 429 and abort
+        raise
     except Exception as exc:
         print(f"❌ Scanner error [{ticker_symbol}]: {exc}")
         return None

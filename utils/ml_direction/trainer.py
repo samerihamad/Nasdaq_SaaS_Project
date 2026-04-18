@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from utils.market_scanner import scan_market
+from utils.market_scanner import scan_market, RateLimitError
 from .dataset import build_sequence_dataset
 from .models import create_direction_model
 
@@ -150,14 +150,29 @@ def train_direction_for_symbol(
     3) train and save model bundle
     """
     tf = str(timeframe).strip().lower()
+    # ── Data Minimization: Only fetch minimum required for LSTM training ──
+    # Requirements:
+    #   - LSTM needs max(200, seq_len * 3) clean rows minimum (dataset.py)
+    #   - With 20% validation split, need ~250 rows before split
+    #   - Feature engineering (EMA200, RSI14, MACD, ADX14) needs ~200 bars for rolling calcs
+    #   - Add 50% buffer for weekends/holidays/bad data gaps
+    #
+    # Raw bars needed: ~400 minimum
+    #   15m: 400 bars / (6.5 hrs * 4 bars/hr) = ~15 trading days = 3 weeks
+    #   4h:  400 bars / (6.5 hrs / 4 hrs per bar) = ~246 trading days = 12 months
+    #   Daily/Weekly: Use 1 year (reduced from 5 years)
     if tf == "15m":
-        period = "3mo"
+        period = "3wk"   # ~15 trading days * 26 bars/day = ~390 bars (was "3mo")
     elif tf == "4h":
-        period = "12mo"
+        period = "12mo"  # ~250 trading days * 1.625 bars/day = ~406 bars (was "12mo", kept)
     else:
-        period = "5y"
+        period = "1y"    # ~250 trading days (was "5y")
 
-    bars = scan_market(symbol, period=period, interval=tf)
+    try:
+        bars = scan_market(symbol, period=period, interval=tf)
+    except RateLimitError as rle:
+        # Re-raise RateLimitError so training loop can detect 429 and trigger cooldown
+        raise rle
     if bars is None or bars.empty:
         raise RuntimeError(f"No data returned for {symbol} {tf}")
 

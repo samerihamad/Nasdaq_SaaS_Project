@@ -70,12 +70,14 @@ def _dynamic_confidence_threshold(timeframes: dict, _symbol: str) -> float:
         return base
     try:
         df = _mr_flatten(df_15m)
+        # STRICT: Require at least 2 bars to use closed candle (iloc[-2])
         if len(df) < 30 or not all(c in df.columns for c in ("High", "Low", "Close")):
             return base
         adx_series, _, _ = _adx(df)
-        adx_val = float(adx_series.iloc[-1])
+        # STRICT: Use last CLOSED candle (iloc[-2]), never live forming candle
+        adx_val = float(adx_series.iloc[-2])
         close = df["Close"].squeeze().astype(float)
-        rsi_val = float(_rsi(close).iloc[-1])
+        rsi_val = float(_rsi(close).iloc[-2])
     except Exception:
         return base
 
@@ -488,11 +490,9 @@ def _analyze_one_from_timeframes(
                 mr.get("stop_loss_pct"),
                 (float(mr.get("ms_score")) if mr.get("ms_score") is not None else None),
                 (float(mr.get("score")) if mr.get("score") is not None else None),
-                bool(mr.get("mr_fast_bypass")),
                 (float(rsi_v) if rsi_v is not None else None),
-                None,
-                False,
-                False,
+                None,  # mom_vol not used for MeanRev
+                False,  # mom_low_vol_entry not used for MeanRev
             ))
     except Exception:
         pass
@@ -516,11 +516,9 @@ def _analyze_one_from_timeframes(
                 None,
                 None,
                 None,
-                False,
-                None,
-                None,
-                False,
-                False,
+                None,  # rsi_aux placeholder
+                None,  # mom_vol placeholder
+                False,  # mom_low_vol_entry placeholder
             ))
         elif mo and not mo.get("rejected") and float(mo.get("confidence", 0)) < float(eff_min_conf):
             print(
@@ -538,11 +536,9 @@ def _analyze_one_from_timeframes(
                 mo.get("stop_loss_pct"),
                 (float(mo.get("ms_score")) if mo.get("ms_score") is not None else None),
                 (float(mo.get("score")) if mo.get("score") is not None else None),
-                False,
                 (float(mrsi) if mrsi is not None else None),
                 (float(mvr) if mvr is not None else None),
                 bool(mo.get("mom_low_vol_entry")),
-                # REMOVED: mom_macd_bypassed — MACD bypass eliminated
             ))
     except Exception:
         pass
@@ -572,7 +568,7 @@ def _analyze_one_from_timeframes(
             "rejected": True,
         }
 
-    best_action, best_conf, best_label, best_reason, best_sl_pct, best_ms_score, best_score, best_mr_fast_bypass, best_rsi_aux, best_mom_vol, best_mom_low_vol = max(
+    best_action, best_conf, best_label, best_reason, best_sl_pct, best_ms_score, best_score, best_rsi_aux, best_mom_vol, best_mom_low_vol = max(
         accepted, key=lambda x: x[1]
     )
     print(f"[CANDIDATES] {symbol} | count={len(candidates)} | best_conf={best_conf:.1f}")
@@ -587,7 +583,7 @@ def _analyze_one_from_timeframes(
         "ms_score": best_ms_score,
         "score": best_score,
         "timeframes": timeframes,
-        "mr_fast_bypass": bool(best_mr_fast_bypass),
+        # REMOVED: "mr_fast_bypass" — eliminated per strict confirmation policy
         "rsi_15m": float(best_rsi_aux) if best_label == "MeanRev" and best_rsi_aux is not None else None,
         "mom_rsi_15m": float(best_rsi_aux) if best_label == "Momentum" and best_rsi_aux is not None else None,
         "mom_vol_ratio": float(best_mom_vol) if best_label == "Momentum" and best_mom_vol is not None else None,

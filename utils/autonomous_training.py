@@ -38,6 +38,9 @@ from config import (
 from database.db_manager import DB_PATH
 from utils.ai_model import train_deep_direction_model
 from utils.ml_direction.infer import invalidate_direction_bundle_cache, load_direction_bundle
+from utils.market_scanner import RateLimitError
+
+import time
 
 MODELS_DIR = "models"
 STABLE_DIR = os.path.join(MODELS_DIR, "stable")
@@ -46,7 +49,48 @@ STATUS_PATH = os.path.join(AUTOTRAIN_LOG_ROOT, "autonomous_training_status.json"
 RUNS_PATH = os.path.join(AUTOTRAIN_LOG_ROOT, "training_runs.jsonl")
 SELF_LEARNING_DATASET_PATH = os.path.join(AUTOTRAIN_LOG_ROOT, "reinforcement_dataset.jsonl")
 
+# Persistent cooldown storage - survives server restarts
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+COOLDOWN_FILE_PATH = os.path.join(DATA_DIR, "training_cooldown.json")
+
 _WEEKDAY_MAP = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+
+
+def _read_cooldown_file() -> dict:
+    """Read persistent cooldown data from file."""
+    try:
+        if not os.path.exists(COOLDOWN_FILE_PATH):
+            return {}
+        with open(COOLDOWN_FILE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _write_cooldown_file(data: dict):
+    """Write cooldown data to persistent file."""
+    try:
+        tmp = f"{COOLDOWN_FILE_PATH}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=True, indent=2)
+        os.replace(tmp, COOLDOWN_FILE_PATH)
+    except Exception:
+        pass
+
+
+def _escape_telegram_markdown(text: str) -> str:
+    """
+    Escape special characters for Telegram MarkdownV2.
+    Characters that must be escaped: _ * [ ] ( ) ~ ` > # + - = | { } . !
+    """
+    if not text:
+        return text
+    # Characters that need escaping in MarkdownV2
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    for char in escape_chars:
+        text = text.replace(char, f'\\{char}')
+    return text
 
 
 # Cooldown duration after training failure (6 hours = 21600 seconds)
@@ -232,9 +276,19 @@ class AutonomousTrainingManager:
         return True
 
     def _is_in_failure_cooldown(self) -> bool:
-        """Check if we're within the 6-hour cooldown period after a training failure."""
-        status = _read_status()
-        last_fail_ts = status.get("last_failure_at")
+        """
+        Check if we're within the 6-hour cooldown period after a training failure.
+        PERSISTENT: Reads from file to survive server restarts.
+        """
+        # Try persistent file first (survives restarts)
+        cd_data = _read_cooldown_file()
+        last_fail_ts = cd_data.get("last_failure_at")
+        
+        # Fallback to status file for backwards compatibility
+        if not last_fail_ts:
+            status = _read_status()
+            last_fail_ts = status.get("last_failure_at")
+        
         if not last_fail_ts:
             return False
         try:
@@ -251,8 +305,9 @@ class AutonomousTrainingManager:
             try:
                 # Check 6-hour cooldown after training failures to prevent "Loop of Death"
                 if self._is_in_failure_cooldown():
-                    status = _read_status()
-                    last_fail = status.get("last_failure_at", "unknown")
+                    # Read from persistent cooldown file (survives restarts)
+                    cd_data = _read_cooldown_file()
+                    last_fail = cd_data.get("last_failure_at", "unknown")
                     self._update_status({
                         "status": "cooldown",
                         "updated_at": _utc_iso(),
@@ -318,7 +373,9 @@ class AutonomousTrainingManager:
         ok = 0
         failed = 0
         rows: list[dict] = []
-        for symbol in symbols:
+        rate_limited = False
+        
+        for idx, symbol in enumerate(symbols):
             row = {
                 "symbol": symbol,
                 "ok": False,
@@ -328,30 +385,75 @@ class AutonomousTrainingManager:
                 "best_val_acc": None,
                 "best_val_loss": None,
             }
-            try:
-                res = train_deep_direction_model(
-                    symbol=symbol,
-                    timeframe=tf,
-                    model_kind=kind,
-                    seq_len=int(DEEP_DIRECTION_SEQ_LEN),
-                    label_horizon=int(DEEP_DIRECTION_LABEL_HORIZON),
-                    label_threshold=float(DEEP_DIRECTION_LABEL_THRESHOLD),
-                    epochs=int(epochs),
-                )
-                model_path = str(res.get("model_path") or "").strip()
-                if not model_path:
-                    raise RuntimeError("training returned empty model_path")
-                stable_model_path = self._promote_model(symbol=symbol, model_path=model_path, timeframe=tf, kind=kind)
-                row["ok"] = True
-                row["model_path"] = model_path
-                row["stable_path"] = stable_model_path
-                row["best_val_acc"] = _safe_float(res.get("best_val_acc"), 0.0)
-                row["best_val_loss"] = _safe_float(res.get("best_val_loss"), 0.0)
-                ok += 1
-            except Exception as exc:
-                row["error"] = str(exc)
-                failed += 1
+            
+            # ── Smart Pacing: 3 second delay between symbols to respect Capital.com rate limits ──
+            if idx > 0:
+                time.sleep(3.0)
+            
+            # ── Exponential Backoff for retries ──
+            max_retries = 2
+            retry_delay = 2.0  # Start with 2 seconds
+            
+            for attempt in range(max_retries):
+                try:
+                    res = train_deep_direction_model(
+                        symbol=symbol,
+                        timeframe=tf,
+                        model_kind=kind,
+                        seq_len=int(DEEP_DIRECTION_SEQ_LEN),
+                        label_horizon=int(DEEP_DIRECTION_LABEL_HORIZON),
+                        label_threshold=float(DEEP_DIRECTION_LABEL_THRESHOLD),
+                        epochs=int(epochs),
+                    )
+                    model_path = str(res.get("model_path") or "").strip()
+                    if not model_path:
+                        raise RuntimeError("training returned empty model_path")
+                    stable_model_path = self._promote_model(symbol=symbol, model_path=model_path, timeframe=tf, kind=kind)
+                    row["ok"] = True
+                    row["model_path"] = model_path
+                    row["stable_path"] = stable_model_path
+                    row["best_val_acc"] = _safe_float(res.get("best_val_acc"), 0.0)
+                    row["best_val_loss"] = _safe_float(res.get("best_val_loss"), 0.0)
+                    ok += 1
+                    break  # Success - exit retry loop
+                    
+                except RateLimitError as rle:
+                    # ── 429 DETECTED: Abort training immediately and trigger cooldown ──
+                    rate_limited = True
+                    row["error"] = f"RATE_LIMITED: {str(rle)}"
+                    failed += 1
+                    log_msg = f"[TRAINING ABORTED] HTTP 429 Rate Limit hit for {symbol}. Aborting training session."
+                    print(log_msg, flush=True)
+                    self._update_status({
+                        "status": "aborted",
+                        "updated_at": _utc_iso(),
+                        "last_error": log_msg,
+                    })
+                    # Break out of retry loop AND symbol loop
+                    break
+                    
+                except Exception as exc:
+                    if attempt < max_retries - 1:
+                        # ── Exponential Backoff: 2s, 4s, 8s ──
+                        print(
+                            f"[TRAINING RETRY] {symbol} attempt {attempt + 1}/{max_retries} failed: {exc}. "
+                            f"Retrying in {retry_delay:.0f}s...",
+                            flush=True,
+                        )
+                        time.sleep(retry_delay)
+                        retry_delay *= 2.0  # Double the delay for next attempt
+                        continue
+                    else:
+                        # Final attempt failed
+                        row["error"] = str(exc)
+                        failed += 1
+                        break
+            
             rows.append(row)
+            
+            # ── If we hit rate limit, abort the entire training session ──
+            if rate_limited:
+                break
 
         ended_at = _utc_now()
         run = {
@@ -370,25 +472,43 @@ class AutonomousTrainingManager:
         }
         _append_jsonl(RUNS_PATH, run)
 
-        # If training failed, set the failure timestamp to trigger 6-hour cooldown
-        if failed > 0:
+        # If training failed OR rate limited, set the failure timestamp to trigger 6-hour cooldown
+        # PERSISTENT: Write to both status file and dedicated cooldown file
+        if failed > 0 or rate_limited:
+            fail_ts = _utc_iso()
             self._update_status({
-                "last_failure_at": _utc_iso(),
+                "last_failure_at": fail_ts,
                 "consecutive_failures": _safe_int(_read_status().get("consecutive_failures"), 0) + 1,
+            })
+            # Write to persistent cooldown file (survives restarts)
+            _write_cooldown_file({
+                "last_failure_at": fail_ts,
+                "consecutive_failures": _safe_int(_read_cooldown_file().get("consecutive_failures"), 0) + 1,
             })
         else:
             # Reset consecutive failures on success
             self._update_status({
                 "consecutive_failures": 0,
             })
+            _write_cooldown_file({
+                "consecutive_failures": 0,
+            })
 
+        # ── Set final status: idle (success), failed (some errors), or aborted (429) ──
+        final_status = "aborted" if rate_limited else ("failed" if failed > 0 else "idle")
+        final_error = ""
+        if rate_limited:
+            final_error = f"ABORTED due to HTTP 429 Rate Limit at symbol {symbol}"
+        elif failed > 0:
+            final_error = f"{failed} symbol(s) failed"
+        
         self._update_status(
             {
-                "status": "idle",
+                "status": final_status,
                 "updated_at": _utc_iso(),
                 "last_run": run,
                 "running": None,
-                "last_error": (f"{failed} symbol(s) failed" if failed else ""),
+                "last_error": final_error,
             }
         )
         self._notify_admin(run)
@@ -598,12 +718,20 @@ class AutonomousTrainingManager:
             return
         try:
             from bot.notifier import send_telegram_message
+            
+            # Escape dynamic values that may contain Markdown special characters
+            # Underscores in values like "auto_refresh_age_123.4h" cause parse errors
+            mode = _escape_telegram_markdown(str(run.get('mode', 'unknown')))
+            reason = _escape_telegram_markdown(str(run.get('reason', 'unknown')))
+            timeframe = _escape_telegram_markdown(str(run.get('timeframe', 'unknown')))
+            kind = _escape_telegram_markdown(str(run.get('kind', 'unknown')))
+            
             msg = (
                 "🤖 Autonomous training finished\n"
-                f"mode={run.get('mode')} reason={run.get('reason')}\n"
+                f"mode={mode} reason={reason}\n"
                 f"ok={run.get('symbols_ok')}/{run.get('symbols_total')} "
                 f"failed={run.get('symbols_failed')}\n"
-                f"timeframe={run.get('timeframe')} kind={run.get('kind')} epochs={run.get('epochs')}"
+                f"timeframe={timeframe} kind={kind} epochs={run.get('epochs')}"
             )
             send_telegram_message(self.admin_chat_id, msg)
         except Exception:
