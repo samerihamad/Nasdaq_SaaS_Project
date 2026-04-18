@@ -29,6 +29,7 @@ from core.trade_close_messages import (
     send_reconcile_tp1_hit,
     send_reconcile_tp2_final,
 )
+from utils.success_tracker import log_successful_setup, log_win_for_symbol
 from database.db_manager import get_subscriber_lang, DB_PATH
 from config import (
     FINAL_SYNC_FALLBACK_ENABLED,
@@ -157,6 +158,24 @@ def _emit_reconcile_close_messages(chat_id: str, trade_id: int) -> None:
             conn.commit()
         except Exception:
             pass
+        
+        # ── SUCCESS MEMORY: Log winning trade for pattern reinforcement ───────
+        try:
+            log_win_for_symbol(symbol)
+            # Log successful setup with default RSI/ADX values (entry features not yet stored in DB)
+            # TODO: Add entry_rsi_15m, entry_adx_15m, entry_ai_confidence columns to trades table
+            log_successful_setup(
+                symbol=symbol,
+                direction=direction,
+                rsi=50.0,  # Default - will be refined when entry features are stored
+                adx=0.0,   # Default - 0 means no trend (conservative for MeanRev)
+                ai_confidence=0.7,  # Default confidence for winning trades
+                timeframe="15m",
+                strategy="TP1",
+            )
+        except Exception as exc:
+            print(f"[SUCCESS TRACKER] Error logging TP hit for {symbol}: {exc}")
+        
         tp2_open = c.execute(
             "SELECT 1 FROM trades WHERE parent_session=? AND status='OPEN' "
             "AND COALESCE(leg_role,'')='TP2' LIMIT 1",
@@ -185,6 +204,23 @@ def _emit_reconcile_close_messages(chat_id: str, trade_id: int) -> None:
             conn.commit()
         except Exception:
             pass
+        
+        # ── SUCCESS MEMORY: Log winning trade for trailing stop exit ───────────
+        try:
+            log_win_for_symbol(symbol)
+            # Log successful setup with default values
+            log_successful_setup(
+                symbol=symbol,
+                direction=direction,
+                rsi=50.0,
+                adx=0.0,
+                ai_confidence=0.7,
+                timeframe="15m",
+                strategy="TP2",
+            )
+        except Exception as exc:
+            print(f"[SUCCESS TRACKER] Error logging TP2 hit for {symbol}: {exc}")
+        
         c.execute(
             "SELECT COALESCE(SUM(pnl),0) FROM trades WHERE parent_session=? AND status='CLOSED'",
             (ps,),

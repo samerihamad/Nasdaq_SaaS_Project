@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 import aiohttp
+import pandas as pd
 
 from utils.market_hours import utc_today, synchronized_utc_now, ET, is_nyse_trading_day
 from config import (
@@ -47,6 +48,11 @@ from utils.market_scanner import (
     CHUNKED_SCAN_INTER_BATCH_SLEEP_SEC,
 )
 from utils.ai_model         import analyze_multi_timeframe
+from utils.success_tracker import (
+    boost_confidence_for_pattern,
+    is_hot_symbol,
+    get_hot_symbols,
+)
 
 log = logging.getLogger(__name__)
 ACTIVE_MIN_CONFIDENCE = float(SIGNAL_MIN_CONFIDENCE if SIGNAL_MIN_CONFIDENCE is not None else FAST_MIN_CONFIDENCE)
@@ -103,6 +109,101 @@ def _dynamic_confidence_threshold(timeframes: dict, _symbol: str) -> float:
         )
         return min(thr, float(GLOBAL_MIN_AI_CONFIDENCE))
     return min(base, float(GLOBAL_MIN_AI_CONFIDENCE))
+
+
+# ── QUANT OPTIMIZATION: Dynamic Volatility Adaptation ─────────────────────────
+
+def _calculate_atr(df: pd.DataFrame, period: int = 14) -> float:
+    """
+    Calculate Average True Range (ATR) for volatility measurement.
+    Returns ATR value as float. Higher ATR = higher volatility.
+    """
+    try:
+        high  = df["High"].squeeze().astype(float)
+        low   = df["Low"].squeeze().astype(float)
+        close = df["Close"].squeeze().astype(float)
+
+        prev_close = close.shift(1)
+
+        # True Range = max(high-low, |high-prev_close|, |low-prev_close|)
+        tr1 = high - low
+        tr2 = (high - prev_close).abs()
+        tr3 = (low - prev_close).abs()
+
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.rolling(window=period).mean().iloc[-1]
+        return float(atr) if not pd.isna(atr) else 0.0
+    except Exception as exc:
+        log.warning(f"[ATR] Calculation failed: {exc}. Defaulting to ATR=0 (conservative)")
+        return 0.0
+
+
+def _get_volatility_adjusted_thresholds(
+    df_15m: pd.DataFrame,
+    base_rsi_buy: float = 30.0,
+    base_rsi_sell: float = 70.0,
+    base_confidence: float = 0.65,
+) -> dict:
+    """
+    QUANT OPTIMIZATION: Hedge Fund Approach - Dynamic thresholds based on ATR.
+    
+    For high-volatility stocks (e.g., TSLA): Wider RSI bands, higher confidence threshold
+    For low-volatility stocks (e.g., AAPL): Standard settings
+    
+    Returns adjusted thresholds dictionary.
+    """
+    try:
+        # Calculate ATR as % of price (normalized volatility)
+        current_price = float(df_15m["Close"].iloc[-1])
+        atr_value = _calculate_atr(df_15m, period=14)
+        atr_pct = (atr_value / current_price * 100) if current_price > 0 else 0.0
+
+        # Categorize volatility (typical ranges for 15m timeframe)
+        # Low: < 0.3%, Normal: 0.3-0.8%, High: > 0.8%
+        if atr_pct < 0.3:
+            volatility_tier = "low"
+            rsi_adjustment = 0.0
+            confidence_adjustment = 0.0
+        elif atr_pct < 0.8:
+            volatility_tier = "normal"
+            rsi_adjustment = 2.5
+            confidence_adjustment = 0.02
+        else:
+            volatility_tier = "high"
+            rsi_adjustment = 5.0
+            confidence_adjustment = 0.05
+
+        # Adjust RSI thresholds (wider bands for high volatility)
+        # For Mean Rev: Lower buy threshold, higher sell threshold
+        adjusted_rsi_buy = max(20.0, base_rsi_buy - rsi_adjustment)
+        adjusted_rsi_sell = min(80.0, base_rsi_sell + rsi_adjustment)
+
+        # Adjust confidence threshold (higher bar for high volatility)
+        adjusted_confidence = min(0.85, base_confidence + confidence_adjustment)
+
+        log.info(
+            f"[DYNAMIC] Volatility: {volatility_tier.upper()} (ATR={atr_pct:.2f}%). "
+            f"RSI: {adjusted_rsi_buy:.0f}/{adjusted_rsi_sell:.0f}, "
+            f"Conf: {adjusted_confidence:.0%}"
+        )
+
+        return {
+            "volatility_tier": volatility_tier,
+            "atr_pct": atr_pct,
+            "rsi_oversold": adjusted_rsi_buy,
+            "rsi_overbought": adjusted_rsi_sell,
+            "min_confidence": adjusted_confidence,
+        }
+    except Exception as exc:
+        log.warning(f"[DYNAMIC] Volatility adaptation failed: {exc}. Using conservative defaults.")
+        # FALLBACK: Conservative defaults
+        return {
+            "volatility_tier": "unknown",
+            "atr_pct": 0.0,
+            "rsi_oversold": base_rsi_buy,
+            "rsi_overbought": base_rsi_sell,
+            "min_confidence": base_confidence + 0.05,  # More conservative
+        }
 
 
 def _side_label(action: str | None) -> str:
@@ -347,7 +448,17 @@ def run_scan() -> list[dict]:
     if not is_nyse_trading_day(synchronized_utc_now().astimezone(ET)):
         log.info("[SCAN SAFETY] NYSE closed day — run_scan skipped.")
         return []
-    log.info("=== Market scan started — %d tickers ===", len(WATCHLIST))
+    
+    # ── HOT SYMBOL PRIORITIZATION ───────────────────────────────────────────
+    # Get hot symbols and prioritize them in the scan order
+    hot_symbols = get_hot_symbols()
+    if hot_symbols:
+        log.info(f"[HOT SYMBOLS] Prioritizing hot symbols: {', '.join(hot_symbols)}")
+    
+    # Reorder WATCHLIST: hot symbols first, then others
+    prioritized_watchlist = list(dict.fromkeys(hot_symbols + [sym for sym in WATCHLIST if sym not in hot_symbols]))
+    
+    log.info("=== Market scan started — %d tickers ===", len(prioritized_watchlist))
 
     subscribers = _get_active_subscribers()
     if not subscribers:
@@ -357,8 +468,8 @@ def run_scan() -> list[dict]:
     triggered = []
 
     # Parallel ticker scanning — IO-bound (provider HTTP calls)
-    with ThreadPoolExecutor(max_workers=min(8, len(WATCHLIST))) as pool:
-        futures = {pool.submit(_analyze_ticker, sym): sym for sym in WATCHLIST}
+    with ThreadPoolExecutor(max_workers=min(8, len(prioritized_watchlist))) as pool:
+        futures = {pool.submit(_analyze_ticker, sym): sym for sym in prioritized_watchlist}
         for future in as_completed(futures):
             sym = futures[future]
             try:
@@ -416,6 +527,21 @@ def _analyze_one_from_timeframes(
     
     # Confidence gate uses FAST_MIN_CONFIDENCE-based dynamic threshold (see _dynamic_confidence_threshold).
     eff_min_conf = _dynamic_confidence_threshold(timeframes, symbol)
+    
+    # ── QUANT OPTIMIZATION: Apply dynamic volatility adaptation ─────────────────
+    # Adjust effective confidence based on ATR-derived volatility tier
+    df_15m = timeframes.get("15m")
+    if df_15m is not None and not df_15m.empty:
+        vol_adjustments = _get_volatility_adjusted_thresholds(
+            df_15m,
+            base_rsi_buy=30.0,
+            base_rsi_sell=70.0,
+            base_confidence=eff_min_conf,
+        )
+        # Use the higher of the two confidence thresholds
+        eff_min_conf = max(eff_min_conf, vol_adjustments["min_confidence"])
+        log.info(f"[SignalEngine {symbol}] Final confidence threshold: {eff_min_conf:.0%}")
+    
     candidates: list[
         tuple[
             str,
@@ -572,6 +698,49 @@ def _analyze_one_from_timeframes(
         accepted, key=lambda x: x[1]
     )
     print(f"[CANDIDATES] {symbol} | count={len(candidates)} | best_conf={best_conf:.1f}")
+
+    # ── SUCCESS REINFORCEMENT: Pattern Matching ──────────────────────────────
+    # Boost confidence if this signal matches a recent successful setup
+    original_conf = best_conf
+    try:
+        from utils.success_tracker import boost_confidence_for_pattern
+        
+        # Get current ADX and RSI for pattern matching
+        df_15m = timeframes.get("15m")
+        adx_val = 0.0
+        rsi_val = 0.0
+        if df_15m is not None and not df_15m.empty:
+            from utils.ai_model import _adx, _rsi, _flatten
+            flat_df = _flatten(df_15m)
+            adx_series = _adx(flat_df)
+            rsi_series = _rsi(flat_df["Close"].squeeze())
+            if len(adx_series) >= 2:
+                adx_val = float(adx_series.iloc[-2])
+            if len(rsi_series) >= 2:
+                rsi_val = float(rsi_series.iloc[-2])
+        
+        boosted_conf, was_boosted, matching_pattern = boost_confidence_for_pattern(
+            base_confidence=best_conf,
+            symbol=symbol,
+            direction=best_action,
+            rsi=rsi_val,
+            adx=adx_val,
+            ai_confidence=best_conf,
+            timeframe="15m",
+            strategy=best_label,
+        )
+        
+        if was_boosted and matching_pattern:
+            best_conf = boosted_conf
+            best_reason = f"{best_reason} | REINFORCED (+10% from win pattern)"
+            log.info(
+                f"[SUCCESS REINFORCEMENT] Pattern match found for {symbol}. "
+                f"Boosting confidence {original_conf:.1%} → {best_conf:.1%} due to recent win."
+            )
+            
+    except Exception as exc:
+        log.warning(f"[SUCCESS REINFORCEMENT] Pattern boost failed for {symbol}: {exc}")
+        pass
 
     out: dict[str, Any] = {
         "symbol": symbol,

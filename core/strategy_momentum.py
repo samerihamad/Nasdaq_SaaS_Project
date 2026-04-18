@@ -200,8 +200,8 @@ def _check_1d_trend(df_1d: pd.DataFrame, direction: str) -> bool:
     """
     1D must show a clear trend (evaluated on CLOSED candle only).
     STRICT: Uses iloc[-2] for last closed candle.
-      BUY : RSI > 50 AND EMA20 > EMA50
-      SELL: RSI < 50 AND EMA20 < EMA50
+      BUY : RSI > 55 AND EMA20 > EMA50  (Changed from 50 to avoid chop)
+      SELL: RSI < 45 AND EMA20 < EMA50  (Changed from 50 to avoid chop)
     """
     if df_1d is None or df_1d.empty or len(df_1d) < 2:
         return False
@@ -216,10 +216,11 @@ def _check_1d_trend(df_1d: pd.DataFrame, direction: str) -> bool:
     ema20_v = float(ema20.iloc[-2])
     ema50_v = float(ema50.iloc[-2])
 
+    # QUANT OPTIMIZATION: Aggressive RSI thresholds to avoid choppy 50-zone
     if direction == "BUY":
-        return rsi_v > 50 and ema20_v > ema50_v
+        return rsi_v > 55 and ema20_v > ema50_v
     else:
-        return rsi_v < 50 and ema20_v < ema50_v
+        return rsi_v < 45 and ema20_v < ema50_v
 
 
 # ── Price Action Confirmation ────────────────────────────────────────────────

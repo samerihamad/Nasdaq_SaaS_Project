@@ -57,6 +57,10 @@ log = logging.getLogger(__name__)
 # Daily RSI alignment for MeanRev BUY (not a % confidence gate).
 MR_1D_RSI_BUY_ALIGN_MAX = 68.0
 
+# QUANT OPTIMIZATION: ADX threshold for "Falling Knife" protection
+# If ADX > 25, market is trending strongly - disable Mean Reversion
+MR_ADX_TREND_THRESHOLD = 25.0
+
 
 # ── Indicator helpers ─────────────────────────────────────────────────────────
 
@@ -85,6 +89,51 @@ def _vwap(df: pd.DataFrame) -> pd.Series:
             result[mask] = (typical[mask] * volume[mask]).cumsum() / volume[mask].cumsum()
         return result
     return (typical * volume).rolling(20).sum() / volume.rolling(20).sum()
+
+
+def _adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """
+    Wilder's ADX implementation for trend strength detection.
+    Returns ADX Series (0-100 scale). ADX > 25 indicates strong trend.
+    """
+    try:
+        high  = df["High"].squeeze().astype(float)
+        low   = df["Low"].squeeze().astype(float)
+        close = df["Close"].squeeze().astype(float)
+
+        prev_high  = high.shift(1)
+        prev_low   = low.shift(1)
+        prev_close = close.shift(1)
+
+        # True Range
+        tr = pd.concat([
+            (high - low),
+            (high - prev_close).abs(),
+            (low  - prev_close).abs(),
+        ], axis=1).max(axis=1)
+
+        # Directional Movements
+        up_move   = high - prev_high
+        down_move = prev_low - low
+
+        plus_dm  = np.where((up_move > down_move) & (up_move > 0),  up_move,  0.0)
+        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+        plus_dm  = pd.Series(plus_dm,  index=df.index, dtype=float)
+        minus_dm = pd.Series(minus_dm, index=df.index, dtype=float)
+
+        # Wilder smoothing
+        atr_s    = tr.ewm(alpha=1 / period, adjust=False).mean()
+        plus_di  = 100 * plus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr_s.replace(0, np.nan)
+        minus_di = 100 * minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr_s.replace(0, np.nan)
+
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+        adx_series = dx.ewm(alpha=1 / period, adjust=False).mean()
+        return adx_series
+    except Exception as exc:
+        log.warning(f"[MeanRev] ADX calculation failed: {exc}. Defaulting to conservative (ADX=0)")
+        # FALLBACK: Return 0 (indicates no trend, safe for Mean Reversion)
+        return pd.Series([0.0] * len(df), index=df.index, dtype=float)
 
 
 def _flatten(df: pd.DataFrame) -> pd.DataFrame:
@@ -359,6 +408,22 @@ def analyze(
         )
         log.info("[MeanRev %s] %s", symbol, rej)
         return {"rejected": True, "strategy": "MeanRev", "reason": rej, "action": _dir_log}
+
+    # ── QUANT OPTIMIZATION: ADX "Falling Knife" Protection ───────────────────
+    # If ADX > 25, market is trending strongly - prices will likely "ride the bands"
+    # rather than reverse. Disable Mean Reversion in strong trends.
+    try:
+        adx_series = _adx(df_15m, period=14)
+        adx_val = float(adx_series.iloc[-2]) if len(adx_series) >= 2 else 0.0
+    except Exception:
+        # FALLBACK: If ADX calculation fails, default to conservative (no trend)
+        adx_val = 0.0
+        log.warning(f"[MeanRev {symbol}] ADX calculation failed, defaulting to ADX=0 (conservative)")
+
+    if adx_val > MR_ADX_TREND_THRESHOLD:
+        rej = f"Rejected: ADX ({adx_val:.1f}) indicates strong trend - Falling Knife protection"
+        log.info("[MeanRev %s] %s", symbol, rej)
+        return {"rejected": True, "strategy": "MeanRev", "reason": rej, "action": direction}
 
     # ── Market structure policy v2 (soft-scoring, no structural hard reject) ─
     htf = None
