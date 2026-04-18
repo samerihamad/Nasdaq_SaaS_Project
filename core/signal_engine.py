@@ -542,7 +542,7 @@ def _analyze_one_from_timeframes(
                 (float(mrsi) if mrsi is not None else None),
                 (float(mvr) if mvr is not None else None),
                 bool(mo.get("mom_low_vol_entry")),
-                bool(mo.get("mom_macd_bypassed")),
+                # REMOVED: mom_macd_bypassed — MACD bypass eliminated
             ))
     except Exception:
         pass
@@ -572,7 +572,7 @@ def _analyze_one_from_timeframes(
             "rejected": True,
         }
 
-    best_action, best_conf, best_label, best_reason, best_sl_pct, best_ms_score, best_score, best_mr_fast_bypass, best_rsi_aux, best_mom_vol, best_mom_low_vol, best_mom_macd_bypassed = max(
+    best_action, best_conf, best_label, best_reason, best_sl_pct, best_ms_score, best_score, best_mr_fast_bypass, best_rsi_aux, best_mom_vol, best_mom_low_vol = max(
         accepted, key=lambda x: x[1]
     )
     print(f"[CANDIDATES] {symbol} | count={len(candidates)} | best_conf={best_conf:.1f}")
@@ -592,7 +592,7 @@ def _analyze_one_from_timeframes(
         "mom_rsi_15m": float(best_rsi_aux) if best_label == "Momentum" and best_rsi_aux is not None else None,
         "mom_vol_ratio": float(best_mom_vol) if best_label == "Momentum" and best_mom_vol is not None else None,
         "mom_low_vol_entry": bool(best_mom_low_vol) if best_label == "Momentum" else False,
-        "mom_macd_bypassed": bool(best_mom_macd_bypassed) if best_label == "Momentum" else False,
+        # REMOVED: "mom_macd_bypassed" — MACD bypass eliminated per strict policy
         "signal_price": _latest_signal_price(timeframes),
     }
     return out

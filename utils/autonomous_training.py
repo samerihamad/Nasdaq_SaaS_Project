@@ -49,6 +49,10 @@ SELF_LEARNING_DATASET_PATH = os.path.join(AUTOTRAIN_LOG_ROOT, "reinforcement_dat
 _WEEKDAY_MAP = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 
 
+# Cooldown duration after training failure (6 hours = 21600 seconds)
+TRAINING_FAILURE_COOLDOWN_SEC = 21600
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -227,9 +231,36 @@ class AutonomousTrainingManager:
             self.active_future = self.executor.submit(self._run_training_job, reason, mode, payload_symbols)
         return True
 
+    def _is_in_failure_cooldown(self) -> bool:
+        """Check if we're within the 6-hour cooldown period after a training failure."""
+        status = _read_status()
+        last_fail_ts = status.get("last_failure_at")
+        if not last_fail_ts:
+            return False
+        try:
+            last_fail_dt = _parse_iso_utc(str(last_fail_ts))
+            if last_fail_dt is None:
+                return False
+            elapsed_sec = (_utc_now() - last_fail_dt).total_seconds()
+            return elapsed_sec < TRAINING_FAILURE_COOLDOWN_SEC
+        except Exception:
+            return False
+
     def _scheduler_loop(self):
         while not self.stop_event.is_set():
             try:
+                # Check 6-hour cooldown after training failures to prevent "Loop of Death"
+                if self._is_in_failure_cooldown():
+                    status = _read_status()
+                    last_fail = status.get("last_failure_at", "unknown")
+                    self._update_status({
+                        "status": "cooldown",
+                        "updated_at": _utc_iso(),
+                        "last_error": f"Training cooldown active (6h) since {last_fail}",
+                    })
+                    self.stop_event.wait(max(60, int(AUTOTRAIN_SCHEDULER_POLL_SEC)))
+                    continue
+
                 if ENABLE_AUTONOMOUS_SELF_LEARNING:
                     self._collect_self_learning_samples()
                     self._maybe_schedule_self_learning_finetune()
@@ -338,6 +369,19 @@ class AutonomousTrainingManager:
             "results": rows,
         }
         _append_jsonl(RUNS_PATH, run)
+
+        # If training failed, set the failure timestamp to trigger 6-hour cooldown
+        if failed > 0:
+            self._update_status({
+                "last_failure_at": _utc_iso(),
+                "consecutive_failures": _safe_int(_read_status().get("consecutive_failures"), 0) + 1,
+            })
+        else:
+            # Reset consecutive failures on success
+            self._update_status({
+                "consecutive_failures": 0,
+            })
+
         self._update_status(
             {
                 "status": "idle",

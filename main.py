@@ -76,7 +76,7 @@ from config import (
     GOLDEN_MOM_RSI_BUY_MAX,
     GOLDEN_MOM_RSI_SELL_MIN,
     FAST_MOM_LOW_VOL_AI_MIN,
-    FAST_MOM_MACD_BYPASS_AI_MIN,
+    # REMOVED: FAST_MOM_MACD_BYPASS_AI_MIN — MACD bypass eliminated
     CHECK_INTERVAL,
     MAX_WATCHLIST,
     HYBRID_SIGNAL_TTL,
@@ -87,9 +87,7 @@ from config import (
     AI_MIN_PROB_RF,
     AI_MIN_PROB_MOMENTUM,
     AI_MIN_PROB_MEANREV,
-    AI_SOFT_OVERRIDE_CONFIDENCE,
-    AI_SOFT_OVERRIDE_MIN_PROB,
-    ENABLE_AI_SOFT_OVERRIDE,
+    # REMOVED: AI_SOFT_OVERRIDE_* settings — override logic eliminated per strict AI policy
     ENABLE_STRUCTURAL_REJECTION_NOTIFY,
     STRUCTURAL_REJECTION_NOTIFY_COOLDOWN_SEC,
     STRUCTURAL_REJECTION_NOTIFY_MAX_PER_CYCLE,
@@ -360,7 +358,6 @@ def _log_ai_gatekeeper(
     ms_score: Optional[float],
     probability: Optional[float],
     approved: bool,
-    override: bool,
     regime: Optional[str],
 ):
     prob_str = "n/a" if probability is None else f"{float(probability):.2f}"
@@ -369,7 +366,7 @@ def _log_ai_gatekeeper(
         (
             f"symbol={symbol} action={action} strategy={strategy} conf={float(confidence):.2f} "
             f"ms_score={('n/a' if ms_score is None else f'{float(ms_score):.1f}')} "
-            f"prob={prob_str} approved={int(bool(approved))} override={int(bool(override))} "
+            f"prob={prob_str} approved={int(bool(approved))} "
             f"regime={regime or 'n/a'}"
         ),
     )
@@ -1123,7 +1120,7 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
                     ms_score: Optional[float] = None, signal_score: Optional[float] = None,
                     mr_fast_bypass: bool = False, rsi_15m: Optional[float] = None,
                     mom_rsi_15m: Optional[float] = None, mom_vol_ratio: Optional[float] = None,
-                    mom_low_vol_entry: bool = False, mom_macd_bypassed: bool = False):
+                    mom_low_vol_entry: bool = False):
     """
     Multi-tenant signal dispatcher.
 
@@ -1140,12 +1137,10 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
     No shared mutable state between users.
     """
     # ── AI Gatekeeper (evaluated once, applies to all users) ──────────────────
-    # Consistent decision model:
-    # - We rely on validate_signal(..., min_probability=...) to produce the boolean gate.
-    # - We allow a soft override only for Momentum/MeanRev when confidence is high.
+    # STRICT POLICY: A trade MUST have approved=1 from the AI model to proceed.
+    # All bypass/override logic has been eliminated. No exceptions.
     ai_prob = None
     ai_approved = True
-    ai_override = False
     regime = "UNKNOWN"
     if timeframes:
         strategy_key = (strategy_label or "RF").strip()
@@ -1159,22 +1154,11 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
             symbol, action, timeframes, min_probability=ai_min_prob, ms_score=ms_score
         )
 
-        # Soft override (Momentum/MeanRev): no VOLATILE block — see config AI_SOFT_OVERRIDE_*
-        ai_override = (
-            ENABLE_AI_SOFT_OVERRIDE
-            and
-            (not ai_approved)
-            and confidence >= AI_SOFT_OVERRIDE_CONFIDENCE
-            and ai_prob >= AI_SOFT_OVERRIDE_MIN_PROB
-            and strategy_key in ("Momentum", "MeanRev")
-        )
-
         # ── AI DEBUG (CRITICAL) ───────────────────────────────────────────────
         print(
             f"[AI DEBUG] {symbol} {action} | "
             f"conf={float(confidence):.1f} | prob={float(ai_prob):.1f} | "
-            f"approved={bool(ai_approved)} | override={bool(ai_override)} | "
-            f"strategy={strategy_key} | regime={regime}"
+            f"approved={bool(ai_approved)} | strategy={strategy_key} | regime={regime}"
         )
         _log_ai_gatekeeper(
             symbol=symbol,
@@ -1184,11 +1168,10 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
             ms_score=ms_score,
             probability=(float(ai_prob) if ai_prob is not None else None),
             approved=bool(ai_approved),
-            override=bool(ai_override),
             regime=regime,
         )
 
-        if not (ai_approved or ai_override):
+        if not ai_approved:
             print(
                 f"[AI BLOCK] {symbol} {action} | "
                 f"prob={float(ai_prob):.1f} < min={float(ai_min_prob):.1f} | "
@@ -1241,49 +1224,12 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
                 "failed": 0,
             }
 
-        if (
-            mom_macd_bypassed
-            and strategy_key == "Momentum"
-            and (ai_prob is None or float(ai_prob) < float(FAST_MOM_MACD_BYPASS_AI_MIN))
-        ):
-            print(
-                f"[AI BLOCK] {symbol} {action} | "
-                f"FAST MACD bypass requires AI prob >= {float(FAST_MOM_MACD_BYPASS_AI_MIN):.1f}% "
-                f"(got {float(ai_prob) if ai_prob is not None else 'n/a'})"
-            )
-            _log_execution_audit(
-                symbol=symbol,
-                action=action,
-                strategy=strategy_label,
-                attempted=0,
-                opened=0,
-                skipped=0,
-                failed=0,
-                status="ai_blocked_macd_bypass",
-            )
-            return {
-                "status": "ai_blocked",
-                "attempted": 0,
-                "opened": 0,
-                "skipped": 0,
-                "failed": 0,
-            }
-
-        if mom_macd_bypassed and strategy_key == "Momentum":
-            print(f"[FAST OPTIMIZATION] Trade triggered by Momentum MACD AI Bypass | {symbol}")
-
-        if ai_override:
-            print(
-                f"   [AI OVERRIDE] {symbol} {action} — "
-                f"probability={ai_prob:.1f}% < min({strategy_key})={ai_min_prob:.1f}% "
-                f"but confidence={confidence:.1f}% >= {AI_SOFT_OVERRIDE_CONFIDENCE:.1f}% "
-                f"| regime={regime}"
-            )
-        else:
-            print(
-                f"   [AI OK] {symbol} {action} — probability={ai_prob:.1f}% "
-                f"| min({strategy_key})={ai_min_prob:.1f}% | regime={regime}"
-            )
+        # REMOVED: MACD bypass logic eliminated — AI approval now strictly required.
+        # REMOVED: ai_override logging — override functionality eliminated.
+        print(
+            f"   [AI OK] {symbol} {action} — probability={ai_prob:.1f}% "
+            f"| min({strategy_key})={ai_min_prob:.1f}% | regime={regime}"
+        )
 
     # ── Iterate only subscribers who have started their trading engine ─────────
     subscribers = get_trading_subscribers()
@@ -1441,7 +1387,7 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
         "skipped": skipped,
         "failed": failed,
         "ai_approved": bool(ai_approved),
-        "ai_override": bool(ai_override),
+        # REMOVED: "ai_override" — override logic eliminated per strict AI policy
         "ai_probability": ai_prob,
     }
 
@@ -1812,7 +1758,7 @@ def run_trading_bot():
                             float(sig["mom_vol_ratio"]) if sig.get("mom_vol_ratio") is not None else None
                         ),
                         mom_low_vol_entry=bool(sig.get("mom_low_vol_entry")),
-                        mom_macd_bypassed=bool(sig.get("mom_macd_bypassed")),
+                        # REMOVED: mom_macd_bypassed — MACD bypass eliminated
                     )
                     if isinstance(dispatch_result, dict) and dispatch_result.get("status") == "ai_blocked":
                         ai_blocked_count += 1

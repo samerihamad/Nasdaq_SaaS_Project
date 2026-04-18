@@ -101,7 +101,7 @@ GOLDEN_MOM_VOL_RATIO = float(os.getenv("GOLDEN_MOM_VOL_RATIO", str(MOM_VOL_RATIO
 FAST_MOM_RSI_BUY_MAX = float(os.getenv("FAST_MOM_RSI_BUY_MAX", "77"))
 # Minimum AI probability (%) for FAST momentum entries using the high-RSI / relaxed-volume path.
 FAST_MOM_LOW_VOL_AI_MIN = float(os.getenv("FAST_MOM_LOW_VOL_AI_MIN", "65"))
-FAST_MOM_MACD_BYPASS_AI_MIN = float(os.getenv("FAST_MOM_MACD_BYPASS_AI_MIN", "60"))
+# REMOVED: FAST_MOM_MACD_BYPASS_AI_MIN — MACD bypass eliminated. AI approval now strictly required.
 GOLDEN_MOM_RSI_BUY_MAX = float(os.getenv("GOLDEN_MOM_RSI_BUY_MAX", "65"))
 FAST_MOM_RSI_SELL_MIN = float(os.getenv("FAST_MOM_RSI_SELL_MIN", "25"))
 GOLDEN_MOM_RSI_SELL_MIN = float(os.getenv("GOLDEN_MOM_RSI_SELL_MIN", "35"))
@@ -317,15 +317,10 @@ AI_MIN_PROB_RF = float(os.getenv("AI_MIN_PROB_RF", "58.0"))
 AI_MIN_PROB_MOMENTUM = float(os.getenv("AI_MIN_PROB_MOMENTUM", "60.0"))
 AI_MIN_PROB_MEANREV = float(os.getenv("AI_MIN_PROB_MEANREV", "58.0"))
 
-# Soft override:
-# Allow high-confidence Momentum/MeanRev signals to pass even if AI probability
-# is below the per-strategy threshold (override is intentionally harder to reach).
-# CHANGED FOR MORE SIGNALS — FAST MODE ONLY — CONSERVATIVE BALANCED VERSION — based on April 7-8 logs
-# Tighten override back up vs the aggressive version: only let through high strategy confidence
-# while still requiring non-trivial AI probability.
-AI_SOFT_OVERRIDE_CONFIDENCE = float(os.getenv("AI_SOFT_OVERRIDE_CONFIDENCE", "72.0"))
-AI_SOFT_OVERRIDE_MIN_PROB = float(os.getenv("AI_SOFT_OVERRIDE_MIN_PROB", "32.0"))
-ENABLE_AI_SOFT_OVERRIDE = os.getenv("ENABLE_AI_SOFT_OVERRIDE", "true").lower() == "true"
+# REMOVED: AI Soft Override logic — eliminated per strict AI gatekeeper policy.
+# A trade MUST have approved=1 from the AI model to proceed. No exceptions.
+# Previous settings (AI_SOFT_OVERRIDE_CONFIDENCE, AI_SOFT_OVERRIDE_MIN_PROB, ENABLE_AI_SOFT_OVERRIDE)
+# have been removed to prevent bypassing the AI gatekeeper.
 
 # Optional AI feature: market-structure score blending.
 # When enabled, validate_signal() adjusts blended probability by:

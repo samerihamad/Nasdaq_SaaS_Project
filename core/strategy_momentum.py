@@ -396,35 +396,14 @@ def analyze(
         liq = ms_ctx.liq
 
     # ── MACD crossover ────────────────────────────────────────────────────────
+    # STRICT POLICY: MACD confirmation is REQUIRED. No bypasses allowed.
+    # REMOVED: macd_bypass_rsi logic — all MACD bypasses eliminated.
     macd_line, signal_line = _macd(close_15m)
     has_macd_confirm = _macd_crossover(macd_line, signal_line, direction)
-    macd_bypass_rsi = (
-        direction == "BUY" and rsi_15m_val > float(FAST_MOM_RSI_VOL_TIER_HIGH)
-    ) or (
-        direction == "SELL" and rsi_15m_val < bearish_rsi_vol_line
-    )
-    mom_macd_bypassed = False
     if MOM_MACD_CONFIRM and not has_macd_confirm:
-        mom_macd_bypassed = True
-        if macd_bypass_rsi:
-            if direction == "BUY":
-                log.info(
-                    "[Momentum %s] MACD bypass (RSI %.1f > %.1f)",
-                    symbol,
-                    rsi_15m_val,
-                    float(FAST_MOM_RSI_VOL_TIER_HIGH),
-                )
-            else:
-                log.info(
-                    "[Momentum %s] MACD bypass (RSI %.1f < %.1f bearish tier)",
-                    symbol,
-                    rsi_15m_val,
-                    bearish_rsi_vol_line,
-                )
-            log.info("[FAST OPTIMIZATION] Trade triggered by Momentum RSI MACD Bypass | %s", symbol)
-        else:
-            # Allowed here; final pass depends on AI probability gate in dispatch.
-            log.info("[Momentum %s] MACD missing; pending FAST AI bypass gate", symbol)
+        # MACD required but not present — signal rejected
+        log.info("[Momentum %s] MACD confirmation required but missing — signal rejected", symbol)
+        return {"action": "NONE", "confidence": 0, "score": 0, "strategy": "Momentum", "reason": "MACD confirmation required"}
 
     # ── Volume vs MA20 (FAST tiered; floor from FAST_MOM_VOL_RATIO_FLOOR in .env) ─
     vol_ratio = _volume_ratio(df_15m)
@@ -477,12 +456,13 @@ def analyze(
         score += 5
         reasons.append("StrongTrend (+5)")
 
-    # 2. MACD crossover (20 pts)
-    if has_macd_confirm or macd_bypass_rsi:
+    # 2. MACD crossover (20 pts) — STRICT: must have confirmation, no bypasses
+    if has_macd_confirm:
         score += 20
-        reasons.append("MACD_cross/bypass (+20)")
-    elif mom_macd_bypassed:
-        reasons.append("MACD_missing (AI_bypass_pending +0)")
+        reasons.append("MACD_cross (+20)")
+    else:
+        # No MACD confirmation — signal rejected (should not reach here due to early return)
+        return {"action": "NONE", "confidence": 0, "score": 0, "strategy": "Momentum", "reason": "MACD confirmation required"}
 
     # 3. Volume spike (20 pts, scaled vs FAST floor)
     vol_pts = min(20, int(20 * (vol_ratio - vol_min) / 2.0 + 10))
@@ -579,5 +559,5 @@ def analyze(
         "mom_rsi_15m":   rsi_15m_val,
         "mom_vol_ratio": vol_ratio,
         "mom_low_vol_entry": bool(mom_low_vol_entry),
-        "mom_macd_bypassed": bool(mom_macd_bypassed),
+        # REMOVED: "mom_macd_bypassed" — MACD bypass eliminated per strict policy
     }
