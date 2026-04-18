@@ -20,7 +20,7 @@ def _with_dubai_footer(message: str) -> str:
     return f"{text}\n\n🕓 Dubai: {_dubai_timestamp()}"
 
 
-def send_telegram_message(chat_id, message):
+def send_telegram_message(chat_id, message, parse_mode="Markdown"):
     """Send a Telegram message to a subscriber."""
     token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
     if not token:
@@ -31,7 +31,7 @@ def send_telegram_message(chat_id, message):
     payload = {
         "chat_id":    chat_id,
         "text":       stamped_message,
-        "parse_mode": "Markdown",
+        "parse_mode": parse_mode,
     }
     try:
         response = requests.post(url, json=payload, timeout=20)

@@ -39,8 +39,13 @@ from database.db_manager import DB_PATH
 from utils.ai_model import train_deep_direction_model
 from utils.ml_direction.infer import invalidate_direction_bundle_cache, load_direction_bundle
 from utils.market_scanner import RateLimitError
+from utils.market_hours import is_market_open
 
 import time
+import html
+import logging
+
+log = logging.getLogger(__name__)
 
 MODELS_DIR = "models"
 STABLE_DIR = os.path.join(MODELS_DIR, "stable")
@@ -50,9 +55,14 @@ RUNS_PATH = os.path.join(AUTOTRAIN_LOG_ROOT, "training_runs.jsonl")
 SELF_LEARNING_DATASET_PATH = os.path.join(AUTOTRAIN_LOG_ROOT, "reinforcement_dataset.jsonl")
 
 # Persistent cooldown storage - survives server restarts
-DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
+# Use absolute path based on project root to ensure file is created in correct location
+PROJECT_ROOT = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
+DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 COOLDOWN_FILE_PATH = os.path.join(DATA_DIR, "training_cooldown.json")
+
+# DEBUG: Print the exact path where cooldown file will be stored
+print(f"DEBUG: Cooldown file path = {COOLDOWN_FILE_PATH}")
 
 _WEEKDAY_MAP = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 
@@ -303,6 +313,41 @@ class AutonomousTrainingManager:
     def _scheduler_loop(self):
         while not self.stop_event.is_set():
             try:
+                # ── MARKET-CLOSED CHECK ────────────────────────────────────────────────
+                # If market is closed, sleep for 1 hour and skip all training logic
+                if not is_market_open():
+                    log.info("Market is closed. Training scheduler is going to sleep.")
+                    self._update_status({
+                        "status": "market_closed",
+                        "updated_at": _utc_iso(),
+                        "last_error": "Market closed - sleeping for 1 hour",
+                    })
+                    self.stop_event.wait(3600)  # Sleep 1 hour
+                    continue
+
+                # ── HARD COOLDOWN CHECK ────────────────────────────────────────────────
+                # Read directly from persistent file at the START of every loop iteration.
+                # This ensures cooldown is enforced even if _is_in_failure_cooldown() has bugs.
+                print(f"DEBUG: Checking cooldown file at {COOLDOWN_FILE_PATH}")
+                cd_data = _read_cooldown_file()
+                last_fail_ts = cd_data.get("last_failure_at")
+                if last_fail_ts:
+                    try:
+                        last_fail_dt = _parse_iso_utc(str(last_fail_ts))
+                        if last_fail_dt:
+                            elapsed_sec = (_utc_now() - last_fail_dt).total_seconds()
+                            if elapsed_sec < TRAINING_FAILURE_COOLDOWN_SEC:
+                                # FORCE COOLDOWN: Sleep and continue without any API calls
+                                self._update_status({
+                                    "status": "cooldown",
+                                    "updated_at": _utc_iso(),
+                                    "last_error": f"HARD COOLDOWN: {int((TRAINING_FAILURE_COOLDOWN_SEC - elapsed_sec)/60)} min remaining",
+                                })
+                                self.stop_event.wait(max(60, int(AUTOTRAIN_SCHEDULER_POLL_SEC)))
+                                continue
+                    except Exception:
+                        pass  # If parsing fails, proceed with normal checks
+                
                 # Check 6-hour cooldown after training failures to prevent "Loop of Death"
                 if self._is_in_failure_cooldown():
                     # Read from persistent cooldown file (survives restarts)
@@ -719,21 +764,23 @@ class AutonomousTrainingManager:
         try:
             from bot.notifier import send_telegram_message
             
-            # Escape dynamic values that may contain Markdown special characters
-            # Underscores in values like "auto_refresh_age_123.4h" cause parse errors
-            mode = _escape_telegram_markdown(str(run.get('mode', 'unknown')))
-            reason = _escape_telegram_markdown(str(run.get('reason', 'unknown')))
-            timeframe = _escape_telegram_markdown(str(run.get('timeframe', 'unknown')))
-            kind = _escape_telegram_markdown(str(run.get('kind', 'unknown')))
+            # HTML escape all dynamic values to prevent Telegram parsing errors
+            # Using HTML parse_mode is much safer than MarkdownV2 for variable content
+            mode = html.escape(str(run.get('mode', 'unknown')))
+            reason = html.escape(str(run.get('reason', 'unknown')))
+            timeframe = html.escape(str(run.get('timeframe', 'unknown')))
+            kind = html.escape(str(run.get('kind', 'unknown')))
             
+            # Build HTML message - no special characters to break parsing
             msg = (
-                "🤖 Autonomous training finished\n"
-                f"mode={mode} reason={reason}\n"
+                "🤖 Autonomous training finished<br>"
+                f"mode={mode} reason={reason}<br>"
                 f"ok={run.get('symbols_ok')}/{run.get('symbols_total')} "
-                f"failed={run.get('symbols_failed')}\n"
+                f"failed={run.get('symbols_failed')}<br>"
                 f"timeframe={timeframe} kind={kind} epochs={run.get('epochs')}"
             )
-            send_telegram_message(self.admin_chat_id, msg)
+            # Use parse_mode='HTML' for safer formatting with dynamic content
+            send_telegram_message(self.admin_chat_id, msg, parse_mode='HTML')
         except Exception:
             # Never fail main engine flow on notifier errors.
             self._update_status({"last_error": "admin notify failed", "updated_at": _utc_iso()})
