@@ -2162,6 +2162,14 @@ def monitor_and_close(chat_id):
                     or close_payload.get("dealRef")
                     or close_payload.get("reference")
                 )
+                # CRITICAL FIX: Capital.com Two-Leg Architecture
+                # The DELETE response returns a NEW dealId for the closing leg.
+                # The P/L is stored under this NEW dealId in history, NOT the original open dealId.
+                close_deal_id = (
+                    close_payload.get("dealId")
+                    or close_payload.get("deal_id")
+                    or close_payload.get("position", {}).get("dealId")
+                )
                 # Gold rule: never trust HTTP 200 alone — confirm GET /positions no longer lists this deal.
                 try:
                     _sz_v = float(size_leg) if size_leg is not None else float(live["position"].get("size") or 0)
@@ -2230,6 +2238,7 @@ def monitor_and_close(chat_id):
                     symbol=symbol,
                     direction=direction,
                     deal_reference=str(deal_ref).strip() if deal_ref else None,
+                    close_deal_id=str(close_deal_id).strip() if close_deal_id else None,
                     reason="awaiting_background_final_sync",
                     notify=False,
                 )

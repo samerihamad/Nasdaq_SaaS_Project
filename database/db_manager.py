@@ -172,6 +172,9 @@ def create_db():
         ('deal_reference', "TEXT"),
         # Capital.com order id (groups split fills in history with dealId).
         ('capital_order_id', "TEXT"),
+        # Capital.com close leg dealId (Two-Leg architecture: open dealId != close dealId).
+        # The NEW dealId returned when closing must be used to lookup P/L in history.
+        ('close_deal_id', "TEXT"),
         # When P&L is summed from multiple history rows (split order), store count for Telegram.
         ('pnl_trade_parts', "INTEGER"),
         # UX: if a position is closed manually on the platform, broker history can lag.

@@ -14,6 +14,7 @@ Runs at the start of every monitoring cycle to fix any discrepancies:
 """
 
 import queue
+import random
 import sqlite3
 import requests
 import re
@@ -52,8 +53,9 @@ PENDING_SYNC = "PENDING_SYNC"
 SYNCED = "SYNCED"
 FINALIZED_NO_PNL = "FINALIZED_NO_PNL"
 
-# Capital can take ~60s to populate realized rpl in history after close — space retries out.
-FINAL_SYNC_BACKOFF_SEC = [15.0, 30.0, 45.0, 60.0, 60.0, 60.0]
+# Capital can take 2-5s to populate realized rpl in history after close.
+# Exponential backoff: initial 2s, then 4s, 8s, 16s, 32s, 60s max with jitter.
+FINAL_SYNC_BACKOFF_SEC = [2.0, 4.0, 8.0, 16.0, 32.0, 60.0]
 
 # Background P&L sync: reconcile enqueues trade_ids; worker runs fetch_closed_deal_final_data
 # (including internal backoff sleeps) off the main / watcher / scanner thread.
@@ -257,7 +259,7 @@ def _broker_fetch_and_finalize_trade(trade_id: int, *, notify: bool = True) -> b
     c = conn.cursor()
     row = c.execute(
         "SELECT chat_id, deal_id, COALESCE(deal_reference,''), COALESCE(capital_order_id,''), "
-        "symbol, direction, entry_price, size, closed_at, COALESCE(sync_status,''), "
+        "COALESCE(close_deal_id,''), symbol, direction, entry_price, size, closed_at, COALESCE(sync_status,''), "
         "COALESCE(risk_outcome_recorded,0) "
         "FROM trades WHERE trade_id=?",
         (tid,),
@@ -270,6 +272,7 @@ def _broker_fetch_and_finalize_trade(trade_id: int, *, notify: bool = True) -> b
         deal_id,
         deal_reference,
         capital_order_id,
+        close_deal_id,
         symbol,
         direction,
         entry_price,
@@ -333,6 +336,7 @@ def _broker_fetch_and_finalize_trade(trade_id: int, *, notify: bool = True) -> b
 
     dr = str(deal_reference or "").strip()
     co = str(capital_order_id or "").strip()
+    cd = str(close_deal_id or "").strip()  # Capital.com close leg dealId (Two-Leg architecture)
     try:
         size_f = float(size) if size is not None else None
     except (TypeError, ValueError):
@@ -348,6 +352,7 @@ def _broker_fetch_and_finalize_trade(trade_id: int, *, notify: bool = True) -> b
         wait_for_realized=True,
         identifiers=[dr] if dr else None,
         capital_order_id=co or None,
+        close_deal_id=cd or None,  # NEW: Pass close leg dealId for history lookup
         max_wall_sec=RECONCILE_FINAL_SYNC_WALL_SEC,
         quiet=True,
         db_trade_id=int(tid),
@@ -741,13 +746,8 @@ def capital_verify_deal_closed_after_close_request(
 
 def _send_pending_close_notice(chat_id, symbol, direction, trade_id):
     try:
-        # Last chance before sending placeholder text: force one quick broker sync.
-        emergency = try_sync_final_for_trade_id(int(trade_id), attempts=1, delay_sec=0.0)
-        if emergency is not None:
-            from core.trade_close_messages import send_bot_automated_close_from_db
-            send_bot_automated_close_from_db(int(trade_id))
-            return
-
+        # DO NOT query history immediately - Capital.com ledger needs 2-5s to update.
+        # Background P&L sync worker will handle final P/L retrieval with exponential backoff.
         from bot.notifier import send_telegram_message
         lang = get_subscriber_lang(chat_id)
         msg = (
@@ -797,6 +797,7 @@ def mark_trade_closed_pending(
     symbol: str,
     direction: str,
     deal_reference: str | None = None,
+    close_deal_id: str | None = None,  # NEW: Capital.com close leg dealId (Two-Leg architecture)
     reason: str = "awaiting_broker_history",
     notify: bool = True,
     provisional_pnl: float | None = None,
@@ -822,7 +823,9 @@ def mark_trade_closed_pending(
         c.execute(
             "UPDATE trades SET status='CLOSED', closed_at=?, sync_status=?, "
             "close_sync_last_error=?, close_reason=COALESCE(close_reason, ?), "
-            "deal_reference=COALESCE(NULLIF(?,''), deal_reference), close_sync_notified=1 "
+            "deal_reference=COALESCE(NULLIF(?,''), deal_reference), "
+            "close_deal_id=COALESCE(NULLIF(?,''), close_deal_id), "  # Store the NEW close leg dealId
+            "close_sync_notified=1 "
             "WHERE trade_id=? AND status='OPEN'",
             (
                 _now_utc().isoformat(),
@@ -830,6 +833,7 @@ def mark_trade_closed_pending(
                 str(reason),
                 "pending_final_sync",
                 str(deal_reference or "").strip(),
+                str(close_deal_id or "").strip(),  # NEW: Save close leg dealId for history lookup
                 tid,
             ),
         )
@@ -859,7 +863,9 @@ def mark_trade_closed_pending(
     c.execute(
         "UPDATE trades SET status='CLOSED', closed_at=?, sync_status=?, "
         "close_sync_last_error=?, close_reason=COALESCE(close_reason, ?), "
-        "deal_reference=COALESCE(NULLIF(?,''), deal_reference), close_sync_notified=1, "
+        "deal_reference=COALESCE(NULLIF(?,''), deal_reference), "
+        "close_deal_id=COALESCE(NULLIF(?,''), close_deal_id), "  # Store close leg dealId
+        "close_sync_notified=1, "
         "pnl=?, actual_pnl=?, risk_outcome_recorded=? "
         "WHERE trade_id=? AND status='OPEN'",
         (
@@ -868,6 +874,7 @@ def mark_trade_closed_pending(
             str(reason),
             "pending_final_sync",
             str(deal_reference or "").strip(),
+            str(close_deal_id or "").strip(),  # NEW: Save close leg dealId
             float(eff_pnl),
             float(eff_pnl),
             int(risk_flag),
@@ -914,6 +921,7 @@ def fetch_closed_deal_final_data(
     wait_for_realized: bool = True,
     identifiers: list[str] | None = None,
     capital_order_id: str | None = None,
+    close_deal_id: str | None = None,  # NEW: Capital.com close leg dealId (Two-Leg architecture)
     lookback_max: int = 2000,
     max_wall_sec: float | None = None,
     quiet: bool = True,
@@ -1003,6 +1011,21 @@ def fetch_closed_deal_final_data(
                 gross = _parse_float(tx.get(k))
                 if gross is not None:
                     return float(gross) - _parse_commission_total(tx)
+        # Capital.com Two-Leg Architecture Fix:
+        # When closing a trade, Capital creates a NEW dealId for the closing leg.
+        # The P/L is stored in the 'size' field as a string (e.g., "size": "-2.24" means $2.24 loss).
+        # This is a Capital.com quirk - 'size' contains realized P/L on close transactions.
+        if "size" in tx and tx.get("size") is not None:
+            size_val = tx.get("size")
+            # Only treat as P/L if this looks like a close transaction (has dealId but no position size context)
+            if isinstance(size_val, str) and tx.get("dealId") is not None:
+                try:
+                    pnl_from_size = float(size_val)
+                    # Validate: P/L should be a reasonable currency amount (not a share count like 100.0)
+                    if abs(pnl_from_size) < 1000000:  # Sanity check
+                        return pnl_from_size
+                except (TypeError, ValueError):
+                    pass
         return None
 
     def _parse_exit_price(tx: dict) -> float | None:
@@ -1138,7 +1161,13 @@ def fetch_closed_deal_final_data(
     if not wait_for_realized:
         wall = min(wall, 45.0)
 
-    ids = [str(deal_id)]
+    # Capital.com Two-Leg Architecture Fix:
+    # The close_deal_id (NEW dealId from close leg) takes priority for history lookup,
+    # as P/L is stored under the closing leg's dealId, NOT the original open dealId.
+    ids = []
+    if close_deal_id and str(close_deal_id).strip():
+        ids.append(str(close_deal_id).strip())  # PRIORITY 1: Close leg dealId (has the P/L)
+    ids.append(str(deal_id))  # PRIORITY 2: Original open dealId (fallback)
     if capital_order_id and str(capital_order_id).strip():
         ids.append(str(capital_order_id).strip())
     if identifiers:
@@ -1168,9 +1197,14 @@ def fetch_closed_deal_final_data(
         return False
 
     def _sleep_for_attempt(attempt_idx: int) -> float:
+        """Calculate sleep duration with exponential backoff and jitter to prevent thundering herd."""
         if attempt_idx < len(FINAL_SYNC_BACKOFF_SEC):
-            return float(FINAL_SYNC_BACKOFF_SEC[attempt_idx])
-        return 60.0
+            base = float(FINAL_SYNC_BACKOFF_SEC[attempt_idx])
+        else:
+            base = 60.0
+        # Add 0-20% jitter to prevent multiple trades from hitting API simultaneously
+        jitter = base * 0.2 * random.random()
+        return base + jitter
 
     def _tx_candidate_strings(tx: dict) -> list[str]:
         out: list[str] = []
@@ -1339,6 +1373,15 @@ def fetch_closed_deal_final_data(
     t0 = time.monotonic()
     attempt_idx = 0
     last_issue = ""
+
+    # Initial delay: give Capital.com ledger 2-3.5 seconds to update before first query.
+    # Jitter (0-1.5s) prevents "delayed thundering herd" when multiple trades close simultaneously.
+    INITIAL_LEDGER_DELAY_BASE = 2.0
+    INITIAL_LEDGER_JITTER_MAX = 1.5
+    initial_delay_with_jitter = INITIAL_LEDGER_DELAY_BASE + (INITIAL_LEDGER_JITTER_MAX * random.random())
+    initial_remaining = wall - (time.monotonic() - t0)
+    if initial_remaining > initial_delay_with_jitter:
+        time.sleep(initial_delay_with_jitter)
 
     while True:
         elapsed = time.monotonic() - t0
@@ -1553,13 +1596,13 @@ def try_sync_final_for_trade_id(
     c = conn.cursor()
     row = c.execute(
         "SELECT chat_id, deal_id, COALESCE(deal_reference,''), COALESCE(capital_order_id,''), "
-        "symbol, direction, entry_price, size, closed_at FROM trades WHERE trade_id=?",
+        "COALESCE(close_deal_id,''), symbol, direction, entry_price, size, closed_at FROM trades WHERE trade_id=?",
         (tid,),
     ).fetchone()
     if not row:
         conn.close()
         return None
-    chat_id, deal_id, deal_reference, capital_order_id, symbol, direction, entry_price, size, closed_at = row
+    chat_id, deal_id, deal_reference, capital_order_id, close_deal_id, symbol, direction, entry_price, size, closed_at = row
     if not deal_id:
         conn.close()
         return None
@@ -1620,6 +1663,7 @@ def try_sync_final_for_trade_id(
 
     dr = str(deal_reference or "").strip()
     co = str(capital_order_id or "").strip()
+    cd = str(close_deal_id or "").strip()  # Capital.com close leg dealId (Two-Leg architecture)
     try:
         size_f = float(size) if size is not None else None
     except (TypeError, ValueError):
@@ -1635,6 +1679,7 @@ def try_sync_final_for_trade_id(
         wait_for_realized=wait_realized,
         identifiers=[dr] if dr else None,
         capital_order_id=co or None,
+        close_deal_id=cd or None,  # NEW: Pass close leg dealId for history lookup
         max_wall_sec=wall,
         quiet=quiet,
         db_trade_id=int(tid),
