@@ -1,14 +1,21 @@
 """
 Decision Agent — NATB v2.0 AI Agent Layer
 
-Phase 3-A: Active Gating — Multi-Agent Committee with Trade Blocking
+Phase 5-A: Strict Consensus — 4-Expert Committee with Sentiment Veto
 
-This module implements a Multi-Agent "Committee" structure with 3 Expert Personas:
+This module implements a Multi-Agent "Committee" structure with 4 Expert Personas:
   1. Technical Analyst: RSI, ADX, Bollinger Bands alignment
   2. Trend Strategist: EMA 20/50/200 and price action (Higher Highs/Lower Lows)
   3. Memory Historian: Symbol-specific success rates from agent_memory
+  4. Sentiment Analyst: Real-time news sentiment via FMP/NewsAPI
 
 The Lead Coordinator synthesizes expert reports into a final Committee Consensus.
+
+Phase 5-A Strict Consensus:
+  - Requires 3 out of 4 experts to approve (raised from 2/4)
+  - Sentiment Veto: HIGH_NEGATIVE sentiment forces REJECT
+  - Weighted confidence: Sentiment 30%, Trend 30%, Technical 20%, Memory 20%
+  - Executive Summary: Human-readable reasoning synthesis
 
 Architecture:
   - Committee of specialized agents debate the signal
@@ -77,7 +84,8 @@ SHADOW_MODE = False
 EMERGENCY_BYPASS_ON_ERROR = True
 
 # AI Gate thresholds for the committee's decision logic
-COMMITTEE_APPROVE_THRESHOLD = 2  # At least 2 experts must approve
+# Phase 5-A: Strict Consensus — now requires 3 out of 4 experts to approve
+COMMITTEE_APPROVE_THRESHOLD = 3  # At least 3 experts must approve (strict consensus)
 CONFIDENCE_THRESHOLD = 55.0  # Minimum confidence for an expert to approve
 
 
@@ -111,18 +119,21 @@ class CommitteeConsensus:
     """
     Final synthesized decision from the Multi-Agent Committee.
     
-    Phase 4-A: Added Sentiment Analyst to the committee.
+    Phase 5-A: Added vote_count and executive_summary for strict consensus.
     """
     symbol: str
     direction: str
     technical_analyst_report: ExpertReport
     trend_strategist_report: ExpertReport
     memory_historian_report: ExpertReport
-    sentiment_analyst_report: ExpertReport  # Phase 4-A: News sentiment
+    sentiment_analyst_report: ExpertReport
     final_verdict: str  # "APPROVE", "REJECT", "UNCERTAIN"
     consensus_confidence: float
     debate_summary: str
     shadow_mode: bool = True
+    # Phase 5-A: Strict consensus metadata
+    vote_count: dict | None = None  # {"approve": X, "reject": Y, "uncertain": Z}
+    executive_summary: str = ""  # One-sentence human-readable summary
     
     def to_dict(self) -> dict:
         return {
@@ -131,21 +142,27 @@ class CommitteeConsensus:
             "technical_analyst": self.technical_analyst_report.to_dict(),
             "trend_strategist": self.trend_strategist_report.to_dict(),
             "memory_historian": self.memory_historian_report.to_dict(),
-            "sentiment_analyst": self.sentiment_analyst_report.to_dict(),  # Phase 4-A
+            "sentiment_analyst": self.sentiment_analyst_report.to_dict(),
             "final_verdict": self.final_verdict,
             "consensus_confidence": self.consensus_confidence,
             "debate_summary": self.debate_summary,
             "shadow_mode": self.shadow_mode,
+            "vote_count": self.vote_count,  # Phase 5-A
+            "executive_summary": self.executive_summary,  # Phase 5-A
         }
     
-    def to_telegram_format(self) -> str:
-        """Format the committee consensus for Telegram notification."""
+    def to_telegram_format(self, blocked_notification: bool = False) -> str:
+        """
+        Format the committee consensus for Telegram notification.
+        
+        Phase 5-A: Now includes executive summary and vote count for strict consensus.
+        """
         emoji_verdict = "✅" if self.final_verdict == "APPROVE" else ("❌" if self.final_verdict == "REJECT" else "⚠️")
         
         ta = self.technical_analyst_report
         ts = self.trend_strategist_report
         mh = self.memory_historian_report
-        sa = self.sentiment_analyst_report  # Phase 4-A
+        sa = self.sentiment_analyst_report
         
         # Emoji mapping for stances
         stance_emoji = {
@@ -161,16 +178,27 @@ class CommitteeConsensus:
             headline_preview = sa.key_points[0][9:][:40]  # Remove "Headline: " prefix, limit to 40 chars
             sentiment_line += f"\n   │   └─ 💬 {headline_preview}..."
         
+        # Phase 5-A: Build vote count display
+        vote_display = ""
+        if self.vote_count:
+            total_votes = self.vote_count.get("approve", 0) + self.vote_count.get("reject", 0) + self.vote_count.get("uncertain", 0)
+            vote_display = f"🗳️ Consensus: {self.vote_count.get('approve', 0)}/{total_votes} Experts Agree\n   ├─ "
+        
+        # Phase 5-A: Executive summary (prominent display)
+        exec_summary = self.executive_summary or "No summary available"
+        
         mode_str = "SHADOW MODE" if self.shadow_mode else "ACTIVE GATING"
         
+        # Phase 5-A: Enhanced format with executive summary and vote count
         return (
             f"🤖 COMMITTEE DECISION [{mode_str}]:\n"
-            f"   ├─ 📊 Technical Analyst: {stance_emoji.get(ta.stance, '⚪')} {ta.stance} ({ta.confidence:.0f}%)\n"
+            f"   ├─ 📝 Executive Summary: {exec_summary}\n"  # Phase 5-A: Prominent summary
+            f"   ├─ {vote_display}📊 Technical Analyst: {stance_emoji.get(ta.stance, '⚪')} {ta.stance} ({ta.confidence:.0f}%)\n"
             f"   ├─ 📈 Trend Strategist: {stance_emoji.get(ts.stance, '⚪')} {ts.stance} ({ts.confidence:.0f}%)\n"
             f"   ├─ 📚 Memory Historian: {stance_emoji.get(mh.stance, '⚪')} {mh.stance}\n"
-            f"   ├─ {sentiment_line}\n"  # Phase 4-A: Sentiment line with headline
+            f"   ├─ {sentiment_line}\n"
             f"   ├─ ⚖️ Final Verdict: {emoji_verdict} {self.final_verdict}\n"
-            f"   └─ 💡 Summary: {self.debate_summary}"
+            f"   └─ 💡 Details: {self.debate_summary}"
         )
 
 
@@ -1395,22 +1423,23 @@ class DecisionAgent:
         ta_report: ExpertReport,
         ts_report: ExpertReport,
         mh_report: ExpertReport,
-        sa_report: ExpertReport,  # Phase 4-A: Sentiment Analyst
+        sa_report: ExpertReport,
     ) -> CommitteeConsensus:
         """
         Synthesize expert reports into a final Committee Consensus.
         
-        Phase 4-A: Now includes 4 experts (added Sentiment Analyst).
+        Phase 5-A: Strict Consensus — requires 3 out of 4 experts to approve.
         
         Voting Logic:
-        - APPROVE: At least 2 experts approve with confidence >= threshold
-        - REJECT: At least 2 experts reject or counter-trend (or HIGH_NEGATIVE sentiment)
-        - UNCERTAIN: Mixed signals or insufficient confidence
+        - APPROVE: At least 3 experts approve with confidence >= threshold
+        - REJECT: Sentiment Veto (HIGH_NEGATIVE) OR 2+ experts reject
+        - UNCERTAIN: Only 2 experts agree (insufficient for strict consensus)
         """
         
-        # Count approvals
+        # Count approvals and rejections
         approvals = 0
         rejections = 0
+        uncertain = 0
         
         # Technical Analyst vote
         if ta_report.stance in ["BULLISH", "BEARISH"] and ta_report.confidence >= CONFIDENCE_THRESHOLD:
@@ -1419,91 +1448,118 @@ class DecisionAgent:
                 approvals += 1
             else:
                 rejections += 1
+        else:
+            uncertain += 1
         
         # Trend Strategist vote
         if ts_report.stance == "ALIGNED" and ts_report.confidence >= CONFIDENCE_THRESHOLD:
             approvals += 1
         elif ts_report.stance == "COUNTER_TREND":
             rejections += 1
+        else:
+            uncertain += 1
         
         # Memory Historian vote
         if mh_report.stance == "POSITIVE" and mh_report.confidence >= CONFIDENCE_THRESHOLD:
             approvals += 1
         elif mh_report.stance == "NEGATIVE":
             rejections += 1
+        else:
+            uncertain += 1
         
-        # Phase 4-A: Sentiment Analyst vote
-        # HIGH_NEGATIVE sentiment can single-handedly force REJECT
-        if sa_report.stance in ["HIGH_POSITIVE", "POSITIVE"] and sa_report.confidence >= CONFIDENCE_THRESHOLD:
-            approvals += 1
-        elif sa_report.stance in ["NEGATIVE", "HIGH_NEGATIVE"]:
+        # Phase 5-A: Sentiment Analyst vote with STRICT VETO power
+        sentiment_veto = False
+        if sa_report.stance == "HIGH_NEGATIVE":
+            # SENTIMENT VETO: HIGH_NEGATIVE sentiment forces REJECT regardless of other agents
+            rejections += 2  # Strong veto weight
+            sentiment_veto = True
+        elif sa_report.stance in ["NEGATIVE"]:
             rejections += 1
-            # HIGH_NEGATIVE is a strong signal - count it extra
-            if sa_report.stance == "HIGH_NEGATIVE":
-                rejections += 1  # Double weight for very bad news
+        elif sa_report.stance in ["HIGH_POSITIVE", "POSITIVE"] and sa_report.confidence >= CONFIDENCE_THRESHOLD:
+            approvals += 1
+        else:
+            uncertain += 1
         
-        # Determine final verdict
-        if approvals >= COMMITTEE_APPROVE_THRESHOLD:
-            verdict = "APPROVE"
-            consensus_conf = (ta_report.confidence + ts_report.confidence + mh_report.confidence + sa_report.confidence) / 4
-        elif rejections >= COMMITTEE_APPROVE_THRESHOLD:
+        # Phase 5-A: Strict consensus determination
+        vote_count = {"approve": approvals, "reject": rejections, "uncertain": uncertain}
+        
+        # Determine final verdict with strict 3/4 threshold
+        if sentiment_veto:
+            # Sentiment Veto overrides everything
             verdict = "REJECT"
-            avg_conf = (ta_report.confidence + ts_report.confidence + mh_report.confidence + sa_report.confidence) / 4
+            consensus_conf = 25.0  # Low confidence due to negative sentiment
+        elif approvals >= COMMITTEE_APPROVE_THRESHOLD:
+            # Strict consensus: 3+ experts must approve
+            verdict = "APPROVE"
+            # Phase 5-A: Weighted confidence calculation
+            # Sentiment 30%, Trend 30%, Technical 20%, Memory 20%
+            consensus_conf = (
+                sa_report.confidence * 0.30 +
+                ts_report.confidence * 0.30 +
+                ta_report.confidence * 0.20 +
+                mh_report.confidence * 0.20
+            )
+        elif rejections >= 2:
+            # Multiple rejections
+            verdict = "REJECT"
+            avg_conf = (
+                sa_report.confidence * 0.30 +
+                ts_report.confidence * 0.30 +
+                ta_report.confidence * 0.20 +
+                mh_report.confidence * 0.20
+            )
             consensus_conf = max(30, 100 - avg_conf)
         else:
+            # Phase 5-A: Only 2 experts agree = UNCERTAIN (acts as REJECT in Active Gating)
             verdict = "UNCERTAIN"
             consensus_conf = 50.0
         
-        # Generate debate summary
+        # Generate detailed debate summary (for internal use)
         summary_parts = []
         
-        # Technical summary
         if ta_report.stance in ["BULLISH", "BEARISH"]:
-            summary_parts.append(
-                f"Technical indicators show {ta_report.stance.lower()} bias ({ta_report.confidence:.0f}% confidence)"
-            )
+            summary_parts.append(f"Technical: {ta_report.stance} ({ta_report.confidence:.0f}%)")
         else:
-            summary_parts.append("Technical indicators are neutral")
+            summary_parts.append("Technical: Neutral")
         
-        # Trend summary
         if ts_report.stance == "ALIGNED":
-            summary_parts.append(f"Trend is aligned with signal ({ts_report.confidence:.0f}% confidence)")
+            summary_parts.append(f"Trend: Aligned ({ts_report.confidence:.0f}%)")
         elif ts_report.stance == "COUNTER_TREND":
-            summary_parts.append("Trend contradicts signal direction — caution advised")
+            summary_parts.append("Trend: Counter-trend")
         else:
-            summary_parts.append("Trend direction is unclear")
+            summary_parts.append("Trend: Unclear")
         
-        # Memory summary
         if mh_report.stance == "POSITIVE":
-            summary_parts.append("Historical memory supports this setup")
+            summary_parts.append("Memory: Positive")
         elif mh_report.stance == "NEGATIVE":
-            summary_parts.append("Historical memory warns against this setup")
-        elif mh_report.stance == "NO_DATA":
-            summary_parts.append("Insufficient historical data for this symbol")
+            summary_parts.append("Memory: Negative")
+        else:
+            summary_parts.append("Memory: No data")
         
-        # Phase 4-A: Sentiment summary
         if sa_report.stance == "HIGH_POSITIVE":
-            summary_parts.append("Very positive news sentiment supports trade")
+            summary_parts.append("Sentiment: Very Positive")
         elif sa_report.stance == "POSITIVE":
-            summary_parts.append("News sentiment is favorable")
+            summary_parts.append("Sentiment: Positive")
         elif sa_report.stance == "NEGATIVE":
-            summary_parts.append("Negative news sentiment detected")
+            summary_parts.append("Sentiment: Negative")
         elif sa_report.stance == "HIGH_NEGATIVE":
-            summary_parts.append("⚠️ Very negative news - high caution advised")
-        elif sa_report.stance == "NO_DATA":
-            summary_parts.append("No recent news data available")
-        
-        # Regime context
-        if ai_regime == "VOLATILE":
-            summary_parts.append("High volatility regime — wider stops recommended")
-        elif ai_regime == "TRENDING":
-            summary_parts.append("Trending market — momentum approach favorable")
-        
-        # Shadow mode disclaimer
-        mode_tag = "SHADOW MODE" if self.shadow_mode else "ACTIVE GATING"
-        summary_parts.append(f"[{mode_tag}] Committee opinion is advisory only")
+            summary_parts.append("Sentiment: Very Negative (VETO)")
+        else:
+            summary_parts.append("Sentiment: Neutral/No data")
         
         debate_summary = "; ".join(summary_parts)
+        
+        # Phase 5-A: Generate executive summary
+        executive_summary = self._generate_executive_summary(
+            verdict=verdict,
+            approvals=approvals,
+            rejections=rejections,
+            sentiment_veto=sentiment_veto,
+            ta_report=ta_report,
+            ts_report=ts_report,
+            mh_report=mh_report,
+            sa_report=sa_report,
+        )
         
         return CommitteeConsensus(
             symbol=symbol,
@@ -1511,12 +1567,104 @@ class DecisionAgent:
             technical_analyst_report=ta_report,
             trend_strategist_report=ts_report,
             memory_historian_report=mh_report,
-            sentiment_analyst_report=sa_report,  # Phase 4-A
+            sentiment_analyst_report=sa_report,
             final_verdict=verdict,
-            consensus_confidence=consensus_conf,
+            consensus_confidence=round(consensus_conf, 1),
             debate_summary=debate_summary,
             shadow_mode=self.shadow_mode,
+            vote_count=vote_count,  # Phase 5-A
+            executive_summary=executive_summary,  # Phase 5-A
         )
+    
+    def _generate_executive_summary(
+        self,
+        verdict: str,
+        approvals: int,
+        rejections: int,
+        sentiment_veto: bool,
+        ta_report: ExpertReport,
+        ts_report: ExpertReport,
+        mh_report: ExpertReport,
+        sa_report: ExpertReport,
+    ) -> str:
+        """
+        Generate a one-sentence human-like executive summary of the committee debate.
+        
+        Phase 5-A: Provides clear reasoning synthesis for Telegram notifications.
+        
+        Examples:
+        - "Technical and News are strongly bullish, outweighing the neutral trend."
+        - "Trade blocked: News sentiment is catastrophic despite strong technical indicators."
+        - "3 out of 4 experts agree — strong consensus across all dimensions."
+        """
+        
+        # Build list of supportive and opposing factors
+        supportive = []
+        opposing = []
+        
+        # Technical analysis
+        if ta_report.stance in ["BULLISH", "BEARISH"] and ta_report.confidence >= CONFIDENCE_THRESHOLD:
+            supportive.append("technical indicators")
+        elif ta_report.stance in ["BULLISH", "BEARISH"]:
+            supportive.append("moderate technical signals")
+        
+        # Trend alignment
+        if ts_report.stance == "ALIGNED" and ts_report.confidence >= CONFIDENCE_THRESHOLD:
+            supportive.append("trend alignment")
+        elif ts_report.stance == "COUNTER_TREND":
+            opposing.append("counter-trend")
+        
+        # Memory
+        if mh_report.stance == "POSITIVE":
+            supportive.append("historical success")
+        elif mh_report.stance == "NEGATIVE":
+            opposing.append("poor historical performance")
+        
+        # Sentiment (strongest signal)
+        if sa_report.stance == "HIGH_POSITIVE":
+            supportive.append("very positive news sentiment")
+        elif sa_report.stance == "POSITIVE":
+            supportive.append("positive news sentiment")
+        elif sa_report.stance == "NEGATIVE":
+            opposing.append("negative news sentiment")
+        elif sa_report.stance == "HIGH_NEGATIVE":
+            opposing.append("catastrophic news sentiment")
+        
+        # Generate summary based on verdict and vote distribution
+        if verdict == "APPROVE":
+            if approvals == 4:
+                if supportive:
+                    return f"Unanimous approval — {', '.join(supportive)} all support this trade."
+                return "All 4 experts agree — strong consensus for this trade."
+            elif approvals == 3:
+                if opposing:
+                    return f"Strong consensus (3/4) — {', '.join(supportive)} outweigh {opposing[0]}."
+                return "3 out of 4 experts agree — solid consensus across most dimensions."
+            else:
+                return f"Majority approval ({approvals}/4) — sufficient consensus to proceed."
+                
+        elif verdict == "REJECT":
+            if sentiment_veto:
+                if supportive:
+                    return f"Trade blocked: {opposing[0]} triggers veto despite {', '.join(supportive)}."
+                return f"Trade blocked: {opposing[0]} triggers automatic rejection."
+            elif rejections >= 3:
+                if opposing:
+                    return f"Strong rejection ({rejections}/4) — {', '.join(opposing)} block this trade."
+                return f"Strong rejection consensus ({rejections}/4 experts oppose)."
+            else:
+                if opposing:
+                    return f"Insufficient consensus — {opposing[0]} prevents approval."
+                return f"Trade blocked: insufficient consensus ({approvals}/4 approve)."
+                
+        else:  # UNCERTAIN
+            if supportive and opposing:
+                return f"Mixed signals — {supportive[0]} vs {opposing[0]}. No clear consensus."
+            elif supportive:
+                return f"Partial support ({approvals}/4) — need stronger alignment to proceed."
+            elif opposing:
+                return f"Weak consensus ({approvals}/4) — {opposing[0]} creates uncertainty."
+            return f"Insufficient consensus ({approvals}/4 approve) — staying cautious."
     
     def notify_opinion(self, opinion: AgentOpinion, chat_id: str | None = None) -> None:
         """
@@ -1611,14 +1759,15 @@ def analyze_signal_shadow(
 if __name__ == "__main__":
     # Test the Multi-Agent Committee DecisionAgent
     print("=" * 60)
-    print("[TEST] Multi-Agent Committee DecisionAgent (Phase 4-A)")
+    print("[TEST] Multi-Agent Committee DecisionAgent (Phase 5-A)")
     print("=" * 60)
     
     agent = DecisionAgent(shadow_mode=True)
     print(f"✓ Shadow Mode: {agent.shadow_mode}")
     print(f"✓ Model Version: {MODEL_VERSION}")
     print(f"✓ Expert Agents: TechnicalAnalyst, TrendStrategist, MemoryHistorian, SentimentAnalyst")
-    print(f"✓ Committee Threshold: {COMMITTEE_APPROVE_THRESHOLD} votes required")
+    print(f"✓ Strict Consensus: {COMMITTEE_APPROVE_THRESHOLD}/4 votes required")
+    print(f"✓ Sentiment Veto: HIGH_NEGATIVE forces REJECT")
     print(f"✓ API Integration: NEWS_API_KEY={bool(NEWS_API_KEY)}, FMP_API_KEY={bool(FMP_API_KEY)}")
     
     print("\n[TEST] Ready for integration")
