@@ -57,6 +57,9 @@ from utils.success_tracker import (
 from bot.notifier import send_telegram_message
 from config import ADMIN_CHAT_ID
 
+# Initialize logger BEFORE the DecisionAgent import block
+log = logging.getLogger(__name__)
+
 # Phase 3-A: Decision Agent Active Gating
 # The Multi-Agent Committee can now BLOCK trades (verdict = REJECT)
 try:
@@ -66,8 +69,6 @@ try:
 except Exception as _decision_agent_err:
     _DECISION_AGENT_AVAILABLE = False
     log.warning(f"[DecisionAgent] Import failed: {_decision_agent_err}. Agent will not be available.")
-
-log = logging.getLogger(__name__)
 ACTIVE_MIN_CONFIDENCE = float(SIGNAL_MIN_CONFIDENCE if SIGNAL_MIN_CONFIDENCE is not None else FAST_MIN_CONFIDENCE)
 
 # Dynamic gate (15m ADX/RSI): bonus / choppy targets; neutral uses FAST_MIN_CONFIDENCE from .env.
