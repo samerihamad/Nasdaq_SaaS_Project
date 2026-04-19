@@ -272,6 +272,9 @@ NEWS_API_KEY         = os.getenv("NEWS_API_KEY", "")
 NEWS_LOOKBACK_HOURS  = 12      # how far back to fetch headlines per ticker
 NEWS_QUALITY_SCORE   = 15      # bonus score when a high-quality news event exists
 
+# ── Telegram Admin Configuration ───────────────────────────────────────────────
+ADMIN_CHAT_ID        = os.getenv("ADMIN_CHAT_ID", "")  # For admin notifications
+
 # ── Earnings Calendar Provider (scanner filters) ──────────────────────────────
 # Primary: NASDAQ calendar endpoint (no key).
 # Fallback: FinancialModelingPrep if FMP_API_KEY is provided.

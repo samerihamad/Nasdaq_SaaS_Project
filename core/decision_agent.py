@@ -32,6 +32,9 @@ import pickle
 from typing import Any
 from dataclasses import dataclass
 
+import requests
+from datetime import datetime, timedelta, timezone
+
 import numpy as np
 import pandas as pd
 
@@ -50,7 +53,7 @@ from utils.ai_model import (
     MODEL_VERSION,
 )
 from bot.notifier import send_telegram_message
-from config import ADMIN_CHAT_ID
+from config import ADMIN_CHAT_ID, NEWS_API_KEY, FMP_API_KEY
 
 # Phase 1-B: Import Agent Memory for contextual reasoning
 try:
@@ -105,12 +108,17 @@ class ExpertReport:
 
 @dataclass
 class CommitteeConsensus:
-    """Final synthesized decision from the Multi-Agent Committee."""
+    """
+    Final synthesized decision from the Multi-Agent Committee.
+    
+    Phase 4-A: Added Sentiment Analyst to the committee.
+    """
     symbol: str
     direction: str
     technical_analyst_report: ExpertReport
     trend_strategist_report: ExpertReport
     memory_historian_report: ExpertReport
+    sentiment_analyst_report: ExpertReport  # Phase 4-A: News sentiment
     final_verdict: str  # "APPROVE", "REJECT", "UNCERTAIN"
     consensus_confidence: float
     debate_summary: str
@@ -123,6 +131,7 @@ class CommitteeConsensus:
             "technical_analyst": self.technical_analyst_report.to_dict(),
             "trend_strategist": self.trend_strategist_report.to_dict(),
             "memory_historian": self.memory_historian_report.to_dict(),
+            "sentiment_analyst": self.sentiment_analyst_report.to_dict(),  # Phase 4-A
             "final_verdict": self.final_verdict,
             "consensus_confidence": self.consensus_confidence,
             "debate_summary": self.debate_summary,
@@ -136,19 +145,30 @@ class CommitteeConsensus:
         ta = self.technical_analyst_report
         ts = self.trend_strategist_report
         mh = self.memory_historian_report
+        sa = self.sentiment_analyst_report  # Phase 4-A
         
         # Emoji mapping for stances
         stance_emoji = {
             "BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "⚪",
             "ALIGNED": "✅", "COUNTER_TREND": "⚠️", "POSITIVE": "📈",
             "NEGATIVE": "📉", "NO_DATA": "❓",
+            "HIGH_POSITIVE": "🚀", "HIGH_NEGATIVE": "🔻",
         }
         
+        # Build sentiment line with headline preview if available
+        sentiment_line = f"📰 Sentiment Analyst: {stance_emoji.get(sa.stance, '⚪')} {sa.stance}"
+        if sa.key_points and sa.key_points[0].startswith("Headline:"):
+            headline_preview = sa.key_points[0][9:][:40]  # Remove "Headline: " prefix, limit to 40 chars
+            sentiment_line += f"\n   │   └─ 💬 {headline_preview}..."
+        
+        mode_str = "SHADOW MODE" if self.shadow_mode else "ACTIVE GATING"
+        
         return (
-            f"🤖 COMMITTEE DECISION [SHADOW MODE]:\n"
+            f"🤖 COMMITTEE DECISION [{mode_str}]:\n"
             f"   ├─ 📊 Technical Analyst: {stance_emoji.get(ta.stance, '⚪')} {ta.stance} ({ta.confidence:.0f}%)\n"
             f"   ├─ 📈 Trend Strategist: {stance_emoji.get(ts.stance, '⚪')} {ts.stance} ({ts.confidence:.0f}%)\n"
             f"   ├─ 📚 Memory Historian: {stance_emoji.get(mh.stance, '⚪')} {mh.stance}\n"
+            f"   ├─ {sentiment_line}\n"  # Phase 4-A: Sentiment line with headline
             f"   ├─ ⚖️ Final Verdict: {emoji_verdict} {self.final_verdict}\n"
             f"   └─ 💡 Summary: {self.debate_summary}"
         )
@@ -654,6 +674,352 @@ class MemoryHistorian:
         )
 
 
+class SentimentAnalyst:
+    """
+    Expert Persona 4: Sentiment Analyst (Phase 4-A)
+    
+    Analyzes real-time news sentiment using:
+      - NewsAPI (general financial news)
+      - FMP (Financial Modeling Prep) News & Press Releases
+    
+    Stance Logic:
+      - HIGH_POSITIVE: Strong bullish sentiment -> Boosts committee approval
+      - POSITIVE: Moderate bullish sentiment
+      - NEUTRAL: No significant news or mixed sentiment
+      - NEGATIVE: Bearish sentiment detected -> May force REJECT
+      - HIGH_NEGATIVE: Strong bearish news -> Forces REJECT
+      - NO_DATA: API unavailable or timeout
+    
+    Safety:
+      - 3-second timeout on all API calls
+      - Defaults to NEUTRAL on any failure
+      - Respects rate limits with minimal calls
+    """
+    
+    # Timeout for API calls (seconds)
+    API_TIMEOUT = 3
+    
+    # Lookback window for news (hours)
+    NEWS_LOOKBACK_HOURS = 24
+    
+    # Positive/Bullish keywords (case-insensitive)
+    BULLISH_KEYWORDS = [
+        "upgrade", "beat", "outperform", "strong buy", "buy", "bullish",
+        "growth", "surge", "rally", "breakthrough", "partnership", "deal",
+        "expansion", "record revenue", "profit", "exceeds expectations",
+        "positive", "optimistic", "momentum", "uptrend", "support"
+    ]
+    
+    # Negative/Bearish keywords (case-insensitive)
+    BEARISH_KEYWORDS = [
+        "downgrade", "miss", "underperform", "sell", "bearish", "bear",
+        "decline", "drop", "plunge", "crash", "layoff", "layoffs",
+        "investigation", "lawsuit", "fine", "penalty", "recall",
+        "bankruptcy", "debt", "loss", "losses", "negative", "pessimistic",
+        "resistance", "downtrend", "warning", "alert", "concern"
+    ]
+    
+    def __init__(self):
+        self.name = "Sentiment Analyst"
+        self._cache = {}  # Simple cache: {symbol: (timestamp, report)}
+        self._cache_ttl_seconds = 300  # 5-minute cache
+    
+    def analyze(self, symbol: str, direction: str) -> ExpertReport:
+        """
+        Analyze news sentiment for the given symbol.
+        
+        Args:
+            symbol: Stock symbol
+            direction: "BUY" or "SELL" (signal direction)
+        
+        Returns:
+            ExpertReport with sentiment stance and confidence
+        """
+        key_points = []
+        
+        # Check cache first
+        cached = self._get_cached(symbol)
+        if cached:
+            return cached
+        
+        # Check if APIs are available
+        has_news_api = bool(NEWS_API_KEY)
+        has_fmp_api = bool(FMP_API_KEY)
+        
+        if not has_news_api and not has_fmp_api:
+            return ExpertReport(
+                expert_name=self.name,
+                stance="NO_DATA",
+                confidence=50.0,
+                key_points=["No API keys configured for sentiment analysis"],
+            )
+        
+        try:
+            # Aggregate sentiment from available sources
+            all_headlines = []
+            sentiment_scores = []
+            sources_used = []
+            
+            # Try FMP News API (more reliable for financial data)
+            if has_fmp_api:
+                fmp_headlines, fmp_score = self._fetch_fmp_news(symbol)
+                if fmp_headlines:
+                    all_headlines.extend(fmp_headlines)
+                    sentiment_scores.append(fmp_score)
+                    sources_used.append("FMP")
+                    key_points.append(f"FMP: {len(fmp_headlines)} articles")
+            
+            # Try NewsAPI as supplement
+            if has_news_api:
+                newsapi_headlines, newsapi_score = self._fetch_newsapi(symbol)
+                if newsapi_headlines:
+                    all_headlines.extend(newsapi_headlines)
+                    sentiment_scores.append(newsapi_score)
+                    sources_used.append("NewsAPI")
+                    key_points.append(f"NewsAPI: {len(newsapi_headlines)} articles")
+            
+            # Calculate aggregate sentiment
+            if sentiment_scores:
+                avg_sentiment = sum(sentiment_scores) / len(sentiment_scores)
+                stance, confidence = self._sentiment_to_stance(avg_sentiment, direction)
+                
+                # Add representative headline to key points
+                if all_headlines:
+                    most_relevant = self._pick_most_relevant_headline(all_headlines, direction)
+                    if most_relevant:
+                        key_points.insert(0, f"Headline: {most_relevant[:60]}...")
+                
+                # Create report
+                report = ExpertReport(
+                    expert_name=self.name,
+                    stance=stance,
+                    confidence=confidence,
+                    key_points=key_points,
+                )
+                
+                # Cache the result
+                self._cache_report(symbol, report)
+                
+                return report
+            else:
+                # No news found
+                return ExpertReport(
+                    expert_name=self.name,
+                    stance="NEUTRAL",
+                    confidence=50.0,
+                    key_points=["No recent news found"] + key_points,
+                )
+                
+        except Exception as exc:
+            log.warning(f"[{self.name}] Analysis failed for {symbol}: {exc}")
+            return ExpertReport(
+                expert_name=self.name,
+                stance="NEUTRAL",  # Default to neutral on error
+                confidence=50.0,
+                key_points=[f"Sentiment analysis failed: {str(exc)[:50]}"],
+            )
+    
+    def _fetch_fmp_news(self, symbol: str) -> tuple[list[str], float]:
+        """
+        Fetch news from Financial Modeling Prep API.
+        
+        Returns: (headlines_list, sentiment_score)
+        """
+        headlines = []
+        total_score = 0
+        count = 0
+        
+        try:
+            # FMP Stock News endpoint
+            url = f"https://financialmodelingprep.com/api/v3/stock_news"
+            params = {
+                "tickers": symbol,
+                "limit": 10,
+                "apikey": FMP_API_KEY,
+            }
+            
+            response = requests.get(url, params=params, timeout=self.API_TIMEOUT)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                # Filter to recent news only
+                cutoff_time = datetime.now(timezone.utc) - timedelta(hours=self.NEWS_LOOKBACK_HOURS)
+                
+                for article in data:
+                    if isinstance(article, dict):
+                        title = article.get("title", "")
+                        text = article.get("text", "")
+                        published = article.get("publishedDate", "")
+                        
+                        # Check if recent
+                        try:
+                            if published:
+                                pub_time = datetime.fromisoformat(published.replace("Z", "+00:00"))
+                                if pub_time < cutoff_time:
+                                    continue
+                        except:
+                            pass  # Include if date parsing fails
+                        
+                        combined_text = f"{title} {text}".lower()
+                        headlines.append(title)
+                        
+                        # Score sentiment
+                        score = self._score_text_sentiment(combined_text)
+                        total_score += score
+                        count += 1
+            
+            avg_score = total_score / count if count > 0 else 0
+            return headlines, avg_score
+            
+        except requests.Timeout:
+            log.warning(f"[{self.name}] FMP API timeout for {symbol}")
+            return [], 0
+        except Exception as exc:
+            log.warning(f"[{self.name}] FMP API error for {symbol}: {exc}")
+            return [], 0
+    
+    def _fetch_newsapi(self, symbol: str) -> tuple[list[str], float]:
+        """
+        Fetch news from NewsAPI.
+        
+        Returns: (headlines_list, sentiment_score)
+        """
+        headlines = []
+        total_score = 0
+        count = 0
+        
+        try:
+            # NewsAPI everything endpoint
+            url = "https://newsapi.org/v2/everything"
+            
+            # Calculate date range (last 24 hours)
+            to_date = datetime.now(timezone.utc)
+            from_date = to_date - timedelta(hours=self.NEWS_LOOKBACK_HOURS)
+            
+            params = {
+                "q": f"{symbol} stock OR earnings OR revenue OR financial",
+                "language": "en",
+                "sortBy": "publishedAt",
+                "pageSize": 10,
+                "from": from_date.strftime("%Y-%m-%d"),
+                "to": to_date.strftime("%Y-%m-%d"),
+                "apiKey": NEWS_API_KEY,
+            }
+            
+            response = requests.get(url, params=params, timeout=self.API_TIMEOUT)
+            
+            if response.status_code == 200:
+                data = response.json()
+                articles = data.get("articles", [])
+                
+                for article in articles:
+                    title = article.get("title", "")
+                    description = article.get("description", "")
+                    
+                    combined_text = f"{title} {description}".lower()
+                    headlines.append(title)
+                    
+                    # Score sentiment
+                    score = self._score_text_sentiment(combined_text)
+                    total_score += score
+                    count += 1
+            
+            avg_score = total_score / count if count > 0 else 0
+            return headlines, avg_score
+            
+        except requests.Timeout:
+            log.warning(f"[{self.name}] NewsAPI timeout for {symbol}")
+            return [], 0
+        except Exception as exc:
+            log.warning(f"[{self.name}] NewsAPI error for {symbol}: {exc}")
+            return [], 0
+    
+    def _score_text_sentiment(self, text: str) -> float:
+        """
+        Score text sentiment from -1.0 (very bearish) to +1.0 (very bullish).
+        
+        Returns 0 for neutral sentiment.
+        """
+        text_lower = text.lower()
+        
+        bullish_count = sum(1 for kw in self.BULLISH_KEYWORDS if kw in text_lower)
+        bearish_count = sum(1 for kw in self.BEARISH_KEYWORDS if kw in text_lower)
+        
+        # Simple scoring: +0.2 per bullish keyword, -0.2 per bearish
+        # Cap at ±1.0
+        score = (bullish_count * 0.2) - (bearish_count * 0.2)
+        return max(-1.0, min(1.0, score))
+    
+    def _sentiment_to_stance(self, sentiment_score: float, direction: str) -> tuple[str, float]:
+        """
+        Convert sentiment score to committee stance and confidence.
+        
+        Args:
+            sentiment_score: -1.0 to +1.0
+            direction: "BUY" or "SELL" (the signal direction)
+        
+        Returns:
+            (stance, confidence)
+        """
+        # Sentiment alignment with signal direction
+        if direction == "BUY":
+            # For BUY signals, positive sentiment is supportive
+            if sentiment_score >= 0.6:
+                return "HIGH_POSITIVE", min(85 + sentiment_score * 10, 95)
+            elif sentiment_score >= 0.2:
+                return "POSITIVE", min(65 + sentiment_score * 20, 80)
+            elif sentiment_score >= -0.2:
+                return "NEUTRAL", 50.0
+            elif sentiment_score >= -0.6:
+                return "NEGATIVE", max(40 - abs(sentiment_score) * 10, 30)
+            else:
+                return "HIGH_NEGATIVE", max(25 - abs(sentiment_score) * 5, 15)
+        else:  # SELL
+            # For SELL signals, negative sentiment is supportive
+            if sentiment_score <= -0.6:
+                return "HIGH_POSITIVE", min(85 + abs(sentiment_score) * 10, 95)
+            elif sentiment_score <= -0.2:
+                return "POSITIVE", min(65 + abs(sentiment_score) * 20, 80)
+            elif sentiment_score <= 0.2:
+                return "NEUTRAL", 50.0
+            elif sentiment_score <= 0.6:
+                return "NEGATIVE", max(40 - sentiment_score * 10, 30)
+            else:
+                return "HIGH_NEGATIVE", max(25 - sentiment_score * 5, 15)
+    
+    def _pick_most_relevant_headline(self, headlines: list[str], direction: str) -> str:
+        """Pick the most sentiment-relevant headline for display."""
+        if not headlines:
+            return ""
+        
+        # Score each headline and pick the most extreme (most informative)
+        best_headline = headlines[0]
+        best_score = abs(self._score_text_sentiment(best_headline.lower()))
+        
+        for headline in headlines[1:]:
+            score = abs(self._score_text_sentiment(headline.lower()))
+            if score > best_score:
+                best_score = score
+                best_headline = headline
+        
+        return best_headline
+    
+    def _get_cached(self, symbol: str) -> ExpertReport | None:
+        """Check if we have a recent cached report for this symbol."""
+        if symbol in self._cache:
+            timestamp, report = self._cache[symbol]
+            if (datetime.now(timezone.utc) - timestamp).seconds < self._cache_ttl_seconds:
+                return report
+            else:
+                del self._cache[symbol]
+        return None
+    
+    def _cache_report(self, symbol: str, report: ExpertReport) -> None:
+        """Cache the report with current timestamp."""
+        self._cache[symbol] = (datetime.now(timezone.utc), report)
+
+
 @dataclass
 class AgentOpinion:
     """
@@ -833,16 +1199,17 @@ class DecisionAgent:
         self.model_cache = {}
         self.opinion_history = []
         
-        # Phase 2-A: Initialize Expert Agents
+        # Phase 4-A: Initialize Expert Agents (now 4 experts)
         self.technical_analyst = TechnicalAnalyst()
         self.trend_strategist = TrendStrategist()
         self.memory_historian = MemoryHistorian()
+        self.sentiment_analyst = SentimentAnalyst()  # Phase 4-A: News sentiment
         
         mode_str = "SHADOW MODE (advisory only)" if self.shadow_mode else "ACTIVE GATING (can block trades)"
         log.info(
             f"[DecisionAgent] Multi-Agent Committee initialized — {mode_str} "
             f"(model_version={MODEL_VERSION}, "
-            f"experts=[TechnicalAnalyst, TrendStrategist, MemoryHistorian], "
+            f"experts=[TechnicalAnalyst, TrendStrategist, MemoryHistorian, SentimentAnalyst], "
             f"emergency_bypass={EMERGENCY_BYPASS_ON_ERROR})"
         )
     
@@ -954,6 +1321,13 @@ class DecisionAgent:
         )
         log.debug(f"[MemoryHistorian] {symbol}: {mh_report.stance}")
         
+        # 4. Sentiment Analyst Report (Phase 4-A)
+        sa_report = self.sentiment_analyst.analyze(
+            symbol=symbol,
+            direction=direction,
+        )
+        log.debug(f"[SentimentAnalyst] {symbol}: {sa_report.stance} ({sa_report.confidence:.0f}%)")
+        
         # ====================================================================
         # Synthesize Committee Consensus
         # ====================================================================
@@ -967,6 +1341,7 @@ class DecisionAgent:
             ta_report=ta_report,
             ts_report=ts_report,
             mh_report=mh_report,
+            sa_report=sa_report,  # Phase 4-A
         )
         
         # Create AgentOpinion with committee data
@@ -1020,13 +1395,16 @@ class DecisionAgent:
         ta_report: ExpertReport,
         ts_report: ExpertReport,
         mh_report: ExpertReport,
+        sa_report: ExpertReport,  # Phase 4-A: Sentiment Analyst
     ) -> CommitteeConsensus:
         """
         Synthesize expert reports into a final Committee Consensus.
         
+        Phase 4-A: Now includes 4 experts (added Sentiment Analyst).
+        
         Voting Logic:
         - APPROVE: At least 2 experts approve with confidence >= threshold
-        - REJECT: At least 2 experts reject or counter-trend
+        - REJECT: At least 2 experts reject or counter-trend (or HIGH_NEGATIVE sentiment)
         - UNCERTAIN: Mixed signals or insufficient confidence
         """
         
@@ -1054,13 +1432,24 @@ class DecisionAgent:
         elif mh_report.stance == "NEGATIVE":
             rejections += 1
         
+        # Phase 4-A: Sentiment Analyst vote
+        # HIGH_NEGATIVE sentiment can single-handedly force REJECT
+        if sa_report.stance in ["HIGH_POSITIVE", "POSITIVE"] and sa_report.confidence >= CONFIDENCE_THRESHOLD:
+            approvals += 1
+        elif sa_report.stance in ["NEGATIVE", "HIGH_NEGATIVE"]:
+            rejections += 1
+            # HIGH_NEGATIVE is a strong signal - count it extra
+            if sa_report.stance == "HIGH_NEGATIVE":
+                rejections += 1  # Double weight for very bad news
+        
         # Determine final verdict
         if approvals >= COMMITTEE_APPROVE_THRESHOLD:
             verdict = "APPROVE"
-            consensus_conf = (ta_report.confidence + ts_report.confidence + mh_report.confidence) / 3
+            consensus_conf = (ta_report.confidence + ts_report.confidence + mh_report.confidence + sa_report.confidence) / 4
         elif rejections >= COMMITTEE_APPROVE_THRESHOLD:
             verdict = "REJECT"
-            consensus_conf = 100 - ((ta_report.confidence + ts_report.confidence + mh_report.confidence) / 3)
+            avg_conf = (ta_report.confidence + ts_report.confidence + mh_report.confidence + sa_report.confidence) / 4
+            consensus_conf = max(30, 100 - avg_conf)
         else:
             verdict = "UNCERTAIN"
             consensus_conf = 50.0
@@ -1092,6 +1481,18 @@ class DecisionAgent:
         elif mh_report.stance == "NO_DATA":
             summary_parts.append("Insufficient historical data for this symbol")
         
+        # Phase 4-A: Sentiment summary
+        if sa_report.stance == "HIGH_POSITIVE":
+            summary_parts.append("Very positive news sentiment supports trade")
+        elif sa_report.stance == "POSITIVE":
+            summary_parts.append("News sentiment is favorable")
+        elif sa_report.stance == "NEGATIVE":
+            summary_parts.append("Negative news sentiment detected")
+        elif sa_report.stance == "HIGH_NEGATIVE":
+            summary_parts.append("⚠️ Very negative news - high caution advised")
+        elif sa_report.stance == "NO_DATA":
+            summary_parts.append("No recent news data available")
+        
         # Regime context
         if ai_regime == "VOLATILE":
             summary_parts.append("High volatility regime — wider stops recommended")
@@ -1099,7 +1500,8 @@ class DecisionAgent:
             summary_parts.append("Trending market — momentum approach favorable")
         
         # Shadow mode disclaimer
-        summary_parts.append("[SHADOW MODE] Committee opinion is advisory only")
+        mode_tag = "SHADOW MODE" if self.shadow_mode else "ACTIVE GATING"
+        summary_parts.append(f"[{mode_tag}] Committee opinion is advisory only")
         
         debate_summary = "; ".join(summary_parts)
         
@@ -1109,6 +1511,7 @@ class DecisionAgent:
             technical_analyst_report=ta_report,
             trend_strategist_report=ts_report,
             memory_historian_report=mh_report,
+            sentiment_analyst_report=sa_report,  # Phase 4-A
             final_verdict=verdict,
             consensus_confidence=consensus_conf,
             debate_summary=debate_summary,
@@ -1158,8 +1561,8 @@ class DecisionAgent:
             "uncertain": uncertain,
             "avg_consensus_confidence": round(avg_consensus_conf, 1),
             "shadow_mode": self.shadow_mode,
-            "committee_size": 3,
-            "experts": ["TechnicalAnalyst", "TrendStrategist", "MemoryHistorian"],
+            "committee_size": 4,  # Phase 4-A: Now 4 experts
+            "experts": ["TechnicalAnalyst", "TrendStrategist", "MemoryHistorian", "SentimentAnalyst"],
         }
     
     def clear_history(self) -> None:
@@ -1208,14 +1611,15 @@ def analyze_signal_shadow(
 if __name__ == "__main__":
     # Test the Multi-Agent Committee DecisionAgent
     print("=" * 60)
-    print("[TEST] Multi-Agent Committee DecisionAgent (Phase 2-A)")
+    print("[TEST] Multi-Agent Committee DecisionAgent (Phase 4-A)")
     print("=" * 60)
     
     agent = DecisionAgent(shadow_mode=True)
     print(f"✓ Shadow Mode: {agent.shadow_mode}")
     print(f"✓ Model Version: {MODEL_VERSION}")
-    print(f"✓ Expert Agents: TechnicalAnalyst, TrendStrategist, MemoryHistorian")
+    print(f"✓ Expert Agents: TechnicalAnalyst, TrendStrategist, MemoryHistorian, SentimentAnalyst")
     print(f"✓ Committee Threshold: {COMMITTEE_APPROVE_THRESHOLD} votes required")
+    print(f"✓ API Integration: NEWS_API_KEY={bool(NEWS_API_KEY)}, FMP_API_KEY={bool(FMP_API_KEY)}")
     
     print("\n[TEST] Ready for integration")
     print("-" * 60)
