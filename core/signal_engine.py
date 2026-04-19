@@ -55,6 +55,15 @@ from utils.success_tracker import (
     get_hot_symbols,
 )
 
+# Phase 1-A: Decision Agent integration (Shadow Mode)
+# The agent provides AI opinions but does NOT block trades
+try:
+    from core.decision_agent import DecisionAgent, analyze_signal_shadow, AgentOpinion
+    _DECISION_AGENT_AVAILABLE = True
+except Exception as _decision_agent_err:
+    _DECISION_AGENT_AVAILABLE = False
+    log.warning(f"[DecisionAgent] Import failed: {_decision_agent_err}. Agent will not be available.")
+
 log = logging.getLogger(__name__)
 ACTIVE_MIN_CONFIDENCE = float(SIGNAL_MIN_CONFIDENCE if SIGNAL_MIN_CONFIDENCE is not None else FAST_MIN_CONFIDENCE)
 
@@ -797,6 +806,55 @@ def _analyze_one_from_timeframes(
         # REMOVED: "mom_macd_bypassed" — MACD bypass eliminated per strict policy
         "signal_price": _latest_signal_price(timeframes),
     }
+
+    # Phase 1-A: Decision Agent Shadow Mode Analysis
+    # The agent analyzes the signal but does NOT block execution.
+    # Its opinion is logged and will be included in Telegram notifications.
+    if _DECISION_AGENT_AVAILABLE:
+        try:
+            signal_data_for_agent = {
+                "symbol": symbol,
+                "action": best_action,
+                "confidence": best_conf,
+                "strategy_label": best_label,
+                "reason": best_reason,
+            }
+            
+            # Get agent opinion in shadow mode (never blocks)
+            agent_opinion = analyze_signal_shadow(
+                signal_data=signal_data_for_agent,
+                market_data=timeframes,
+                chat_id=None,  # Will be sent later with the main signal notification
+            )
+            
+            # Add agent opinion to signal dict for downstream use
+            out["agent_opinion"] = agent_opinion.to_dict()
+            
+            log.info(
+                f"[SignalEngine {symbol}] DecisionAgent Shadow Opinion: "
+                f"{agent_opinion.verdict} (AI: {agent_opinion.ai_confidence:.1f}%, "
+                f"Tech: {agent_opinion.technical_confidence:.1f}%)"
+            )
+            
+        except Exception as agent_exc:
+            # CRITICAL: Agent failure must never block trading
+            log.warning(
+                f"[SignalEngine {symbol}] DecisionAgent analysis failed: {agent_exc}. "
+                f"Trade will proceed on technical signal only."
+            )
+            out["agent_opinion"] = {
+                "error": str(agent_exc),
+                "verdict": "ERROR",
+                "shadow_mode": True,
+            }
+    else:
+        # DecisionAgent not available - mark in signal for transparency
+        out["agent_opinion"] = {
+            "verdict": "UNAVAILABLE",
+            "reasoning": "DecisionAgent module not loaded",
+            "shadow_mode": True,
+        }
+
     return out
 
 
