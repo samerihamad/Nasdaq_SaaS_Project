@@ -1,7 +1,7 @@
 """
 Decision Agent — NATB v2.0 AI Agent Layer
 
-Phase 2-A: Multi-Agent Committee (AutoGen-inspired)
+Phase 3-A: Active Gating — Multi-Agent Committee with Trade Blocking
 
 This module implements a Multi-Agent "Committee" structure with 3 Expert Personas:
   1. Technical Analyst: RSI, ADX, Bollinger Bands alignment
@@ -14,13 +14,14 @@ Architecture:
   - Committee of specialized agents debate the signal
   - Each expert generates a brief "Agent Report"
   - Lead Coordinator synthesizes reports into final verdict
-  - Operates in SHADOW MODE (opinions only, never blocks trades)
+  - ACTIVE GATING: Committee can block trades (verdict = REJECT)
   - All paths use absolute: /root/Nasdaq_SaaS_Project/
 
 Safety:
-  - SHADOW_MODE = True (enforced)
+  - SHADOW_MODE = False (ACTIVE GATING — committee can block trades)
+  - Emergency Bypass: On agent error, defaults to APPROVE (don't freeze)
   - All agent operations wrapped in try-except
-  - Trade execution proceeds regardless of committee verdict
+  - Trade execution blocked ONLY on explicit REJECT verdict
 """
 
 import os
@@ -61,12 +62,25 @@ except Exception as _mem_err:
 
 log = logging.getLogger(__name__)
 
-# Shadow mode flag - ensures agent never blocks trades
-SHADOW_MODE = True
+# =============================================================================
+# PHASE 3-A: ACTIVE GATING CONFIGURATION
+# =============================================================================
+
+# SHADOW_MODE = False enables active gating (committee can block trades)
+# Set to True to return to shadow mode (opinions only, never blocks)
+SHADOW_MODE = False
+
+# Emergency Bypass: If True, agent errors default to APPROVE (safety valve)
+EMERGENCY_BYPASS_ON_ERROR = True
 
 # AI Gate thresholds for the committee's decision logic
 COMMITTEE_APPROVE_THRESHOLD = 2  # At least 2 experts must approve
 CONFIDENCE_THRESHOLD = 55.0  # Minimum confidence for an expert to approve
+
+
+def is_gating_active() -> bool:
+    """Check if the committee is in active gating mode (can block trades)."""
+    return not SHADOW_MODE
 
 # =============================================================================
 # PHASE 2-A: Multi-Agent Committee Dataclasses
@@ -645,7 +659,7 @@ class AgentOpinion:
     """
     Structured opinion from the Decision Agent.
     
-    Phase 2-A: Now wraps CommitteeConsensus for backward compatibility.
+    Phase 3-A: Active Gating — includes is_approved for trade execution control.
     """
     symbol: str
     direction: str
@@ -655,12 +669,38 @@ class AgentOpinion:
     ai_regime: str
     verdict: str  # "APPROVE", "REJECT", or "UNCERTAIN"
     reasoning: str
-    shadow_mode: bool = True
+    shadow_mode: bool = False  # Phase 3-A: Default to active gating
     ai_score: float = 0.0
     model_version: int = MODEL_VERSION
     
-    # Phase 2-A: Committee data (optional for backward compatibility)
+    # Phase 2-A: Committee data
     committee_consensus: CommitteeConsensus | None = None
+    
+    @property
+    def is_approved(self) -> bool:
+        """
+        Phase 3-A: Active Gating property.
+        
+        Returns True if trade should proceed, False if blocked.
+        
+        Logic:
+          - APPROVE: True (trade proceeds)
+          - UNCERTAIN: True (trade proceeds with caution)
+          - REJECT: False (trade blocked)
+          - ERROR: Depends on EMERGENCY_BYPASS_ON_ERROR (default True = approve)
+        """
+        if self.verdict == "REJECT":
+            return False
+        if self.verdict == "ERROR":
+            # Emergency bypass: on error, default to approve to avoid freezing
+            return EMERGENCY_BYPASS_ON_ERROR
+        # APPROVE, UNCERTAIN, or any other state: allow trade
+        return True
+    
+    @property
+    def is_blocked(self) -> bool:
+        """Convenience property — True if trade was blocked by committee."""
+        return not self.is_approved
     
     def to_dict(self) -> dict:
         result = {
@@ -675,33 +715,93 @@ class AgentOpinion:
             "shadow_mode": self.shadow_mode,
             "ai_score": self.ai_score,
             "model_version": self.model_version,
+            "is_approved": self.is_approved,
+            "is_blocked": self.is_blocked,
         }
         if self.committee_consensus:
             result["committee"] = self.committee_consensus.to_dict()
         return result
     
-    def to_telegram_format(self) -> str:
-        """Format for Telegram - delegates to committee format if available."""
+    def to_telegram_format(self, blocked_notification: bool = False) -> str:
+        """
+        Format for Telegram.
+        
+        Args:
+            blocked_notification: If True, format as a trade block alert
+        """
+        if blocked_notification:
+            # Phase 3-A: Blocked trade notification format
+            return self._to_blocked_telegram_format()
+        
+        # Standard committee format for approved/uncertain trades
         if self.committee_consensus:
             return self.committee_consensus.to_telegram_format()
         
         # Fallback to legacy format
         emoji_verdict = "✅" if self.verdict == "APPROVE" else ("❌" if self.verdict == "REJECT" else "⚠️")
+        mode_tag = "[SHADOW MODE]" if self.shadow_mode else "[ACTIVE GATING]"
         return (
-            f"🤖 AI Agent Opinion [SHADOW MODE]:\n"
+            f"🤖 AI Agent Opinion {mode_tag}:\n"
             f"   ├─ Verdict: {emoji_verdict} {self.verdict}\n"
             f"   ├─ AI Confidence: {self.ai_confidence:.1f}%\n"
             f"   ├─ Technical Confidence: {self.technical_confidence:.1f}%\n"
             f"   ├─ Regime: {self.ai_regime}\n"
             f"   └─ Reasoning: {self.reasoning}"
         )
+    
+    def _to_blocked_telegram_format(self) -> str:
+        """Phase 3-A: Format for blocked trade notification."""
+        cc = self.committee_consensus
+        
+        if cc:
+            # Detailed committee breakdown for blocked trades
+            ta = cc.technical_analyst_report
+            ts = cc.trend_strategist_report
+            mh = cc.memory_historian_report
+            
+            # Build expert breakdown
+            expert_lines = []
+            if ta.stance in ["BULLISH", "BEARISH"]:
+                expert_lines.append(f"📊 Technical: {ta.stance} ({ta.confidence:.0f}%)")
+            if ts.stance in ["ALIGNED", "COUNTER_TREND"]:
+                expert_lines.append(f"📈 Trend: {ts.stance} ({ts.confidence:.0f}%)")
+            if mh.stance in ["POSITIVE", "NEGATIVE"]:
+                expert_lines.append(f"📚 Memory: {mh.stance}")
+            
+            expert_block = "\n   ├─ " + "\n   ├─ ".join(expert_lines) if expert_lines else ""
+            
+            return (
+                f"🛡️🛑 TRADE BLOCKED BY COMMITTEE 🛑🛡️\n"
+                f"\n"
+                f"🎯 Signal: {self.symbol} {self.direction}\n"
+                f"❌ Verdict: {self.verdict}"
+                f"{expert_block}\n"
+                f"\n"
+                f"📝 Reason: {self.reasoning[:150]}...\n"
+                f"\n"
+                f"⚠️ Technical strategy signal was NOT executed.\n"
+                f"🤖 Committee protection activated."
+            )
+        else:
+            # Simplified format without committee data
+            return (
+                f"🛡️🛑 TRADE BLOCKED BY COMMITTEE 🛑🛡️\n"
+                f"\n"
+                f"🎯 Signal: {self.symbol} {self.direction}\n"
+                f"❌ Verdict: {self.verdict}\n"
+                f"\n"
+                f"📝 Reason: {self.reasoning[:150]}...\n"
+                f"\n"
+                f"⚠️ Technical strategy signal was NOT executed.\n"
+                f"🤖 Committee protection activated."
+            )
 
 
 class DecisionAgent:
     """
     Decision Agent — Multi-Agent Committee Lead Coordinator.
     
-    CURRENTLY IN SHADOW MODE - Provides opinions without blocking trades.
+    PHASE 3-A: ACTIVE GATING — Committee can block trades.
     
     The Lead Coordinator orchestrates 3 Expert Agents:
       1. TechnicalAnalyst: RSI, ADX, Bollinger Bands
@@ -714,12 +814,22 @@ class DecisionAgent:
     Usage:
         agent = DecisionAgent()
         opinion = agent.analyze_signal(signal_data, market_data)
-        # Committee reports are logged and sent to Telegram
-        # Trade proceeds regardless of committee verdict
+        
+        # Phase 3-A: Check if trade should proceed
+        if opinion.is_approved:
+            execute_trade()  # Trade proceeds
+        else:
+            log_block_event()  # Trade blocked by committee
+            send_blocked_notification()
+    
+    Safety:
+        - Emergency bypass: Agent errors default to APPROVE
+        - SHADOW_MODE configurable: Set to True for advisory-only mode
     """
     
-    def __init__(self, shadow_mode: bool = True):
-        self.shadow_mode = shadow_mode
+    def __init__(self, shadow_mode: bool | None = None):
+        # Use module-level SHADOW_MODE if not specified
+        self.shadow_mode = shadow_mode if shadow_mode is not None else SHADOW_MODE
         self.model_cache = {}
         self.opinion_history = []
         
@@ -728,10 +838,12 @@ class DecisionAgent:
         self.trend_strategist = TrendStrategist()
         self.memory_historian = MemoryHistorian()
         
+        mode_str = "SHADOW MODE (advisory only)" if self.shadow_mode else "ACTIVE GATING (can block trades)"
         log.info(
-            f"[DecisionAgent] Multi-Agent Committee initialized "
-            f"(shadow_mode={shadow_mode}, model_version={MODEL_VERSION}, "
-            f"experts=[TechnicalAnalyst, TrendStrategist, MemoryHistorian])"
+            f"[DecisionAgent] Multi-Agent Committee initialized — {mode_str} "
+            f"(model_version={MODEL_VERSION}, "
+            f"experts=[TechnicalAnalyst, TrendStrategist, MemoryHistorian], "
+            f"emergency_bypass={EMERGENCY_BYPASS_ON_ERROR})"
         )
     
     def analyze_signal(
@@ -752,17 +864,25 @@ class DecisionAgent:
         try:
             return self._perform_analysis(signal_data, market_data)
         except Exception as exc:
+            # PHASE 3-A: Emergency Bypass — On error, default to APPROVE
+            # This ensures the bot never freezes due to agent failures
             log.error(f"[DecisionAgent] Analysis failed for {signal_data.get('symbol', 'unknown')}: {exc}")
-            # Return a fallback opinion that doesn't block trading
+            log.warning(f"[DecisionAgent] EMERGENCY BYPASS activated — defaulting to APPROVE for {signal_data.get('symbol', 'unknown')}")
+            
+            symbol = str(signal_data.get("symbol", "")).upper()
+            direction = str(signal_data.get("action", "")).upper()
+            technical_conf = float(signal_data.get("confidence", 0.0))
+            technical_strategy = str(signal_data.get("strategy_label", "unknown"))
+            
             return AgentOpinion(
-                symbol=signal_data.get("symbol", "unknown"),
-                direction=signal_data.get("action", "unknown"),
-                technical_confidence=signal_data.get("confidence", 0.0),
-                technical_strategy=signal_data.get("strategy_label", "unknown"),
+                symbol=symbol,
+                direction=direction,
+                technical_confidence=technical_conf,
+                technical_strategy=technical_strategy,
                 ai_confidence=0.0,
-                ai_regime="UNKNOWN",
-                verdict="UNCERTAIN",
-                reasoning=f"Agent analysis failed: {str(exc)[:100]}. Trade proceeds on technical signal only.",
+                ai_regime="ERROR",
+                verdict="ERROR",  # is_approved will return True due to EMERGENCY_BYPASS_ON_ERROR
+                reasoning=f"Agent analysis failed: {str(exc)[:100]}. Emergency bypass activated — trade approved.",
                 shadow_mode=self.shadow_mode,
                 ai_score=0.0,
             )

@@ -54,12 +54,15 @@ from utils.success_tracker import (
     is_hot_symbol,
     get_hot_symbols,
 )
+from bot.notifier import send_telegram_message
+from config import ADMIN_CHAT_ID
 
-# Phase 1-A: Decision Agent integration (Shadow Mode)
-# The agent provides AI opinions but does NOT block trades
+# Phase 3-A: Decision Agent Active Gating
+# The Multi-Agent Committee can now BLOCK trades (verdict = REJECT)
 try:
-    from core.decision_agent import DecisionAgent, analyze_signal_shadow, AgentOpinion
+    from core.decision_agent import DecisionAgent, analyze_signal_shadow, AgentOpinion, SHADOW_MODE
     _DECISION_AGENT_AVAILABLE = True
+    log.info(f"[DecisionAgent] Active Gating loaded — SHADOW_MODE={SHADOW_MODE}")
 except Exception as _decision_agent_err:
     _DECISION_AGENT_AVAILABLE = False
     log.warning(f"[DecisionAgent] Import failed: {_decision_agent_err}. Agent will not be available.")
@@ -807,9 +810,8 @@ def _analyze_one_from_timeframes(
         "signal_price": _latest_signal_price(timeframes),
     }
 
-    # Phase 1-A: Decision Agent Shadow Mode Analysis
-    # The agent analyzes the signal but does NOT block execution.
-    # Its opinion is logged and will be included in Telegram notifications.
+    # Phase 3-A: Decision Agent Active Gating
+    # The Multi-Agent Committee analyzes the signal and can BLOCK execution.
     if _DECISION_AGENT_AVAILABLE:
         try:
             signal_data_for_agent = {
@@ -820,32 +822,54 @@ def _analyze_one_from_timeframes(
                 "reason": best_reason,
             }
             
-            # Get agent opinion in shadow mode (never blocks)
+            # Get agent opinion in active gating mode (can block)
             agent_opinion = analyze_signal_shadow(
                 signal_data=signal_data_for_agent,
                 market_data=timeframes,
-                chat_id=None,  # Will be sent later with the main signal notification
+                chat_id=None,  # Blocked trades send separate notification
             )
             
             # Add agent opinion to signal dict for downstream use
             out["agent_opinion"] = agent_opinion.to_dict()
             
-            log.info(
-                f"[SignalEngine {symbol}] DecisionAgent Shadow Opinion: "
-                f"{agent_opinion.verdict} (AI: {agent_opinion.ai_confidence:.1f}%, "
-                f"Tech: {agent_opinion.technical_confidence:.1f}%)"
-            )
+            # PHASE 3-A: ACTIVE GATING — Check if signal should be blocked
+            if agent_opinion.is_blocked:
+                # 🛡️ COMMITTEE BLOCK — Signal is rejected
+                block_reason = agent_opinion.reasoning[:100] if agent_opinion.reasoning else "Committee consensus"
+                log.warning(
+                    f"[AGENT_BLOCK] Signal for {symbol} {best_action} blocked by Committee. "
+                    f"Verdict: {agent_opinion.verdict}. Reason: {block_reason}"
+                )
+                
+                # Send Telegram notification about blocked trade
+                try:
+                    blocked_message = agent_opinion.to_telegram_format(blocked_notification=True)
+                    if ADMIN_CHAT_ID:
+                        send_telegram_message(ADMIN_CHAT_ID, blocked_message)
+                        log.info(f"[AGENT_BLOCK] Telegram notification sent for blocked {symbol} signal")
+                except Exception as notify_err:
+                    log.warning(f"[AGENT_BLOCK] Failed to send Telegram notification: {notify_err}")
+                
+                # 🛑 RETURN NONE — Signal is blocked, no trade execution
+                return None
+            else:
+                # ✅ Signal approved or uncertain — proceed with execution
+                log.info(
+                    f"[SignalEngine {symbol}] DecisionAgent APPROVED: "
+                    f"{agent_opinion.verdict} (AI: {agent_opinion.ai_confidence:.1f}%, "
+                    f"Tech: {agent_opinion.technical_confidence:.1f}%)"
+                )
             
         except Exception as agent_exc:
-            # CRITICAL: Agent failure must never block trading
+            # PHASE 3-A: Emergency Bypass — On error, default to APPROVE
             log.warning(
                 f"[SignalEngine {symbol}] DecisionAgent analysis failed: {agent_exc}. "
-                f"Trade will proceed on technical signal only."
+                f"Emergency bypass — trade proceeding on technical signal."
             )
             out["agent_opinion"] = {
                 "error": str(agent_exc),
                 "verdict": "ERROR",
-                "shadow_mode": True,
+                "shadow_mode": SHADOW_MODE,
             }
     else:
         # DecisionAgent not available - mark in signal for transparency
