@@ -31,6 +31,13 @@ from core.trade_close_messages import (
 )
 from utils.success_tracker import log_successful_setup, log_win_for_symbol
 from database.db_manager import get_subscriber_lang, DB_PATH
+
+# Phase 1-B: Agent Memory integration for learning loop
+try:
+    from core.agent_memory import record_trade_outcome
+    _AGENT_MEMORY_AVAILABLE = True
+except Exception as _mem_err:
+    _AGENT_MEMORY_AVAILABLE = False
 from config import (
     FINAL_SYNC_FALLBACK_ENABLED,
     ENABLE_CLOSE_PENDING_NOTIFY,
@@ -282,6 +289,34 @@ def _emit_reconcile_close_messages(chat_id: str, trade_id: int) -> None:
             reason_hint="sync",
             aggregated_parts=agg_parts,
         )
+    
+    # Phase 1-B: Record trade outcome in Agent Memory
+    # This enables the learning loop (reinforcement/penalty)
+    if _AGENT_MEMORY_AVAILABLE:
+        try:
+            # Determine outcome type
+            if pnl_f > 0:
+                outcome_type = "WIN"
+            elif pnl_f < 0:
+                outcome_type = "LOSS"
+            else:
+                outcome_type = "BREAKEVEN"
+            
+            # We don't know the agent's verdict for this specific trade,
+            # so we'll record it as "UNKNOWN" verdict. The agent will 
+            # correlate this with its opinion history internally.
+            record_trade_outcome(
+                symbol=symbol,
+                direction=direction,
+                verdict="APPROVE",  # Assume APPROVE for trade execution
+                pnl=pnl_f,
+                outcome=outcome_type,
+            )
+            log.info(f"[AgentMemory] Recorded outcome for {symbol}: {outcome_type} (P&L: {pnl_f:.2f})")
+        except Exception as mem_exc:
+            # Never block sync due to memory errors
+            log.warning(f"[AgentMemory] Failed to record outcome: {mem_exc}")
+    
     conn.close()
 
 

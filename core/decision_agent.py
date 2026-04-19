@@ -43,6 +43,14 @@ from utils.ai_model import (
 from bot.notifier import send_telegram_message
 from config import ADMIN_CHAT_ID
 
+# Phase 1-B: Import Agent Memory for contextual reasoning
+try:
+    from core.agent_memory import get_symbol_insights, record_opinion, AgentMemory, SymbolInsights
+    _AGENT_MEMORY_AVAILABLE = True
+except Exception as _mem_err:
+    _AGENT_MEMORY_AVAILABLE = False
+    log.warning(f"[DecisionAgent] AgentMemory not available: {_mem_err}")
+
 log = logging.getLogger(__name__)
 
 # Shadow mode flag - ensures agent never blocks trades
@@ -87,13 +95,27 @@ class AgentOpinion:
         """Format the opinion for Telegram notification."""
         emoji_verdict = "✅" if self.verdict == "APPROVE" else ("❌" if self.verdict == "REJECT" else "⚠️")
         
+        # Split reasoning into main and memory parts for cleaner display
+        main_reasoning = self.reasoning
+        memory_part = ""
+        
+        if "📚 Memory:" in self.reasoning or "⚠️ Memory:" in self.reasoning:
+            parts = self.reasoning.split("; ")
+            memory_parts = [p for p in parts if "📚 Memory:" in p or "⚠️ Memory:" in p]
+            other_parts = [p for p in parts if "📚 Memory:" not in p and "⚠️ Memory:" not in p]
+            
+            if memory_parts:
+                memory_part = "\n   ├─ " + memory_parts[0].strip()
+                main_reasoning = "; ".join(other_parts)
+        
         return (
             f"🤖 AI Agent Opinion [SHADOW MODE]:\n"
             f"   ├─ Verdict: {emoji_verdict} {self.verdict}\n"
             f"   ├─ AI Confidence: {self.ai_confidence:.1f}%\n"
             f"   ├─ Technical Confidence: {self.technical_confidence:.1f}%\n"
-            f"   ├─ Regime: {self.ai_regime}\n"
-            f"   └─ Reasoning: {self.reasoning}"
+            f"   ├─ Regime: {self.ai_regime}"
+            f"{memory_part}\n"
+            f"   └─ Reasoning: {main_reasoning}"
         )
 
 
@@ -215,6 +237,22 @@ class DecisionAgent:
         # Store in history
         self.opinion_history.append(opinion.to_dict())
         
+        # Phase 1-B: Record opinion in Agent Memory
+        if _AGENT_MEMORY_AVAILABLE:
+            try:
+                record_opinion(
+                    symbol=symbol,
+                    verdict=verdict,
+                    ai_confidence=ai_confidence,
+                    technical_confidence=technical_conf,
+                    technical_strategy=technical_strategy,
+                    direction=direction,
+                )
+                log.debug(f"[DecisionAgent] Opinion recorded in AgentMemory for {symbol}")
+            except Exception as mem_exc:
+                # Never block trading due to memory errors
+                log.warning(f"[DecisionAgent] Failed to record opinion in memory: {mem_exc}")
+        
         # Log the opinion
         log.info(f"[DecisionAgent] {symbol} {direction} | AI: {ai_confidence:.1f}% | Tech: {technical_conf:.1f}% | Verdict: {verdict}")
         
@@ -229,6 +267,7 @@ class DecisionAgent:
         ai_regime: str,
         is_approved_by_ai: bool,
         technical_strategy: str,
+        include_memory: bool = True,
     ) -> str:
         """Generate human-readable reasoning for the opinion."""
         
@@ -255,11 +294,77 @@ class DecisionAgent:
         # Strategy context
         parts.append(f"Technical approach: {technical_strategy}")
         
+        # Phase 1-B: Memory Insight
+        if include_memory and _AGENT_MEMORY_AVAILABLE:
+            try:
+                memory_insight = self._get_memory_insight(symbol, direction)
+                if memory_insight:
+                    parts.append(memory_insight)
+            except Exception as mem_exc:
+                log.debug(f"[DecisionAgent] Could not retrieve memory insight: {mem_exc}")
+        
         # Shadow mode disclaimer
         if self.shadow_mode:
             parts.append("[SHADOW MODE] Opinion is advisory only — trade will proceed")
         
         return "; ".join(parts)
+    
+    def _get_memory_insight(self, symbol: str, direction: str) -> str | None:
+        """
+        Retrieve memory-based insight for this symbol + direction.
+        
+        Returns a formatted insight string or None if no relevant memory.
+        """
+        try:
+            insights = get_symbol_insights(symbol, direction=direction, lookback_days=30)
+            
+            if insights is None:
+                return None
+            
+            # Only provide insight if we have meaningful data
+            if insights.total_opinions < 3:
+                return f"📚 Memory: Building baseline ({insights.total_opinions} experiences recorded)"
+            
+            # Format the insight
+            msg_parts = []
+            
+            if insights.success_rate_when_approved is not None:
+                if insights.success_rate_when_approved >= 80:
+                    msg_parts.append(
+                        f"📚 Memory: Strong track record! When I approved {symbol} {direction}, "
+                        f"{insights.success_rate_when_approved:.0f}% were winners "
+                        f"({insights.total_opinions} cases)"
+                    )
+                elif insights.success_rate_when_approved >= 60:
+                    msg_parts.append(
+                        f"📚 Memory: Good history with {symbol} {direction} — "
+                        f"{insights.success_rate_when_approved:.0f}% success when I approved "
+                        f"({insights.total_opinions} cases)"
+                    )
+                elif insights.success_rate_when_approved >= 40:
+                    msg_parts.append(
+                        f"📚 Memory: Mixed results for {symbol} {direction} — "
+                        f"{insights.success_rate_when_approved:.0f}% success when I approved "
+                        f"({insights.total_opinions} cases)"
+                    )
+                else:
+                    msg_parts.append(
+                        f"⚠️ Memory: Poor track record with {symbol} {direction} — "
+                        f"only {insights.success_rate_when_approved:.0f}% success when I approved "
+                        f"({insights.total_opinions} cases)"
+                    )
+            
+            # Add trend context
+            if insights.recent_trend == "IMPROVING":
+                msg_parts.append("trend is improving")
+            elif insights.recent_trend == "DECLINING":
+                msg_parts.append("trend has declined")
+            
+            return "; ".join(msg_parts) if msg_parts else None
+            
+        except Exception as exc:
+            log.debug(f"[DecisionAgent] Error getting memory insight: {exc}")
+            return None
     
     def notify_opinion(self, opinion: AgentOpinion, chat_id: str | None = None) -> None:
         """
