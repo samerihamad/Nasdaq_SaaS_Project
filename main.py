@@ -463,6 +463,53 @@ def _backup_loop():
         time.sleep(BACKUP_INTERVAL)
 
 
+def _nightly_report_loop():
+    """
+    Phase 6-A: Daemon thread — sends dual-channel strategic reports at 23:30 UAE time.
+    
+    UAE time = UTC+4, so 23:30 UAE = 19:30 UTC.
+    
+    Admin Report (internal metrics):
+      - Committee blocking performance
+      - Losses prevented estimation
+      - Consensus health
+    
+    Client Report (trading results):
+      - Daily P&L
+      - Trade statistics
+      - Market overview
+    """
+    from datetime import datetime
+    
+    REPORT_HOUR_UTC = 19      # 19:30 UTC = 23:30 UAE
+    REPORT_MINUTE = 30
+    ALREADY_SENT_TODAY = None
+    
+    while True:
+        try:
+            now = datetime.utcnow()
+            today_str = now.strftime("%Y-%m-%d")
+            
+            # Check if it's time to send (19:30 UTC)
+            if now.hour == REPORT_HOUR_UTC and now.minute == REPORT_MINUTE:
+                if ALREADY_SENT_TODAY != today_str:
+                    print("[NIGHTLY-REPORT] Phase 6-A: Generating strategic reports...")
+                    try:
+                        from core.strategy_reporter import run_nightly_reports
+                        result = run_nightly_reports()
+                        print(f"[NIGHTLY-REPORT] Admin sent: {result['admin_sent']}, Clients: {result['clients_sent']}")
+                        ALREADY_SENT_TODAY = today_str
+                    except Exception as e:
+                        print(f"[NIGHTLY-REPORT] Error: {e}")
+            
+            # Sleep for 60 seconds (check every minute)
+            time.sleep(60)
+            
+        except Exception as e:
+            print(f"[NIGHTLY-REPORT] Thread error: {e}")
+            time.sleep(60)
+
+
 def _hybrid_approval_loop():
     """
     Background thread — non-blocking multi-user hybrid signal executor.
@@ -738,6 +785,7 @@ def _start_background_threads():
         (_hybrid_approval_loop, "hybrid-approvals"),
         (_limit_order_worker_loop, "limit-orders"),
         (_market_open_alert_loop, "market-open-alert"),
+        (_nightly_report_loop,  "nightly-report"),  # Phase 6-A
     ]:
         t = threading.Thread(target=target, name=name, daemon=True)
         t.start()

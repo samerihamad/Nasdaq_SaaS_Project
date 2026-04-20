@@ -2267,14 +2267,15 @@ async def support_timeout_cb(context: ContextTypes.DEFAULT_TYPE):
 
 async def _post_init(app):
     await app.bot.set_my_commands([
-        BotCommand('start',      'Main dashboard / onboarding'),
-        BotCommand('override',   'Manual override after Circuit Breaker'),
-        BotCommand('stop_today', 'Block trading for the rest of today (stops engine)'),
-        BotCommand('limits',     'Admin: active pending limit orders'),
-        BotCommand('orders',     'Admin alias for /limits'),
-        BotCommand('monitor',    'Admin: live subscriber monitor'),
-        BotCommand('admin',      'Admin controls (/admin ai, /admin status, ...)'),
-        BotCommand('audit_sync', 'Admin: DB vs broker position audit'),
+        BotCommand('start',        'Main dashboard / onboarding'),
+        BotCommand('override',     'Manual override after Circuit Breaker'),
+        BotCommand('stop_today',   'Block trading for the rest of today (stops engine)'),
+        BotCommand('limits',       'Admin: active pending limit orders'),
+        BotCommand('orders',       'Admin alias for /limits'),
+        BotCommand('monitor',      'Admin: live subscriber monitor'),
+        BotCommand('admin',        'Admin controls (/admin ai, /admin status, ...)'),
+        BotCommand('audit_sync',   'Admin: DB vs broker position audit'),
+        BotCommand('daily_report', 'Admin: generate strategic daily report'),
     ])
 
 
@@ -2346,6 +2347,9 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler('orders',     limits_handler))
     app.add_handler(CommandHandler('monitor',    monitor_handler))
     app.add_handler(CommandHandler('audit_sync', audit_sync_handler))
+    # Phase 6-A: Strategic Reporter command
+    from core.strategy_reporter import daily_report_command
+    app.add_handler(CommandHandler('daily_report', daily_report_command))
     app.add_error_handler(_on_error)
 
     print("NATB Dashboard Bot running...")
