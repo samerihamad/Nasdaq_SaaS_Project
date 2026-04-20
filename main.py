@@ -96,6 +96,20 @@ from config import (
     MAIN_LOOP_MAX_CONSECUTIVE_FAILURES,
 )
 
+# ── PROJECT ROOT (Phase 6-A Fix: dynamic path for cross-platform compatibility) ─
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+# ── Phase 6-A Fix: Ensure all directories exist on startup ───────────────────
+REQUIRED_DIRS = [
+    os.path.join(PROJECT_ROOT, "data"),
+    os.path.join(PROJECT_ROOT, "logs", "ai_training"),
+    os.path.join(PROJECT_ROOT, "models"),
+    os.path.join(PROJECT_ROOT, "models", "stable"),
+]
+for d in REQUIRED_DIRS:
+    os.makedirs(d, exist_ok=True)
+    print(f"[Startup] Directory ensured: {d}")
+
 # ── Single-instance lock ──────────────────────────────────────────────────────
 _LOCK_FILE = "main.pid"
 
@@ -995,18 +1009,6 @@ def _auto_resume_trading_at_open():
     if resumed:
         print(f"[AUTO-RESUME] Enabled trading for {resumed} eligible subscriber(s) at market open.")
 
-
-# ── Phase 6-A Fix: Ensure all directories exist on startup ────────────────────
-# Prevents FileNotFoundError when saving training status, logs, etc.
-REQUIRED_DIRS = [
-    os.path.join(PROJECT_ROOT, "data"),
-    os.path.join(PROJECT_ROOT, "logs", "ai_training"),
-    os.path.join(PROJECT_ROOT, "models"),
-    os.path.join(PROJECT_ROOT, "models", "stable"),
-]
-for d in REQUIRED_DIRS:
-    os.makedirs(d, exist_ok=True)
-    print(f"[Startup] Directory ensured: {d}")
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 

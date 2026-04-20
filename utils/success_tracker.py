@@ -18,7 +18,7 @@ import logging
 log = logging.getLogger(__name__)
 
 # HARDCODED ABSOLUTE PATH (consistent with autonomous_training.py)
-ABSOLUTE_PROJECT_ROOT = "/root/Nasdaq_SaaS_Project"
+ABSOLUTE_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(ABSOLUTE_PROJECT_ROOT, "data")
 SUCCESS_SETUPS_PATH = os.path.join(DATA_DIR, "successful_setups.json")
 HOT_SYMBOLS_PATH = os.path.join(DATA_DIR, "hot_symbols.json")

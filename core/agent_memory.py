@@ -9,7 +9,7 @@ This module provides persistent memory for the Decision Agent:
   3. Learning Loop: Reinforcement/penalty based on trade results
 
 Architecture:
-  - JSON-based storage at /root/Nasdaq_SaaS_Project/data/agent_memory.json
+  - JSON-based storage at /data/agent_memory.json
   - Atomic file operations (write to temp, then rename)
   - Thread-safe with file locking
   - Shadow mode compatible (does not affect live trading)
@@ -41,7 +41,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 # Ensure project root is in path
-PROJECT_ROOT = "/root/Nasdaq_SaaS_Project"
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 

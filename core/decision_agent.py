@@ -46,7 +46,7 @@ import numpy as np
 import pandas as pd
 
 # Ensure project root is in path for absolute imports
-PROJECT_ROOT = "/root/Nasdaq_SaaS_Project"
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
