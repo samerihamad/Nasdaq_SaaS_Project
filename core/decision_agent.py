@@ -62,6 +62,9 @@ from utils.ai_model import (
 from bot.notifier import send_telegram_message
 from config import ADMIN_CHAT_ID, NEWS_API_KEY, FMP_API_KEY
 
+# Initialize logger FIRST (before any imports that might use it)
+log = logging.getLogger(__name__)
+
 # Phase 1-B: Import Agent Memory for contextual reasoning
 try:
     from core.agent_memory import get_symbol_insights, record_opinion, AgentMemory, SymbolInsights
@@ -69,8 +72,6 @@ try:
 except Exception as _mem_err:
     _AGENT_MEMORY_AVAILABLE = False
     log.warning(f"[DecisionAgent] AgentMemory not available: {_mem_err}")
-
-log = logging.getLogger(__name__)
 
 # =============================================================================
 # PHASE 3-A: ACTIVE GATING CONFIGURATION
@@ -1723,12 +1724,36 @@ class DecisionAgent:
 _agent_instance: DecisionAgent | None = None
 
 
-def get_decision_agent(shadow_mode: bool = True) -> DecisionAgent:
-    """Get or create the global DecisionAgent singleton."""
+def get_decision_agent(shadow_mode: bool | None = None) -> DecisionAgent:
+    """
+    Get or create the global DecisionAgent singleton.
+    
+    Phase 6-A Fix: Defaults to ACTIVE_GATING from config (shadow_mode=False).
+    Pass shadow_mode=True explicitly for shadow/analysis-only mode.
+    """
     global _agent_instance
     if _agent_instance is None:
+        # Default to config setting (ACTIVE_GATING = not shadow_mode)
+        if shadow_mode is None:
+            from config import ACTIVE_GATING
+            shadow_mode = not ACTIVE_GATING
         _agent_instance = DecisionAgent(shadow_mode=shadow_mode)
     return _agent_instance
+
+
+def set_agent_mode(shadow_mode: bool) -> None:
+    """
+    Phase 6-A: Runtime mode switching for /mode command.
+    Updates the global agent instance to use new shadow_mode setting.
+    """
+    global _agent_instance
+    if _agent_instance is not None:
+        _agent_instance.shadow_mode = shadow_mode
+        log.info(f"[DecisionAgent] Mode switched to: {'SHADOW' if shadow_mode else 'ACTIVE GATING'}")
+    else:
+        # Create new instance with specified mode
+        _agent_instance = DecisionAgent(shadow_mode=shadow_mode)
+        log.info(f"[DecisionAgent] Created with mode: {'SHADOW' if shadow_mode else 'ACTIVE GATING'}")
 
 
 def analyze_signal_shadow(

@@ -2289,6 +2289,176 @@ async def system_purge_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data['system_purge_confirm'] = True
 
 
+# ── Mode Control Command (Phase 6-A Fix) ──────────────────────────────────────
+
+async def mode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Admin command: /mode
+    
+    Displays inline buttons to toggle between ACTIVE GATING and SHADOW MODE.
+    Only accessible to ADMIN_CHAT_ID.
+    """
+    chat_id = str(update.message.chat_id)
+    
+    # Security: Admin only
+    if chat_id != ADMIN_CHAT_ID:
+        await update.message.reply_text(
+            "⛔ This command is restricted to admin users only."
+        )
+        return
+    
+    # Get current mode from config
+    from config import ACTIVE_GATING
+    current_mode = "🚀 ACTIVE GATING" if ACTIVE_GATING else "🛡️ SHADOW MODE"
+    
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🚀 ACTIVE GATING", callback_data='mode_active_gating'),
+            InlineKeyboardButton("🛡️ SHADOW MODE", callback_data='mode_shadow'),
+        ]
+    ])
+    
+    await update.message.reply_text(
+        f"⚙️ *Trading Mode Control*\n\n"
+        f"Current Mode: *{current_mode}*\n\n"
+        f"🚀 *ACTIVE GATING*: Committee can BLOCK trades (REJECT stops execution)\n"
+        f"🛡️ *SHADOW MODE*: Committee provides opinions only, never blocks\n\n"
+        f"Select mode:",
+        parse_mode='Markdown',
+        reply_markup=keyboard
+    )
+
+
+async def mode_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle mode selection callback from inline buttons."""
+    query = update.callback_query
+    chat_id = str(query.message.chat_id)
+    
+    # Security: Admin only
+    if chat_id != ADMIN_CHAT_ID:
+        await query.answer("⛔ Admin only", show_alert=True)
+        return
+    
+    data = query.data
+    
+    try:
+        from core.decision_agent import set_agent_mode
+        from config import ACTIVE_GATING
+        
+        if data == 'mode_active_gating':
+            # Switch to active gating (shadow_mode=False)
+            set_agent_mode(shadow_mode=False)
+            new_mode = "🚀 ACTIVE GATING"
+            log_msg = "ACTIVE GATING enabled - Committee can now BLOCK trades"
+        elif data == 'mode_shadow':
+            # Switch to shadow mode (shadow_mode=True)
+            set_agent_mode(shadow_mode=True)
+            new_mode = "🛡️ SHADOW MODE"
+            log_msg = "SHADOW MODE enabled - Committee provides opinions only"
+        else:
+            await query.answer("❌ Invalid selection", show_alert=True)
+            return
+        
+        await query.answer(f"✅ Switched to {new_mode}", show_alert=True)
+        await query.edit_message_text(
+            f"⚙️ *Trading Mode Updated*\n\n"
+            f"New Mode: *{new_mode}*\n\n"
+            f"{log_msg}\n"
+            f"Changes take effect immediately for all new signals.",
+            parse_mode='Markdown'
+        )
+        
+    except Exception as e:
+        await query.answer(f"❌ Error: {e}", show_alert=True)
+
+
+# ── Cache Clear Command (Phase 6-A Fix) ───────────────────────────────────────
+
+async def clear_cache_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Admin command: /clear_cache
+    
+    Deletes all __pycache__ directories to force fresh bytecode compilation.
+    """
+    chat_id = str(update.message.chat_id)
+    
+    # Security: Admin only
+    if chat_id != ADMIN_CHAT_ID:
+        await update.message.reply_text(
+            "⛔ This command is restricted to admin users only."
+        )
+        return
+    
+    processing_msg = await update.message.reply_text("🧹 Scanning for cache directories...")
+    
+    try:
+        import shutil
+        import os
+        
+        cache_dirs_found = []
+        
+        # Walk through project and find all __pycache__ directories
+        for root, dirs, files in os.walk(PROJECT_ROOT):
+            for dir_name in dirs:
+                if dir_name == '__pycache__':
+                    cache_path = os.path.join(root, dir_name)
+                    cache_dirs_found.append(cache_path)
+        
+        if not cache_dirs_found:
+            await processing_msg.edit_text("✅ No __pycache__ directories found. System is clean.")
+            return
+        
+        # Delete all found cache directories
+        deleted_count = 0
+        errors = []
+        
+        for cache_path in cache_dirs_found:
+            try:
+                shutil.rmtree(cache_path)
+                deleted_count += 1
+            except Exception as e:
+                errors.append(f"{cache_path}: {e}")
+        
+        # Also clear .pyc files
+        pyc_files_found = []
+        for root, dirs, files in os.walk(PROJECT_ROOT):
+            for file in files:
+                if file.endswith('.pyc'):
+                    pyc_path = os.path.join(root, file)
+                    pyc_files_found.append(pyc_path)
+        
+        pyc_deleted = 0
+        for pyc_path in pyc_files_found:
+            try:
+                os.remove(pyc_path)
+                pyc_deleted += 1
+            except Exception:
+                pass
+        
+        result_text = (
+            f"✅ *Cache Clear Complete*\n\n"
+            f"🗑️ Deleted: {deleted_count} `__pycache__` directories\n"
+            f"🗑️ Deleted: {pyc_deleted} `.pyc` files\n\n"
+        )
+        
+        if errors:
+            result_text += f"⚠️ Errors ({len(errors)}):\n"
+            for err in errors[:5]:  # Show first 5 errors
+                result_text += f"• `{err}`\n"
+        
+        result_text += (
+            f"\n📋 *Next Steps:*\n"
+            f"1. Restart the bot to load fresh code\n"
+            f"2. Verify with `/system_status`\n"
+            f"3. Test with `/mode` to confirm ACTIVE GATING"
+        )
+        
+        await processing_msg.edit_text(result_text, parse_mode='Markdown')
+        
+    except Exception as e:
+        await processing_msg.edit_text(f"❌ Cache clear failed: {e}")
+
+
 async def system_purge_confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle system purge confirmation response."""
     chat_id = str(update.message.chat_id)
@@ -2463,6 +2633,7 @@ async def _post_init(app):
         BotCommand('start',          'Main dashboard / onboarding'),
         BotCommand('override',       'Manual override after Circuit Breaker'),
         BotCommand('stop_today',     'Block trading for the rest of today (stops engine)'),
+        BotCommand('mode',           'Admin: toggle ACTIVE GATING / SHADOW MODE'),
         BotCommand('limits',         'Admin: active pending limit orders'),
         BotCommand('orders',         'Admin alias for /limits'),
         BotCommand('monitor',        'Admin: live subscriber monitor'),
@@ -2471,6 +2642,7 @@ async def _post_init(app):
         BotCommand('daily_report',   'Admin: generate strategic daily report'),
         BotCommand('system_status',  'Admin: check system sync status'),
         BotCommand('system_purge',   'Admin: purge legacy data and sync'),
+        BotCommand('clear_cache',    'Admin: clear __pycache__ and restart'),
     ])
 
 
@@ -2548,6 +2720,10 @@ if __name__ == "__main__":
     # Phase 6-A: System Status & Purge commands
     app.add_handler(CommandHandler('system_status', system_status_handler))
     app.add_handler(CommandHandler('system_purge', system_purge_handler))
+    # Phase 6-A Fix: Mode control and cache clear commands
+    app.add_handler(CommandHandler('mode', mode_handler))
+    app.add_handler(CommandHandler('clear_cache', clear_cache_handler))
+    app.add_handler(CallbackQueryHandler(mode_callback_handler, pattern=r'^mode_'))
     app.add_error_handler(_on_error)
 
     print("NATB Dashboard Bot running...")

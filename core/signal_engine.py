@@ -63,9 +63,13 @@ log = logging.getLogger(__name__)
 # Phase 3-A: Decision Agent Active Gating
 # The Multi-Agent Committee can now BLOCK trades (verdict = REJECT)
 try:
-    from core.decision_agent import DecisionAgent, analyze_signal_shadow, AgentOpinion, SHADOW_MODE
+    from core.decision_agent import (
+        DecisionAgent, analyze_signal_shadow, AgentOpinion, 
+        SHADOW_MODE, get_decision_agent, set_agent_mode
+    )
+    from config import ACTIVE_GATING
     _DECISION_AGENT_AVAILABLE = True
-    log.info(f"[DecisionAgent] Active Gating loaded — SHADOW_MODE={SHADOW_MODE}")
+    log.info(f"[DecisionAgent] Active Gating loaded — ACTIVE_GATING={ACTIVE_GATING}, SHADOW_MODE={SHADOW_MODE}")
 except Exception as _decision_agent_err:
     _DECISION_AGENT_AVAILABLE = False
     log.warning(f"[DecisionAgent] Import failed: {_decision_agent_err}. Agent will not be available.")
@@ -823,11 +827,12 @@ def _analyze_one_from_timeframes(
                 "reason": best_reason,
             }
             
-            # Get agent opinion in active gating mode (can block)
-            agent_opinion = analyze_signal_shadow(
+            # Phase 6-A Fix: Use get_decision_agent() which respects ACTIVE_GATING config
+            # analyze_signal_shadow() is for shadow analysis only (always shadow_mode=True)
+            agent = get_decision_agent()  # Uses ACTIVE_GATING from config
+            agent_opinion = agent.analyze_signal(
                 signal_data=signal_data_for_agent,
                 market_data=timeframes,
-                chat_id=None,  # Blocked trades send separate notification
             )
             
             # Add agent opinion to signal dict for downstream use
