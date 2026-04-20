@@ -47,12 +47,16 @@ import logging
 
 log = logging.getLogger(__name__)
 
-# ── HARDCODED ABSOLUTE PATHS ─────────────────────────────────────────────────
-# Force absolute paths to prevent FileNotFoundError in any OS environment
-ABSOLUTE_PROJECT_ROOT = "/root/Nasdaq_SaaS_Project"
+# ── DYNAMIC PATHS ────────────────────────────────────────────────────────────
+# Phase 6-A Fix: Use dynamic project root that works on any OS
+# First try to get from environment, then calculate from this file's location
+ABSOLUTE_PROJECT_ROOT = os.getenv(
+    "PROJECT_ROOT",
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
 
 DATA_DIR = os.path.join(ABSOLUTE_PROJECT_ROOT, "data")
-LOGS_DIR = os.path.join(ABSOLUTE_PROJECT_ROOT, "logs/ai_training")
+LOGS_DIR = os.path.join(ABSOLUTE_PROJECT_ROOT, "logs", "ai_training")
 MODELS_DIR = os.path.join(ABSOLUTE_PROJECT_ROOT, "models")
 STABLE_DIR = os.path.join(MODELS_DIR, "stable")
 REGISTRY_PATH = os.path.join(MODELS_DIR, "deep_model_registry.json")
@@ -63,10 +67,21 @@ SELF_LEARNING_DATASET_PATH = os.path.join(LOGS_DIR, "reinforcement_dataset.jsonl
 # Persistent cooldown storage - survives server restarts
 COOLDOWN_FILE_PATH = os.path.join(DATA_DIR, "training_cooldown.json")
 
-# Ensure all directories exist (prevents FileNotFoundError crashes)
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(LOGS_DIR, exist_ok=True)
-os.makedirs(STABLE_DIR, exist_ok=True)
+# Phase 6-A Fix: Ensure ALL directories exist before any file operations
+# Create recursively with exist_ok to prevent FileNotFoundError
+def _ensure_directories():
+    """Ensure all required directories exist. Called at module load and explicitly."""
+    dirs_to_create = [DATA_DIR, LOGS_DIR, MODELS_DIR, STABLE_DIR]
+    for d in dirs_to_create:
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception as e:
+            log.warning(f"[AutonomousTraining] Failed to create directory {d}: {e}")
+
+_ensure_directories()
+
+# Phase 6-A Fix: In-memory status fallback when file I/O fails
+_in_memory_status: dict = {"status": "idle", "updated_at": _utc_iso(), "last_error": ""}
 
 # DEBUG: Print the exact path where cooldown file will be stored
 print(f"DEBUG: Cooldown file path = {COOLDOWN_FILE_PATH}")
@@ -251,9 +266,13 @@ class AutonomousTrainingManager:
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="autonomous-trainer")
         self.state_lock = threading.Lock()
         self.active_future: Optional[Future] = None
+        # Phase 6-A Fix: Track training state to prevent duplicate sessions
+        self._training_in_progress = False
         self.cached_watchlist: list[str] = []
         self.weekly_day = _WEEKDAY_MAP.get(str(AUTOTRAIN_WEEKLY_DAY).strip().lower(), 6)
 
+        # Phase 6-A Fix: Ensure all directories exist at init time
+        _ensure_directories()
         os.makedirs(AUTOTRAIN_LOG_ROOT, exist_ok=True)
         os.makedirs(STABLE_DIR, exist_ok=True)
         os.makedirs(MODELS_DIR, exist_ok=True)
@@ -289,8 +308,14 @@ class AutonomousTrainingManager:
         if not ENABLE_AUTONOMOUS_TRAINING:
             return False
         with self.state_lock:
+            # Phase 6-A Fix: Prevent duplicate training sessions
+            if self._training_in_progress and not force:
+                log.warning(f"[AutonomousTraining] Training already in progress, rejecting request: {reason}")
+                return False
             if self.active_future and not self.active_future.done() and not force:
                 return False
+            # Phase 6-A Fix: Mark training as starting
+            self._training_in_progress = True
             payload_symbols = self._resolve_symbols(symbols)
             self.active_future = self.executor.submit(self._run_training_job, reason, mode, payload_symbols)
         return True
@@ -404,6 +429,16 @@ class AutonomousTrainingManager:
         return out
 
     def _run_training_job(self, reason: str, mode: str, symbols: list[str]):
+        """Run training job with guaranteed cleanup of _training_in_progress flag."""
+        try:
+            self._run_training_job_inner(reason, mode, symbols)
+        finally:
+            # Phase 6-A Fix: ALWAYS reset training flag when done
+            with self.state_lock:
+                self._training_in_progress = False
+                log.info(f"[AutonomousTraining] Training session complete. Flag reset.")
+
+    def _run_training_job_inner(self, reason: str, mode: str, symbols: list[str]):
         started_at = _utc_now()
         started_iso = _utc_iso(started_at)
         tf = str(DEEP_DIRECTION_TIMEFRAME).strip().lower()
@@ -764,14 +799,28 @@ class AutonomousTrainingManager:
         _save_json_atomic(STATUS_PATH, status)
 
     def _update_status(self, patch: dict):
-        """Update status file with error handling to prevent thread crashes."""
+        """
+        Update status file with error handling and memory fallback.
+        Phase 6-A Fix: Always updates in-memory status even if file write fails.
+        This prevents infinite loops when directory/file permissions fail.
+        """
+        global _in_memory_status
         try:
+            # Phase 6-A Fix: Update in-memory status FIRST (always succeeds)
+            _in_memory_status.update(patch or {})
+            _in_memory_status["updated_at"] = _utc_iso()
+            
+            # Phase 6-A Fix: Ensure directory exists before writing
+            _ensure_directories()
+            
+            # Try to read and update file status
             status = _read_status()
             status.update(patch or {})
+            status["updated_at"] = _utc_iso()
             _save_json_atomic(STATUS_PATH, status)
         except Exception as exc:
-            # Log error but never crash the scheduler thread
-            log.error(f"Failed to update status file: {exc}")
+            # Phase 6-A Fix: Log error but don't crash - in-memory status is current
+            log.warning(f"[AutonomousTraining] File status update failed (using memory): {exc}")
 
     def _notify_admin(self, run: dict):
         if not (AUTOTRAIN_NOTIFY_ADMIN and self.admin_chat_id):

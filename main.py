@@ -18,6 +18,7 @@ import time
 import sqlite3
 import threading
 import traceback
+import subprocess
 from datetime import datetime, timezone, time as dt_time
 from collections import Counter
 from typing import Optional
@@ -166,6 +167,9 @@ _triple_tz_threads_started = False
 _hourly_refresh_thread: Optional[threading.Thread] = None
 # Log [CALENDAR] sleep message at most once per UTC day when skipping Capital.com scans.
 _last_calendar_sleep_log_date = None
+
+# Dashboard bot subprocess handle (Phase 6-A Fix: auto-start Telegram bot)
+_dashboard_bot_process: Optional[subprocess.Popen] = None
 
 
 def _log_calendar_sleep_mode(reason: str) -> None:
@@ -800,6 +804,56 @@ def _start_background_threads():
             print("   Thread 'autonomous-training-scheduler' started.")
 
 
+# ── Dashboard Bot Auto-starter (Phase 6-A Fix) ────────────────────────────────
+
+def _start_dashboard_bot() -> Optional[subprocess.Popen]:
+    """
+    Start the Telegram dashboard bot as a separate subprocess.
+    This ensures commands (/mode, /system_status, etc.) are responsive
+    even during heavy market scanning in the main engine.
+    
+    Returns the subprocess handle or None if failed.
+    """
+    global _dashboard_bot_process
+    
+    # Check if already running
+    if _dashboard_bot_process is not None:
+        ret = _dashboard_bot_process.poll()
+        if ret is None:
+            print("[DashboardBot] Already running (pid={_dashboard_bot_process.pid})")
+            return _dashboard_bot_process
+        else:
+            print(f"[DashboardBot] Previous process exited with code {ret}, restarting...")
+    
+    dashboard_path = os.path.join(PROJECT_ROOT, "bot", "dashboard.py")
+    if not os.path.exists(dashboard_path):
+        print(f"[DashboardBot] ERROR: {dashboard_path} not found!")
+        return None
+    
+    try:
+        # Start dashboard.py in a separate process with its own Python interpreter
+        # Using CREATE_NEW_PROCESS_GROUP on Windows for clean termination
+        kwargs = {}
+        if sys.platform == 'win32':
+            kwargs['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
+        
+        _dashboard_bot_process = subprocess.Popen(
+            [sys.executable, dashboard_path],
+            cwd=PROJECT_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            **kwargs
+        )
+        
+        print(f"[DashboardBot] Started with PID {_dashboard_bot_process.pid}")
+        print(f"[DashboardBot] Commands now active: /mode, /system_status, /clear_cache")
+        return _dashboard_bot_process
+        
+    except Exception as e:
+        print(f"[DashboardBot] ERROR starting bot: {e}")
+        return None
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _get_user_lang(chat_id: str) -> str:
@@ -942,7 +996,19 @@ def _auto_resume_trading_at_open():
         print(f"[AUTO-RESUME] Enabled trading for {resumed} eligible subscriber(s) at market open.")
 
 
-# ── Daily scan ────────────────────────────────────────────────────────────────
+# ── Phase 6-A Fix: Ensure all directories exist on startup ────────────────────
+# Prevents FileNotFoundError when saving training status, logs, etc.
+REQUIRED_DIRS = [
+    os.path.join(PROJECT_ROOT, "data"),
+    os.path.join(PROJECT_ROOT, "logs", "ai_training"),
+    os.path.join(PROJECT_ROOT, "models"),
+    os.path.join(PROJECT_ROOT, "models", "stable"),
+]
+for d in REQUIRED_DIRS:
+    os.makedirs(d, exist_ok=True)
+    print(f"[Startup] Directory ensured: {d}")
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
 
 def run_daily_scan(hourly_refresh: bool = False):
     now_et = synchronized_utc_now().astimezone(ET)
@@ -1503,6 +1569,10 @@ def _notify_structural_rejection(symbol: str, strategy: str, reason: str) -> boo
 
 def run_trading_bot():
     global _watchlist, _last_scan_date, _prev_market_status, _closed_notified, _daily_report_sent, _last_watchlist_refresh_at, _unsupported_all_day, _last_structural_suppression_notice_at, _hourly_refresh_thread
+
+    # Phase 6-A Fix: Auto-start Telegram Dashboard Bot in separate process
+    # This ensures commands (/mode, /system_status, etc.) are always responsive
+    _start_dashboard_bot()
 
     print("🚀 NATB v2.0 — محرك التداول الذكي")
     # Scan uses the looser floor so FAST-tier candidates are not discarded before per-user gates.
