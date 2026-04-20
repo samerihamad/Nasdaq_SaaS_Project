@@ -3372,3 +3372,255 @@ def place_trade_for_user(
         f"✅ Opened — legs: {len(opened_legs)} | size: {verified_qty} | "
         f"stop: {stop_info} | RR: {rr_ratio:.1f}"
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SYSTEM PURGE & HASH SYNCHRONIZATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def force_sync_from_broker(chat_id: str) -> dict:
+    """
+    Force local state to match broker state exactly.
+    
+    Phase 6-A: Used after system purge to establish 100% hash synchronization.
+    This function:
+      1. Fetches current open positions from Capital.com
+      2. Clears local open trades in DB
+      3. Re-inserts broker positions as fresh tracking records
+      4. Recalculates hash to confirm sync
+    
+    Returns dict with sync status.
+    """
+    import sqlite3
+    from database.db_manager import DB_PATH
+    
+    result = {
+        "chat_id": chat_id,
+        "success": False,
+        "broker_positions": 0,
+        "local_positions_before": 0,
+        "local_positions_after": 0,
+        "hash_match": False,
+        "errors": []
+    }
+    
+    try:
+        # Get user credentials
+        creds = get_user_credentials(chat_id)
+        if not creds:
+            result["errors"].append("Failed to get user credentials")
+            return result
+        
+        base_url, headers = get_session(creds, chat_id=str(chat_id))
+        if not headers:
+            result["errors"].append("Failed to establish broker session")
+            return result
+        
+        # Fetch live positions from broker
+        pos_res, _ = _resilient_capital_get(
+            f"{base_url}/positions",
+            headers=headers,
+            timeout=20,
+            chat_id=str(chat_id),
+            creds=creds,
+        )
+        
+        if pos_res is None or pos_res.status_code != 200:
+            result["errors"].append("Failed to fetch broker positions")
+            return result
+        
+        live_positions = pos_res.json().get('positions', [])
+        result["broker_positions"] = len(live_positions)
+        
+        # Count local positions before sync
+        local_before = get_open_trades(chat_id) or []
+        result["local_positions_before"] = len(local_before)
+        
+        # Sync: Clear local and re-import from broker
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # Mark all local open trades as closed (they'll be re-imported if still open)
+        cursor.execute(
+            """
+            UPDATE trades 
+            SET status = 'CLOSED', 
+                close_reason = 'SYSTEM_PURGE_SYNC',
+                closed_at = datetime('now'),
+                sync_status = 'PENDING_SYNC'
+            WHERE chat_id = ? AND status = 'OPEN'
+            """,
+            (str(chat_id),)
+        )
+        closed_count = cursor.rowcount
+        
+        # Re-insert broker positions as fresh tracking records
+        imported = 0
+        for pos in live_positions:
+            try:
+                m = pos.get("market") or {}
+                p = pos.get("position") or {}
+                
+                symbol = m.get("epic", "")
+                direction = p.get("direction", "")
+                deal_id = p.get("dealId", "")
+                size = float(p.get("size", 0))
+                entry_price = float(p.get("openLevel", 0))
+                
+                if not symbol or not deal_id:
+                    continue
+                
+                cursor.execute(
+                    """
+                    INSERT INTO trades (
+                        chat_id, symbol, direction, entry_price, size, deal_id,
+                        status, opened_at, sync_status, regime
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'OPEN', datetime('now'), 'SYNCED', 'SYSTEM_IMPORT')
+                    """,
+                    (str(chat_id), symbol, direction, entry_price, size, str(deal_id))
+                )
+                imported += 1
+                
+            except Exception as e:
+                result["errors"].append(f"Import error for position: {e}")
+        
+        conn.commit()
+        conn.close()
+        
+        result["local_positions_after"] = imported
+        
+        # Recalculate hashes to verify sync
+        local_hash = _local_positions_state_hash(str(chat_id))
+        broker_hash = _broker_positions_state_hash(live_positions)
+        result["hash_match"] = (local_hash == broker_hash)
+        result["local_hash"] = local_hash[:12]
+        result["broker_hash"] = broker_hash[:12]
+        
+        # Audit log
+        _audit_exec_event(
+            stage="system_purge_sync",
+            chat_id=str(chat_id),
+            symbol=None,
+            action="FORCE_SYNC",
+            details=(
+                f"cleared={closed_count} imported={imported} "
+                f"hash_match={result['hash_match']} "
+                f"local_hash={local_hash[:12]} broker_hash={broker_hash[:12]}"
+            ),
+        )
+        
+        # Success if hash matches
+        result["success"] = result["hash_match"]
+        
+        if result["success"]:
+            log.info(
+                f"[SystemPurge] Force sync successful for {chat_id}: "
+                f"{imported} positions imported, hash synchronized"
+            )
+        else:
+            result["errors"].append("Hash mismatch after sync attempt")
+            log.warning(
+                f"[SystemPurge] Force sync hash mismatch for {chat_id}: "
+                f"local={local_hash[:12]} broker={broker_hash[:12]}"
+            )
+        
+    except Exception as e:
+        result["errors"].append(f"Force sync exception: {e}")
+        log.error(f"[SystemPurge] Force sync failed for {chat_id}: {e}")
+    
+    return result
+
+
+def get_system_sync_status(chat_id: str) -> dict:
+    """
+    Get current synchronization status between local DB and broker.
+    
+    Returns status info for /system_status command.
+    """
+    import sqlite3
+    from database.db_manager import DB_PATH
+    
+    status = {
+        "chat_id": chat_id,
+        "database": {"status": "unknown", "open_trades": 0, "pending_signals": 0},
+        "hash_sync": {"status": "unknown", "local_hash": "", "broker_hash": "", "match": False},
+        "broker": {"connected": False, "open_positions": 0}
+    }
+    
+    try:
+        # Database status
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # Count open trades
+        cursor.execute(
+            "SELECT COUNT(*) FROM trades WHERE chat_id = ? AND status = 'OPEN'",
+            (str(chat_id),)
+        )
+        open_trades = cursor.fetchone()[0]
+        status["database"]["open_trades"] = open_trades
+        
+        # Count pending signals
+        cursor.execute(
+            "SELECT COUNT(*) FROM pending_signals WHERE chat_id = ? AND status = 'PENDING'",
+            (str(chat_id),)
+        )
+        pending_signals = cursor.fetchone()[0]
+        status["database"]["pending_signals"] = pending_signals
+        
+        # Database cleanliness
+        if open_trades == 0 and pending_signals == 0:
+            status["database"]["status"] = "clean"
+        elif open_trades < 5:
+            status["database"]["status"] = "lightly_active"
+        else:
+            status["database"]["status"] = "active"
+        
+        conn.close()
+        
+    except Exception as e:
+        status["database"]["status"] = f"error: {e}"
+    
+    try:
+        # Broker connection and hash comparison
+        creds = get_user_credentials(chat_id)
+        if creds:
+            base_url, headers = get_session(creds, chat_id=str(chat_id))
+            if headers:
+                pos_res, _ = _resilient_capital_get(
+                    f"{base_url}/positions",
+                    headers=headers,
+                    timeout=10,
+                    chat_id=str(chat_id),
+                    creds=creds,
+                )
+                
+                if pos_res and pos_res.status_code == 200:
+                    status["broker"]["connected"] = True
+                    live_positions = pos_res.json().get('positions', [])
+                    status["broker"]["open_positions"] = len(live_positions)
+                    
+                    # Calculate hashes
+                    local_hash = _local_positions_state_hash(str(chat_id))
+                    broker_hash = _broker_positions_state_hash(live_positions)
+                    
+                    status["hash_sync"]["local_hash"] = local_hash[:12]
+                    status["hash_sync"]["broker_hash"] = broker_hash[:12]
+                    status["hash_sync"]["match"] = (local_hash == broker_hash)
+                    
+                    if status["hash_sync"]["match"]:
+                        status["hash_sync"]["status"] = "synced"
+                    else:
+                        status["hash_sync"]["status"] = "mismatch"
+                else:
+                    status["broker"]["connected"] = False
+                    status["hash_sync"]["status"] = "broker_unavailable"
+            else:
+                status["hash_sync"]["status"] = "no_session"
+        else:
+            status["hash_sync"]["status"] = "no_credentials"
+            
+    except Exception as e:
+        status["hash_sync"]["status"] = f"error: {e}"
+    
+    return status

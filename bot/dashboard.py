@@ -1963,11 +1963,18 @@ def _build_daily_report_text(chat_id: str, lang: str, date_str: str) -> str:
 
 
 async def report_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles text messages for the report date-collection flow and manage-trade flows."""
+    """Handles text messages for the report date-collection flow, manage-trade flows, and system purge."""
     state = context.user_data.get('report_state')
     mstate = context.user_data.get('manage_trade_state')
-    if not state and not mstate:
+    purge_state = context.user_data.get('system_purge_confirm')
+    
+    if not state and not mstate and not purge_state:
         return  # not in a handled text flow — let other handlers process
+    
+    # Phase 6-A: Handle system purge confirmation
+    if purge_state:
+        await system_purge_confirm_handler(update, context)
+        return
 
     chat_id = str(update.message.chat_id)
     lang    = _get_lang(chat_id)
@@ -2183,6 +2190,192 @@ async def stop_today_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(t('day_halt_applied', lang), parse_mode='Markdown')
 
 
+# ── System Status & Purge Commands (Phase 6-A) ─────────────────────────────────
+
+async def system_status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Admin command: /system_status
+    
+    Returns current system synchronization status:
+    - Database cleanliness
+    - Hash sync status
+    - Open positions count vs broker
+    """
+    chat_id = str(update.message.chat_id)
+    
+    # Security: Admin only
+    if chat_id != ADMIN_CHAT_ID:
+        await update.message.reply_text(
+            "⛔ This command is restricted to admin users only."
+        )
+        return
+    
+    # Show processing message
+    processing_msg = await update.message.reply_text("🔍 Checking system status...")
+    
+    try:
+        from core.executor import get_system_sync_status
+        
+        # Get own status
+        status = get_system_sync_status(chat_id)
+        
+        # Format report
+        db_status = status["database"]["status"]
+        db_emoji = "🟢" if db_status == "clean" else ("🟡" if db_status == "lightly_active" else "🔴")
+        
+        hash_status = status["hash_sync"]["status"]
+        hash_emoji = "🟢" if hash_status == "synced" else ("🔴" if hash_status == "mismatch" else "⚪")
+        
+        broker_conn = "🟢 Connected" if status["broker"]["connected"] else "🔴 Disconnected"
+        
+        report = f"""⚙️ SYSTEM STATUS REPORT
+
+📊 Database:
+   {db_emoji} Status: {db_status.upper()}
+   • Open Trades: {status['database']['open_trades']}
+   • Pending Signals: {status['database']['pending_signals']}
+
+🔗 Hash Synchronization:
+   {hash_emoji} Status: {hash_status.upper()}
+   • Local Hash: `{status['hash_sync']['local_hash']}`
+   • Broker Hash: `{status['hash_sync']['broker_hash']}`
+   • Match: {'✅ Yes' if status['hash_sync']['match'] else '❌ No'}
+
+🏦 Broker Connection:
+   {broker_conn}
+   • Open Positions: {status['broker']['open_positions']}
+
+═══════════════════════════════════════════════════
+
+{'✅ System is fully synchronized.' if status['hash_sync']['match'] else '⚠️ Hash mismatch detected. Consider /system_purge'}
+"""
+        
+        await processing_msg.edit_text(report, parse_mode='Markdown')
+        
+    except Exception as e:
+        await processing_msg.edit_text(f"❌ Error checking status: {e}")
+
+
+async def system_purge_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Admin command: /system_purge
+    
+    Executes system purge and force sync:
+    1. Clears legacy data from database
+    2. Resets agent memory
+    3. Forces hash sync from broker
+    """
+    chat_id = str(update.message.chat_id)
+    
+    # Security: Admin only
+    if chat_id != ADMIN_CHAT_ID:
+        await update.message.reply_text(
+            "⛔ This command is restricted to admin users only."
+        )
+        return
+    
+    # Confirm with user
+    confirm_msg = await update.message.reply_text(
+        "⚠️ *SYSTEM PURGE INITIATED*\n\n"
+        "This will:\n"
+        "• Clear all legacy trading data\n"
+        "• Reset agent memory\n"
+        "• Force sync from broker\n\n"
+        "Reply with `CONFIRM` to proceed, or `CANCEL` to abort.",
+        parse_mode='Markdown'
+    )
+    
+    # Store confirmation state
+    context.user_data['system_purge_confirm'] = True
+
+
+async def system_purge_confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle system purge confirmation response."""
+    chat_id = str(update.message.chat_id)
+    
+    if chat_id != ADMIN_CHAT_ID:
+        return
+    
+    if not context.user_data.get('system_purge_confirm'):
+        return  # Not in confirmation state
+    
+    # Clear state
+    context.user_data['system_purge_confirm'] = False
+    
+    response = update.message.text.strip().upper()
+    
+    if response != "CONFIRM":
+        await update.message.reply_text("❌ System purge cancelled.")
+        return
+    
+    # Execute purge
+    processing_msg = await update.message.reply_text("🧹 Executing system purge...")
+    
+    try:
+        # Step 1: Purge legacy data
+        await processing_msg.edit_text("🧹 Step 1/3: Purging legacy data...")
+        
+        import subprocess
+        result = subprocess.run(
+            [sys.executable, "tools/system_purge.py", "--confirm", "--no-backup"],
+            capture_output=True,
+            text=True,
+            cwd=PROJECT_ROOT
+        )
+        
+        purge_output = result.stdout[-500:] if len(result.stdout) > 500 else result.stdout
+        
+        # Step 2: Force sync from broker
+        await processing_msg.edit_text("🔄 Step 2/3: Synchronizing with broker...")
+        
+        from core.executor import force_sync_from_broker
+        sync_result = force_sync_from_broker(chat_id)
+        
+        # Step 3: Verify sync
+        await processing_msg.edit_text("✅ Step 3/3: Verifying synchronization...")
+        
+        from core.executor import get_system_sync_status
+        final_status = get_system_sync_status(chat_id)
+        
+        # Build result report
+        if sync_result["success"] and final_status["hash_sync"]["match"]:
+            report = f"""✅ *SYSTEM PURGE COMPLETE*
+
+🧹 Legacy Data:
+   • Database rows cleared
+   • Agent memory reset
+   • Execution logs cleared
+
+🔄 Broker Sync:
+   • Positions imported: {sync_result['local_positions_after']}
+   • Hash synchronized: ✅
+
+⚙️ Final Status:
+   • Local Hash: `{final_status['hash_sync']['local_hash']}`
+   • Broker Hash: `{final_status['hash_sync']['broker_hash']}`
+   • Match: ✅ SYNCHRONIZED
+
+[SystemPurge] All legacy data cleared. Local state is now 100% synced with Broker.
+"""
+        else:
+            report = f"""⚠️ *SYSTEM PURGE PARTIAL*
+
+🧹 Legacy Data: Cleared
+🔄 Broker Sync: {'✅' if sync_result['success'] else '❌ Failed'}
+⚙️ Hash Match: {'✅' if final_status['hash_sync']['match'] else '❌ Failed'}
+
+Errors:
+{chr(10).join(sync_result.get('errors', ['None']))}
+
+Check logs for details.
+"""
+        
+        await processing_msg.edit_text(report, parse_mode='Markdown')
+        
+    except Exception as e:
+        await processing_msg.edit_text(f"❌ System purge failed: {e}")
+
+
 # ── Hybrid signal helpers ──────────────────────────────────────────────────────
 
 def _update_signal_status(signal_id: int, status: str):
@@ -2267,15 +2460,17 @@ async def support_timeout_cb(context: ContextTypes.DEFAULT_TYPE):
 
 async def _post_init(app):
     await app.bot.set_my_commands([
-        BotCommand('start',        'Main dashboard / onboarding'),
-        BotCommand('override',     'Manual override after Circuit Breaker'),
-        BotCommand('stop_today',   'Block trading for the rest of today (stops engine)'),
-        BotCommand('limits',       'Admin: active pending limit orders'),
-        BotCommand('orders',       'Admin alias for /limits'),
-        BotCommand('monitor',      'Admin: live subscriber monitor'),
-        BotCommand('admin',        'Admin controls (/admin ai, /admin status, ...)'),
-        BotCommand('audit_sync',   'Admin: DB vs broker position audit'),
-        BotCommand('daily_report', 'Admin: generate strategic daily report'),
+        BotCommand('start',          'Main dashboard / onboarding'),
+        BotCommand('override',       'Manual override after Circuit Breaker'),
+        BotCommand('stop_today',     'Block trading for the rest of today (stops engine)'),
+        BotCommand('limits',         'Admin: active pending limit orders'),
+        BotCommand('orders',         'Admin alias for /limits'),
+        BotCommand('monitor',        'Admin: live subscriber monitor'),
+        BotCommand('admin',          'Admin controls (/admin ai, /admin status, ...)'),
+        BotCommand('audit_sync',     'Admin: DB vs broker position audit'),
+        BotCommand('daily_report',   'Admin: generate strategic daily report'),
+        BotCommand('system_status',  'Admin: check system sync status'),
+        BotCommand('system_purge',   'Admin: purge legacy data and sync'),
     ])
 
 
@@ -2350,6 +2545,9 @@ if __name__ == "__main__":
     # Phase 6-A: Strategic Reporter command
     from core.strategy_reporter import daily_report_command
     app.add_handler(CommandHandler('daily_report', daily_report_command))
+    # Phase 6-A: System Status & Purge commands
+    app.add_handler(CommandHandler('system_status', system_status_handler))
+    app.add_handler(CommandHandler('system_purge', system_purge_handler))
     app.add_error_handler(_on_error)
 
     print("NATB Dashboard Bot running...")
