@@ -47,6 +47,19 @@ import logging
 
 log = logging.getLogger(__name__)
 
+# ── Helper Functions (must be defined before use) ─────────────────────────────
+
+def _utc_now() -> datetime:
+    """Return current UTC datetime."""
+    return datetime.now(timezone.utc)
+
+
+def _utc_iso(ts: Optional[datetime] = None) -> str:
+    """Return ISO format UTC timestamp."""
+    t = ts or _utc_now()
+    return t.replace(microsecond=0).isoformat()
+
+
 # ── DYNAMIC PATHS ────────────────────────────────────────────────────────────
 # Phase 6-A Fix: Use dynamic project root that works on any OS
 # First try to get from environment, then calculate from this file's location
@@ -127,15 +140,6 @@ def _escape_telegram_markdown(text: str) -> str:
 
 # Cooldown duration after training failure (6 hours = 21600 seconds)
 TRAINING_FAILURE_COOLDOWN_SEC = 21600
-
-
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _utc_iso(ts: Optional[datetime] = None) -> str:
-    t = ts or _utc_now()
-    return t.replace(microsecond=0).isoformat()
 
 
 def _parse_iso_utc(ts: str | None) -> datetime | None:
