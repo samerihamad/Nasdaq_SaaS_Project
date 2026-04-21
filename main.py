@@ -19,6 +19,7 @@ import sqlite3
 import threading
 import traceback
 import subprocess
+import logging
 from datetime import datetime, timezone, time as dt_time
 from collections import Counter
 from typing import Optional
