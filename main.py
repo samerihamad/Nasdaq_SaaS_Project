@@ -22,6 +22,7 @@ import subprocess
 from datetime import datetime, timezone, time as dt_time
 from collections import Counter
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
 
 from database.db_manager import create_db, is_maintenance_mode
 from utils.filters import get_nasdaq_tickers, level1_filter, level2_filter, level3_filter
@@ -181,7 +182,7 @@ _dashboard_bot_process: Optional[subprocess.Popen] = None
 
 # ── Real-time Notification Architecture (Async Telegram) ───────────────────────
 # ThreadPool for non-blocking Telegram notifications — prevents scan loop blocking
-_telegram_executor = threading.ThreadPoolExecutor(max_workers=4, thread_name_prefix="telegram_")
+_telegram_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="telegram_")
 
 # Progress heartbeat tracking
 _scan_progress_state = {
