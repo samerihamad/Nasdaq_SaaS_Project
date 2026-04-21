@@ -179,6 +179,111 @@ _last_calendar_sleep_log_date = None
 # Dashboard bot subprocess handle (Phase 6-A Fix: auto-start Telegram bot)
 _dashboard_bot_process: Optional[subprocess.Popen] = None
 
+# ── Real-time Notification Architecture (Async Telegram) ───────────────────────
+# ThreadPool for non-blocking Telegram notifications — prevents scan loop blocking
+_telegram_executor = threading.ThreadPoolExecutor(max_workers=4, thread_name_prefix="telegram_")
+
+# Progress heartbeat tracking
+_scan_progress_state = {
+    "active": False,
+    "started_at": None,
+    "processed_count": 0,
+    "total_count": 0,
+    "last_heartbeat": 0,
+}
+_PROGRESS_HEARTBEAT_INTERVAL_SEC = 600  # 10 minutes
+
+# Dedicated error logger for Telegram failures
+_telegram_error_logger = logging.getLogger("telegram_errors")
+_telegram_error_handler = logging.FileHandler(os.path.join(PROJECT_ROOT, "logs", "telegram_errors.log"))
+_telegram_error_handler.setFormatter(logging.Formatter("%(asctime)s — %(levelname)s — %(message)s"))
+_telegram_error_logger.addHandler(_telegram_error_handler)
+_telegram_error_logger.setLevel(logging.ERROR)
+
+
+def _send_telegram_async(chat_id: str, message: str, context: str = "") -> None:
+    """
+    NON-BLOCKING: Queue a Telegram message to be sent in a background thread.
+    Errors are logged to logs/telegram_errors.log (not silently swallowed).
+    
+    Args:
+        chat_id: Target Telegram chat ID
+        message: Message text to send
+        context: Description for logging (e.g., "Committee APPROVED for AAPL")
+    """
+    def _send_task():
+        try:
+            from bot.notifier import send_telegram_message
+            result = send_telegram_message(chat_id, message)
+            if result is None:
+                _telegram_error_logger.error(f"[TELEGRAM SEND FAILED] context={context} | chat_id={chat_id}")
+            else:
+                log.info(f"[TELEGRAM SENT] context={context}")
+        except Exception as e:
+            _telegram_error_logger.error(f"[TELEGRAM EXCEPTION] context={context} | error={str(e)}")
+            log.error(f"[TELEGRAM EXCEPTION] context={context} | error={str(e)}")
+    
+    # Submit to thread pool (non-blocking)
+    try:
+        _telegram_executor.submit(_send_task)
+        log.info(f"[TELEGRAM QUEUED] context={context}")
+    except Exception as e:
+        _telegram_error_logger.error(f"[TELEGRAM QUEUE FAILED] context={context} | error={str(e)}")
+
+
+def _update_scan_progress(processed: int, total: int) -> None:
+    """Update scan progress state and trigger heartbeat if needed."""
+    global _scan_progress_state
+    _scan_progress_state["processed_count"] = processed
+    _scan_progress_state["total_count"] = total
+    
+    now = time.time()
+    if now - _scan_progress_state["last_heartbeat"] >= _PROGRESS_HEARTBEAT_INTERVAL_SEC:
+        _send_progress_heartbeat()
+        _scan_progress_state["last_heartbeat"] = now
+
+
+def _send_progress_heartbeat() -> None:
+    """Send progress status update to admin every 10 minutes during active scan."""
+    if not ADMIN_CHAT_ID or not _scan_progress_state["active"]:
+        return
+    
+    processed = _scan_progress_state["processed_count"]
+    total = _scan_progress_state["total_count"]
+    started_at = _scan_progress_state["started_at"]
+    
+    if started_at:
+        elapsed_min = int((time.time() - started_at) / 60)
+        message = (
+            f"⏱️ **[SYSTEM STATUS]**\n"
+            f"Scan in progress...\n"
+            f"📊 Progress: {processed}/{total} symbols analyzed\n"
+            f"⏰ Elapsed: {elapsed_min} minutes\n"
+            f"🕓 Dubai: {synchronized_utc_now().astimezone(UAE).strftime('%H:%M:%S GST')}"
+        )
+        _send_telegram_async(ADMIN_CHAT_ID, message, context=f"Progress heartbeat {processed}/{total}")
+
+
+def _start_scan_progress(total: int) -> None:
+    """Mark scan as starting and initialize progress tracking."""
+    global _scan_progress_state
+    _scan_progress_state = {
+        "active": True,
+        "started_at": time.time(),
+        "processed_count": 0,
+        "total_count": total,
+        "last_heartbeat": time.time(),
+    }
+    log.info(f"[SCAN PROGRESS] Started tracking for {total} symbols")
+
+
+def _end_scan_progress() -> None:
+    """Mark scan as complete."""
+    global _scan_progress_state
+    _scan_progress_state["active"] = False
+    _scan_progress_state["started_at"] = None
+    log.info("[SCAN PROGRESS] Scan complete, tracking ended")
+
 
 def _log_calendar_sleep_mode(reason: str) -> None:
     global _last_calendar_sleep_log_date
@@ -1253,15 +1358,13 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
         # SHADOW MODE: Log analysis, send Telegram notification, but NEVER block
         if agent.shadow_mode:
             print(f"[SHADOW MODE] Committee analysis only — execution NOT blocked")
-            # Send committee decision to Telegram (admin monitoring)
-            try:
-                from bot.telegram_notifier import send_message
-                if ADMIN_CHAT_ID:
-                    log.info(f"DEBUG: Attempting to send Committee SHADOW message to Telegram for symbol: {symbol}")
-                    send_message(ADMIN_CHAT_ID, committee_verdict.to_telegram_format())
-                    log.info(f"DEBUG: Successfully sent SHADOW Committee message for {symbol}")
-            except Exception as e:
-                log.error(f"[SHADOW NOTIFY ERROR] {e}")
+            # Send committee decision to Telegram (admin monitoring) — NON-BLOCKING
+            if ADMIN_CHAT_ID:
+                _send_telegram_async(
+                    ADMIN_CHAT_ID, 
+                    committee_verdict.to_telegram_format(),
+                    context=f"Committee SHADOW for {symbol} {action}"
+                )
 
         # ACTIVE MODE: Committee decision gates execution
         else:
@@ -1271,15 +1374,13 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
                     f"reason={committee_verdict.reasoning} | "
                     f"confidence={committee_verdict.ai_confidence:.1f}%"
                 )
-                # Send Committee Decision to Telegram even when rejected (so user sees reasoning)
-                try:
-                    from bot.telegram_notifier import send_message
-                    if ADMIN_CHAT_ID:
-                        log.info(f"DEBUG: Attempting to send Committee REJECTED message to Telegram for symbol: {symbol}")
-                        send_message(ADMIN_CHAT_ID, committee_verdict.to_telegram_format())
-                        log.info(f"DEBUG: Successfully sent REJECTED Committee message for {symbol}")
-                except Exception as e:
-                    log.error(f"[COMMITTEE REJECTED NOTIFY ERROR] {e}")
+                # Send Committee Decision to Telegram even when rejected (so user sees reasoning) — NON-BLOCKING
+                if ADMIN_CHAT_ID:
+                    _send_telegram_async(
+                        ADMIN_CHAT_ID,
+                        committee_verdict.to_telegram_format(),
+                        context=f"Committee REJECT for {symbol} {action}"
+                    )
 
                 _log_execution_audit(
                     symbol=symbol,
@@ -1305,14 +1406,13 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
                     f"[COMMITTEE APPROVED] {symbol} {action} | "
                     f"confidence={committee_verdict.ai_confidence:.1f}% | {committee_verdict.reasoning}"
                 )
-                # Send Committee Decision to Telegram for APPROVED verdicts (so user sees reasoning)
-                try:
-                    from bot.telegram_notifier import send_message
-                    if ADMIN_CHAT_ID:
-                        log.info(f"DEBUG: Attempting to send Committee APPROVED message to Telegram for symbol: {symbol}")
-                        send_message(ADMIN_CHAT_ID, committee_verdict.to_telegram_format())
-                except Exception as e:
-                    log.error(f"[COMMITTEE APPROVED NOTIFY ERROR] {e}")
+                # Send Committee Decision to Telegram for APPROVED verdicts (so user sees reasoning) — NON-BLOCKING
+                if ADMIN_CHAT_ID:
+                    _send_telegram_async(
+                        ADMIN_CHAT_ID,
+                        committee_verdict.to_telegram_format(),
+                        context=f"Committee APPROVE for {symbol} {action}"
+                    )
 
     # ── Iterate only subscribers who have started their trading engine ─────────
     subscribers = get_trading_subscribers()
@@ -1827,6 +1927,9 @@ def run_trading_bot():
             scan_started = time.time()
             print(f"[SCAN START] symbols={len(_watchlist)}")
 
+            # Initialize progress tracking for heartbeat notifications
+            _start_scan_progress(len(_watchlist))
+
             # Parallel scan: aiohttp + asyncio (bounded Capital HTTP concurrency; see signal_engine).
             # Returns best-per-symbol signals with timeframes attached (no execution).
             signals = scan_watchlist_parallel(
@@ -1858,8 +1961,14 @@ def run_trading_bot():
                 committee_rejected_count = 0
                 _top_rejected_candidates = []  # Track top 3 rejected for cycle summary
 
+                processed_signals = 0
                 for sig in sorted(signals, key=lambda r: float(r.get("confidence", 0)), reverse=True):
                     symbol = sig["symbol"]
+                    processed_signals += 1
+                    # Update progress for heartbeat (every 10 signals to reduce overhead)
+                    if processed_signals % 10 == 0:
+                        _update_scan_progress(processed_signals, len(signals))
+                    
                     if sig.get("rejected"):
                         rej_reason = str(sig.get("reason", "Rejected by market structure filter"))
                         rej_strategy = str(sig.get("strategy_label", "Unknown"))
@@ -1932,6 +2041,9 @@ def run_trading_bot():
                                 "rejected_by": "Committee",
                                 "committee_confidence": dispatch_result.get("committee_confidence")
                             })
+
+                # Mark scan progress as complete
+                _end_scan_progress()
 
                 total_candidates = len(signals)
                 rejected_count = total_candidates - accepted_count
