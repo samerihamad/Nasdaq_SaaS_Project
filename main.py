@@ -29,9 +29,8 @@ from utils.market_scanner import scan_multi_timeframe, scan_market, clear_local_
 from utils.ai_model import (
     analyze_multi_timeframe,
     load_or_train_model,
-    validate_signal,
-    AI_PROBABILITY_THRESHOLD,
 )
+from core.decision_agent import get_decision_agent, AgentVerdict
 from utils.autonomous_training import AutonomousTrainingManager
 from utils.market_hours import (
     get_market_status,
@@ -75,9 +74,7 @@ from config import (
     GOLDEN_MOM_MIN_SCORE,
     GOLDEN_MOM_VOL_RATIO,
     GOLDEN_MOM_RSI_BUY_MAX,
-    GOLDEN_MOM_RSI_SELL_MIN,
-    FAST_MOM_LOW_VOL_AI_MIN,
-    # REMOVED: FAST_MOM_MACD_BYPASS_AI_MIN — MACD bypass eliminated
+    # REMOVED: FAST_MOM_LOW_VOL_AI_MIN, FAST_MOM_MACD_BYPASS_AI_MIN — legacy AI gate eliminated
     CHECK_INTERVAL,
     MAX_WATCHLIST,
     HYBRID_SIGNAL_TTL,
@@ -85,10 +82,7 @@ from config import (
     BACKUP_INTERVAL,
     HEARTBEAT_FILE,
     WATCHLIST_REFRESH_SECONDS,
-    AI_MIN_PROB_RF,
-    AI_MIN_PROB_MOMENTUM,
-    AI_MIN_PROB_MEANREV,
-    # REMOVED: AI_SOFT_OVERRIDE_* settings — override logic eliminated per strict AI policy
+    # REMOVED: AI_MIN_PROB_*, AI_SOFT_OVERRIDE_* — legacy AI gate eliminated
     ENABLE_STRUCTURAL_REJECTION_NOTIFY,
     STRUCTURAL_REJECTION_NOTIFY_COOLDOWN_SEC,
     STRUCTURAL_REJECTION_NOTIFY_MAX_PER_CYCLE,
@@ -368,28 +362,6 @@ def _log_structural_rejection(symbol: str, strategy: str, reason: str, notified:
         pass
 
 
-def _log_ai_gatekeeper(
-    symbol: str,
-    action: str,
-    strategy: str,
-    confidence: float,
-    ms_score: Optional[float],
-    probability: Optional[float],
-    approved: bool,
-    regime: Optional[str],
-):
-    prob_str = "n/a" if probability is None else f"{float(probability):.2f}"
-    _append_daily_log(
-        "ai_telemetry.txt",
-        (
-            f"symbol={symbol} action={action} strategy={strategy} conf={float(confidence):.2f} "
-            f"ms_score={('n/a' if ms_score is None else f'{float(ms_score):.1f}')} "
-            f"prob={prob_str} approved={int(bool(approved))} "
-            f"regime={regime or 'n/a'}"
-        ),
-    )
-
-
 def _log_execution_audit(
     symbol: str,
     action: str,
@@ -414,7 +386,7 @@ def _log_scan_cycle_summary(
     total_signals: int,
     rejected_signals: int,
     accepted_signals: int,
-    ai_blocked: int,
+    committee_rejected: int,
 ):
     acceptance_ratio = (accepted_signals / total_signals * 100.0) if total_signals else 0.0
     rejection_ratio = (rejected_signals / total_signals * 100.0) if total_signals else 0.0
@@ -422,7 +394,7 @@ def _log_scan_cycle_summary(
         "engine_cycle.txt",
         (
             f"scanned={scanned_symbols} candidates={total_signals} accepted={accepted_signals} "
-            f"rejected={rejected_signals} ai_blocked={ai_blocked} "
+            f"rejected={rejected_signals} committee_rejected={committee_rejected} "
             f"acceptance_ratio={acceptance_ratio:.2f}% rejection_ratio={rejection_ratio:.2f}%"
         ),
     )
@@ -1235,13 +1207,13 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
                     timeframes: dict = None, stop_loss_pct: float = None, strategy_label: str = None,
                     ms_score: Optional[float] = None, signal_score: Optional[float] = None,
                     mr_fast_bypass: bool = False, rsi_15m: Optional[float] = None,
-                    mom_rsi_15m: Optional[float] = None, mom_vol_ratio: Optional[float] = None,
-                    mom_low_vol_entry: bool = False):
+                    mom_rsi_15m: Optional[float] = None, mom_vol_ratio: Optional[float] = None):
     """
     Multi-tenant signal dispatcher.
 
-    Step 1 — AI Gatekeeper: validate_signal() is evaluated ONCE per signal.
-             A block here stops execution for ALL users (saves N broker calls).
+    Step 1 — Committee Gatekeeper: DecisionAgent 4-expert committee evaluates ONCE per signal.
+             In SHADOW mode: logs analysis, sends Telegram notification, does NOT block.
+             In ACTIVE mode: REJECTED verdict stops execution for ALL users (saves N broker calls).
 
     Step 2 — Per-user dispatch:
              AUTO   users → place_trade_for_user() called immediately.
@@ -1252,100 +1224,73 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
     Thread safety: each user gets their own broker session and DB row.
     No shared mutable state between users.
     """
-    # ── AI Gatekeeper (evaluated once, applies to all users) ──────────────────
-    # STRICT POLICY: A trade MUST have approved=1 from the AI model to proceed.
-    # All bypass/override logic has been eliminated. No exceptions.
-    ai_prob = None
-    ai_approved = True
-    regime = "UNKNOWN"
+    # ── Multi-Agent Committee Gatekeeper ─────────────────────────────────────
+    # Phase 5-A: DecisionAgent with 4-expert committee replaces legacy validate_signal()
+    # Committee: TechnicalAnalyst, TrendStrategist, MemoryHistorian, SentimentAnalyst
+    # Strict consensus: 3/4 votes required, SentimentAnalyst can veto with HIGH_NEGATIVE
+    committee_verdict = None
     if timeframes:
-        strategy_key = (strategy_label or "RF").strip()
-        ai_min_by_strategy = {
-            "RF": AI_MIN_PROB_RF,
-            "Momentum": AI_MIN_PROB_MOMENTUM,
-            "MeanRev": AI_MIN_PROB_MEANREV,
+        agent = get_decision_agent()
+        signal_data = {
+            "symbol": symbol,
+            "action": action,
+            "confidence": confidence,
+            "reason": reason,
+            "strategy_label": strategy_label,
+            "ms_score": ms_score,
+            "signal_score": signal_score,
         }
-        ai_min_prob = ai_min_by_strategy.get(strategy_key, AI_MIN_PROB_RF)
-        ai_approved, ai_prob, regime = validate_signal(
-            symbol, action, timeframes, min_probability=ai_min_prob, ms_score=ms_score
-        )
+        committee_verdict = agent.analyze_signal(signal_data, timeframes)
 
-        # ── AI DEBUG (CRITICAL) ───────────────────────────────────────────────
+        # ── COMMITTEE DEBUG ─────────────────────────────────────────────────────
         print(
-            f"[AI DEBUG] {symbol} {action} | "
-            f"conf={float(confidence):.1f} | prob={float(ai_prob):.1f} | "
-            f"approved={bool(ai_approved)} | strategy={strategy_key} | regime={regime}"
-        )
-        _log_ai_gatekeeper(
-            symbol=symbol,
-            action=action,
-            strategy=strategy_key,
-            confidence=float(confidence),
-            ms_score=ms_score,
-            probability=(float(ai_prob) if ai_prob is not None else None),
-            approved=bool(ai_approved),
-            regime=regime,
+            f"[COMMITTEE] {symbol} {action} | "
+            f"decision={committee_verdict.decision.value} | "
+            f"confidence={committee_verdict.confidence:.1f}% | "
+            f"shadow_mode={agent.shadow_mode}"
         )
 
-        if not ai_approved:
-            print(
-                f"[AI BLOCK] {symbol} {action} | "
-                f"prob={float(ai_prob):.1f} < min={float(ai_min_prob):.1f} | "
-                f"conf={float(confidence):.1f} | strategy={strategy_key} | regime={regime}"
-            )
-            _log_execution_audit(
-                symbol=symbol,
-                action=action,
-                strategy=strategy_label,
-                attempted=0,
-                opened=0,
-                skipped=0,
-                failed=0,
-                status="ai_blocked",
-            )
-            return {
-                "status": "ai_blocked",
-                "attempted": 0,
-                "opened": 0,
-                "skipped": 0,
-                "failed": 0,
-            }
+        # SHADOW MODE: Log analysis, send Telegram notification, but NEVER block
+        if agent.shadow_mode:
+            print(f"[SHADOW MODE] Committee analysis only — execution NOT blocked")
+            # Send committee decision to Telegram (admin monitoring)
+            try:
+                from bot.telegram_notifier import send_message
+                if ADMIN_CHAT_ID:
+                    send_message(ADMIN_CHAT_ID, committee_verdict.to_telegram_format())
+            except Exception as e:
+                print(f"[SHADOW NOTIFY ERROR] {e}")
 
-        # FAST momentum: high-RSI / relaxed-volume entries need stronger AI probability.
-        if (
-            mom_low_vol_entry
-            and strategy_key == "Momentum"
-            and (ai_prob is None or float(ai_prob) < float(FAST_MOM_LOW_VOL_AI_MIN))
-        ):
-            print(
-                f"[AI BLOCK] {symbol} {action} | "
-                f"FAST low-vol momentum requires AI prob >= {float(FAST_MOM_LOW_VOL_AI_MIN):.1f}% "
-                f"(got {float(ai_prob) if ai_prob is not None else 'n/a'})"
-            )
-            _log_execution_audit(
-                symbol=symbol,
-                action=action,
-                strategy=strategy_label,
-                attempted=0,
-                opened=0,
-                skipped=0,
-                failed=0,
-                status="ai_blocked_low_vol_momentum",
-            )
-            return {
-                "status": "ai_blocked",
-                "attempted": 0,
-                "opened": 0,
-                "skipped": 0,
-                "failed": 0,
-            }
-
-        # REMOVED: MACD bypass logic eliminated — AI approval now strictly required.
-        # REMOVED: ai_override logging — override functionality eliminated.
-        print(
-            f"   [AI OK] {symbol} {action} — probability={ai_prob:.1f}% "
-            f"| min({strategy_key})={ai_min_prob:.1f}% | regime={regime}"
-        )
+        # ACTIVE MODE: Committee decision gates execution
+        else:
+            if committee_verdict.decision.value == "REJECTED":
+                print(
+                    f"[COMMITTEE BLOCK] {symbol} {action} | "
+                    f"reason={committee_verdict.reason} | "
+                    f"confidence={committee_verdict.confidence:.1f}%"
+                )
+                _log_execution_audit(
+                    symbol=symbol,
+                    action=action,
+                    strategy=strategy_label,
+                    attempted=0,
+                    opened=0,
+                    skipped=0,
+                    failed=0,
+                    status="committee_rejected",
+                )
+                return {
+                    "status": "committee_rejected",
+                    "attempted": 0,
+                    "opened": 0,
+                    "skipped": 0,
+                    "failed": 0,
+                }
+            else:
+                print(
+                    f"[COMMITTEE APPROVED] {symbol} {action} | "
+                    f"confidence={committee_verdict.confidence:.1f}% | {committee_verdict.reason}"
+                )
 
     # ── Iterate only subscribers who have started their trading engine ─────────
     subscribers = get_trading_subscribers()
@@ -1428,7 +1373,7 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
                     chat_id, symbol, action,
                     confidence=confidence, stop_loss_pct=stop_loss_pct,
                     strategy_label=strategy_label,
-                    ai_prob=ai_prob,
+                    committee_confidence=(committee_verdict.confidence if committee_verdict else None),
                 )
                 print(f"   [AUTO  {chat_id}] {symbol} {action} → {result}")
                 if isinstance(result, str) and result.startswith("✅ Opened"):
@@ -1502,9 +1447,9 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
         "opened": opened,
         "skipped": skipped,
         "failed": failed,
-        "ai_approved": bool(ai_approved),
-        # REMOVED: "ai_override" — override logic eliminated per strict AI policy
-        "ai_probability": ai_prob,
+        "committee_decision": (committee_verdict.decision.value if committee_verdict else None),
+        "committee_confidence": (committee_verdict.confidence if committee_verdict else None),
+        "committee_reason": (committee_verdict.reason if committee_verdict else None),
     }
 
 
@@ -1822,14 +1767,14 @@ def run_trading_bot():
                     total_signals=0,
                     rejected_signals=0,
                     accepted_signals=0,
-                    ai_blocked=0,
+                    committee_rejected=0,
                 )
             else:
                 rej_sent = 0
                 rej_suppressed = 0
                 rej_counter = Counter()
                 accepted_count = 0
-                ai_blocked_count = 0
+                committee_rejected_count = 0
                 for sig in sorted(signals, key=lambda r: float(r.get("confidence", 0)), reverse=True):
                     symbol = sig["symbol"]
                     if sig.get("rejected"):
@@ -1877,18 +1822,18 @@ def run_trading_bot():
                         mom_vol_ratio=(
                             float(sig["mom_vol_ratio"]) if sig.get("mom_vol_ratio") is not None else None
                         ),
-                        mom_low_vol_entry=bool(sig.get("mom_low_vol_entry")),
+                        # REMOVED: mom_low_vol_entry — legacy AI gate eliminated
                         # REMOVED: mom_macd_bypassed — MACD bypass eliminated
                     )
-                    if isinstance(dispatch_result, dict) and dispatch_result.get("status") == "ai_blocked":
-                        ai_blocked_count += 1
+                    if isinstance(dispatch_result, dict) and dispatch_result.get("status") == "committee_rejected":
+                        committee_rejected_count += 1
 
                 total_candidates = len(signals)
                 rejected_count = total_candidates - accepted_count
                 acceptance_ratio = (accepted_count / total_candidates * 100.0) if total_candidates else 0.0
                 print(
                     f"[SCAN METRICS] candidates={total_candidates} accepted={accepted_count} "
-                    f"rejected={rejected_count} ai_blocked={ai_blocked_count} "
+                    f"rejected={rejected_count} committee_rejected={committee_rejected_count} "
                     f"acceptance_ratio={acceptance_ratio:.1f}%"
                 )
                 _log_scan_cycle_summary(
@@ -1896,7 +1841,7 @@ def run_trading_bot():
                     total_signals=total_candidates,
                     rejected_signals=rejected_count,
                     accepted_signals=accepted_count,
-                    ai_blocked=ai_blocked_count,
+                    committee_rejected=committee_rejected_count,
                 )
                 if rej_suppressed > 0:
                     top_reason, top_count = ("N/A", 0)
