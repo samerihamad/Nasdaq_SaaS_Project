@@ -839,12 +839,12 @@ class AutonomousTrainingManager:
             timeframe = html.escape(str(run.get('timeframe', 'unknown')))
             kind = html.escape(str(run.get('kind', 'unknown')))
             
-            # Build HTML message - no special characters to break parsing
+            # Build message with newlines for Telegram Markdown
             msg = (
-                "🤖 Autonomous training finished<br>"
-                f"mode={mode} reason={reason}<br>"
+                "🤖 Autonomous training finished\n"
+                f"mode={mode} reason={reason}\n"
                 f"ok={run.get('symbols_ok')}/{run.get('symbols_total')} "
-                f"failed={run.get('symbols_failed')}<br>"
+                f"failed={run.get('symbols_failed')}\n"
                 f"timeframe={timeframe} kind={kind} epochs={run.get('epochs')}"
             )
             # Use parse_mode='HTML' for safer formatting with dynamic content

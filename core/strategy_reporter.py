@@ -23,7 +23,7 @@ import sys
 import json
 import sqlite3
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from pathlib import Path
 
@@ -404,7 +404,7 @@ def should_run_scheduled_report() -> bool:
     
     UAE is UTC+4, so 23:30 UAE = 19:30 UTC.
     """
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     target_hour = 19  # 19:30 UTC = 23:30 UAE
     target_minute = 30
     

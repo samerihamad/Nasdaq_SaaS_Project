@@ -220,15 +220,15 @@ def _send_telegram_async(chat_id: str, message: str, context: str = "") -> None:
             if result is None:
                 _telegram_error_logger.error(f"[TELEGRAM SEND FAILED] context={context} | chat_id={chat_id}")
             else:
-                log.info(f"[TELEGRAM SENT] context={context}")
+                logging.info(f"[TELEGRAM SENT] context={context}")
         except Exception as e:
             _telegram_error_logger.error(f"[TELEGRAM EXCEPTION] context={context} | error={str(e)}")
-            log.error(f"[TELEGRAM EXCEPTION] context={context} | error={str(e)}")
+            logging.error(f"[TELEGRAM EXCEPTION] context={context} | error={str(e)}")
     
     # Submit to thread pool (non-blocking)
     try:
         _telegram_executor.submit(_send_task)
-        log.info(f"[TELEGRAM QUEUED] context={context}")
+        logging.info(f"[TELEGRAM QUEUED] context={context}")
     except Exception as e:
         _telegram_error_logger.error(f"[TELEGRAM QUEUE FAILED] context={context} | error={str(e)}")
 
@@ -276,7 +276,7 @@ def _start_scan_progress(total: int) -> None:
         "total_count": total,
         "last_heartbeat": time.time(),
     }
-    log.info(f"[SCAN PROGRESS] Started tracking for {total} symbols")
+    logging.info(f"[SCAN PROGRESS] Started tracking for {total} symbols")
 
 
 def _end_scan_progress() -> None:
@@ -284,7 +284,7 @@ def _end_scan_progress() -> None:
     global _scan_progress_state
     _scan_progress_state["active"] = False
     _scan_progress_state["started_at"] = None
-    log.info("[SCAN PROGRESS] Scan complete, tracking ended")
+    logging.info("[SCAN PROGRESS] Scan complete, tracking ended")
 
 
 def _log_calendar_sleep_mode(reason: str) -> None:
@@ -584,7 +584,7 @@ def _nightly_report_loop():
     
     while True:
         try:
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             today_str = now.strftime("%Y-%m-%d")
             
             # Check if it's time to send (19:30 UTC)
