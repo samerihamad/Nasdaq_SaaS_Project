@@ -86,7 +86,7 @@ EMERGENCY_BYPASS_ON_ERROR = True
 
 # AI Gate thresholds for the committee's decision logic
 # Phase 5-A: Strict Consensus — now requires 3 out of 4 experts to approve
-COMMITTEE_APPROVE_THRESHOLD = 3  # At least 3 experts must approve (strict consensus)
+COMMITTEE_APPROVE_THRESHOLD = 2  # At least 2 experts must approve (majority consensus)
 CONFIDENCE_THRESHOLD = 55.0  # Minimum confidence for an expert to approve
 
 
@@ -1490,7 +1490,7 @@ class DecisionAgent:
             verdict = "REJECT"
             consensus_conf = 25.0  # Low confidence due to negative sentiment
         elif approvals >= COMMITTEE_APPROVE_THRESHOLD:
-            # Strict consensus: 3+ experts must approve
+            # Majority consensus: 2+ experts must approve
             verdict = "APPROVE"
             # Phase 5-A: Weighted confidence calculation
             # Sentiment 30%, Trend 30%, Technical 20%, Memory 20%

@@ -40,8 +40,8 @@ TARGET_ANALYSIS_BARS = int(os.getenv("TARGET_ANALYSIS_BARS", "200"))
 
 # RSI thresholds — tier-based (Fast vs Gold / GOLDEN signal profile).
 # Tuple: (oversold_max_for_BUY, overbought_min_for_SELL) on 15m RSI.
-FAST_RSI_LIMITS = (45, 70)
-GOLD_RSI_LIMITS = (30, 70)
+FAST_RSI_LIMITS = (40, 60)
+GOLD_RSI_LIMITS = (40, 60)
 
 # FAST Mean Reversion: at/ beyond these 15m RSI levels, FAST tier may skip reversal candle / sweep (GOLDEN never).
 # CHANGED FOR MORE SIGNALS — FAST MODE ONLY — CONSERVATIVE BALANCED VERSION — based on April 7-8 logs
@@ -322,9 +322,9 @@ PREMARKET_ALERT_WINDOW_MIN = 30
 # April 7-8 AI telemetry shows RF probabilities mostly 9–48% while thresholds were ~64–65%,
 # causing near-total AI blocks. Lower thresholds *modestly* and rely on soft override for only
 # genuinely high-confidence strategy setups.
-AI_MIN_PROB_RF = float(os.getenv("AI_MIN_PROB_RF", "58.0"))
-AI_MIN_PROB_MOMENTUM = float(os.getenv("AI_MIN_PROB_MOMENTUM", "60.0"))
-AI_MIN_PROB_MEANREV = float(os.getenv("AI_MIN_PROB_MEANREV", "58.0"))
+AI_MIN_PROB_RF = float(os.getenv("AI_MIN_PROB_RF", "42.0"))
+AI_MIN_PROB_MOMENTUM = float(os.getenv("AI_MIN_PROB_MOMENTUM", "42.0"))
+AI_MIN_PROB_MEANREV = float(os.getenv("AI_MIN_PROB_MEANREV", "42.0"))
 
 # REMOVED: AI Soft Override logic — eliminated per strict AI gatekeeper policy.
 # A trade MUST have approved=1 from the AI model to proceed. No exceptions.

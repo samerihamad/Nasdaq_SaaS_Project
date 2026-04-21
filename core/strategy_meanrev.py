@@ -58,8 +58,8 @@ log = logging.getLogger(__name__)
 MR_1D_RSI_BUY_ALIGN_MAX = 68.0
 
 # QUANT OPTIMIZATION: ADX threshold for "Falling Knife" protection
-# If ADX > 25, market is trending strongly - disable Mean Reversion
-MR_ADX_TREND_THRESHOLD = 25.0
+# If ADX > 40, market is trending strongly - disable Mean Reversion
+MR_ADX_TREND_THRESHOLD = 40.0
 
 
 # ── Indicator helpers ─────────────────────────────────────────────────────────
