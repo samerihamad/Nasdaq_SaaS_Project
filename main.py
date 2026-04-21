@@ -1269,6 +1269,14 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
                     f"reason={committee_verdict.reason} | "
                     f"confidence={committee_verdict.confidence:.1f}%"
                 )
+                # Send Committee Decision to Telegram even when rejected (so user sees reasoning)
+                try:
+                    from bot.telegram_notifier import send_message
+                    if ADMIN_CHAT_ID:
+                        send_message(ADMIN_CHAT_ID, committee_verdict.to_telegram_format())
+                except Exception as e:
+                    print(f"[COMMITTEE NOTIFY ERROR] {e}")
+
                 _log_execution_audit(
                     symbol=symbol,
                     action=action,
@@ -1285,6 +1293,8 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
                     "opened": 0,
                     "skipped": 0,
                     "failed": 0,
+                    "committee_reason": committee_verdict.reason,
+                    "committee_confidence": committee_verdict.confidence,
                 }
             else:
                 print(
@@ -1510,6 +1520,62 @@ def _notify_structural_rejection(symbol: str, strategy: str, reason: str) -> boo
         return False
     _log_structural_rejection(symbol, strategy, reason, notified=False)
     return False
+
+
+def _send_cycle_summary_telegram(
+    scanned: int,
+    total: int,
+    rejected_count: int,
+    committee_rejected_count: int,
+    top_candidates: list
+) -> None:
+    """
+    Send a cycle summary to Telegram when 0 trades were accepted.
+    Shows why the top 3 candidates were rejected (structural or committee).
+    """
+    try:
+        from bot.telegram_notifier import send_message
+        if not ADMIN_CHAT_ID:
+            return
+
+        lang = _get_user_lang(ADMIN_CHAT_ID)
+
+        if lang == "ar":
+            msg_lines = [
+                "📊 ملخص دورة المسح — لم يتم قبول أي صفقات",
+                f"الرموز الممسوحة: {scanned} | المرشحين: {total}",
+                f"رفضتها اللجنة: {committee_rejected_count} | رفضها الفلتر: {rejected_count - committee_rejected_count}",
+                "",
+                "🏆 أفضل 3 مرشحين مرفوضين:"
+            ]
+            for i, cand in enumerate(top_candidates[:3], 1):
+                rej_by = "🤖 اللجنة" if cand["rejected_by"] == "Committee" else "⚡ فلتر بنيوي"
+                conf_str = f"{cand['confidence']:.1f}%"
+                reason_short = cand["reason"][:50] + "..." if len(cand["reason"]) > 50 else cand["reason"]
+                msg_lines.append(
+                    f"{i}. {cand['symbol']} ({cand['action']}) — {conf_str} | {rej_by}"
+                )
+                msg_lines.append(f"   └ {reason_short}")
+        else:
+            msg_lines = [
+                "📊 Cycle Summary — 0 Trades Accepted",
+                f"Scanned: {scanned} | Candidates: {total}",
+                f"Committee Rejected: {committee_rejected_count} | Filter Rejected: {rejected_count - committee_rejected_count}",
+                "",
+                "🏆 Top 3 Rejected Candidates:"
+            ]
+            for i, cand in enumerate(top_candidates[:3], 1):
+                rej_by = "🤖 Committee" if cand["rejected_by"] == "Committee" else "⚡ Structural Filter"
+                conf_str = f"{cand['confidence']:.1f}%"
+                reason_short = cand["reason"][:50] + "..." if len(cand["reason"]) > 50 else cand["reason"]
+                msg_lines.append(
+                    f"{i}. {cand['symbol']} ({cand['action']}) — {conf_str} | {rej_by}"
+                )
+                msg_lines.append(f"   └ {reason_short}")
+
+        send_message(ADMIN_CHAT_ID, "\n".join(msg_lines))
+    except Exception as e:
+        print(f"[CYCLE SUMMARY ERROR] {e}")
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -1760,6 +1826,9 @@ def run_trading_bot():
             duration = time.time() - scan_started
             print(f"[SCAN END] duration={duration:.1f} sec | signals_found={len(signals)}")
 
+            # Track top rejected candidates for cycle summary report
+            _top_rejected_candidates = []
+
             if not signals:
                 print("   [SCAN] No signals found this cycle.")
                 _log_scan_cycle_summary(
@@ -1775,13 +1844,26 @@ def run_trading_bot():
                 rej_counter = Counter()
                 accepted_count = 0
                 committee_rejected_count = 0
+                _top_rejected_candidates = []  # Track top 3 rejected for cycle summary
+
                 for sig in sorted(signals, key=lambda r: float(r.get("confidence", 0)), reverse=True):
                     symbol = sig["symbol"]
                     if sig.get("rejected"):
                         rej_reason = str(sig.get("reason", "Rejected by market structure filter"))
                         rej_strategy = str(sig.get("strategy_label", "Unknown"))
+                        rej_confidence = float(sig.get("confidence", 0))
                         rej_counter[rej_reason] += 1
                         print(f"   [{symbol}] REJECTED | strategy={rej_strategy} | {rej_reason}")
+                        # Track for cycle summary
+                        if len(_top_rejected_candidates) < 3:
+                            _top_rejected_candidates.append({
+                                "symbol": symbol,
+                                "action": sig.get("action", "N/A"),
+                                "confidence": rej_confidence,
+                                "reason": rej_reason,
+                                "strategy": rej_strategy,
+                                "rejected_by": "Structural Filter"
+                            })
                         if rej_sent < int(STRUCTURAL_REJECTION_NOTIFY_MAX_PER_CYCLE):
                             did_send = _notify_structural_rejection(symbol, rej_strategy, rej_reason)
                             if did_send:
@@ -1827,6 +1909,17 @@ def run_trading_bot():
                     )
                     if isinstance(dispatch_result, dict) and dispatch_result.get("status") == "committee_rejected":
                         committee_rejected_count += 1
+                        # Track for cycle summary
+                        if len(_top_rejected_candidates) < 3:
+                            _top_rejected_candidates.append({
+                                "symbol": symbol,
+                                "action": best_action,
+                                "confidence": best_conf,
+                                "reason": dispatch_result.get("committee_reason", "Committee rejected"),
+                                "strategy": best_label,
+                                "rejected_by": "Committee",
+                                "committee_confidence": dispatch_result.get("committee_confidence")
+                            })
 
                 total_candidates = len(signals)
                 rejected_count = total_candidates - accepted_count
@@ -1836,6 +1929,17 @@ def run_trading_bot():
                     f"rejected={rejected_count} committee_rejected={committee_rejected_count} "
                     f"acceptance_ratio={acceptance_ratio:.1f}%"
                 )
+
+                # If 0 accepted trades, send cycle summary to Telegram
+                if accepted_count == 0 and _top_rejected_candidates:
+                    _send_cycle_summary_telegram(
+                        scanned=len(_watchlist),
+                        total=total_candidates,
+                        rejected_count=rejected_count,
+                        committee_rejected_count=committee_rejected_count,
+                        top_candidates=_top_rejected_candidates
+                    )
+
                 _log_scan_cycle_summary(
                     scanned_symbols=len(_watchlist),
                     total_signals=total_candidates,
