@@ -1245,8 +1245,8 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
         # ── COMMITTEE DEBUG ─────────────────────────────────────────────────────
         print(
             f"[COMMITTEE] {symbol} {action} | "
-            f"decision={committee_verdict.decision.value} | "
-            f"confidence={committee_verdict.confidence:.1f}% | "
+            f"verdict={committee_verdict.verdict} | "
+            f"ai_confidence={committee_verdict.ai_confidence:.1f}% | "
             f"shadow_mode={agent.shadow_mode}"
         )
 
@@ -1257,25 +1257,29 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
             try:
                 from bot.telegram_notifier import send_message
                 if ADMIN_CHAT_ID:
+                    log.info(f"DEBUG: Attempting to send Committee SHADOW message to Telegram for symbol: {symbol}")
                     send_message(ADMIN_CHAT_ID, committee_verdict.to_telegram_format())
+                    log.info(f"DEBUG: Successfully sent SHADOW Committee message for {symbol}")
             except Exception as e:
-                print(f"[SHADOW NOTIFY ERROR] {e}")
+                log.error(f"[SHADOW NOTIFY ERROR] {e}")
 
         # ACTIVE MODE: Committee decision gates execution
         else:
-            if committee_verdict.decision.value == "REJECTED":
+            if committee_verdict.verdict == "REJECT":
                 print(
                     f"[COMMITTEE BLOCK] {symbol} {action} | "
-                    f"reason={committee_verdict.reason} | "
-                    f"confidence={committee_verdict.confidence:.1f}%"
+                    f"reason={committee_verdict.reasoning} | "
+                    f"confidence={committee_verdict.ai_confidence:.1f}%"
                 )
                 # Send Committee Decision to Telegram even when rejected (so user sees reasoning)
                 try:
                     from bot.telegram_notifier import send_message
                     if ADMIN_CHAT_ID:
+                        log.info(f"DEBUG: Attempting to send Committee REJECTED message to Telegram for symbol: {symbol}")
                         send_message(ADMIN_CHAT_ID, committee_verdict.to_telegram_format())
+                        log.info(f"DEBUG: Successfully sent REJECTED Committee message for {symbol}")
                 except Exception as e:
-                    print(f"[COMMITTEE NOTIFY ERROR] {e}")
+                    log.error(f"[COMMITTEE REJECTED NOTIFY ERROR] {e}")
 
                 _log_execution_audit(
                     symbol=symbol,
@@ -1293,14 +1297,22 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
                     "opened": 0,
                     "skipped": 0,
                     "failed": 0,
-                    "committee_reason": committee_verdict.reason,
-                    "committee_confidence": committee_verdict.confidence,
+                    "committee_reason": committee_verdict.reasoning,
+                    "committee_confidence": committee_verdict.ai_confidence,
                 }
             else:
                 print(
                     f"[COMMITTEE APPROVED] {symbol} {action} | "
-                    f"confidence={committee_verdict.confidence:.1f}% | {committee_verdict.reason}"
+                    f"confidence={committee_verdict.ai_confidence:.1f}% | {committee_verdict.reasoning}"
                 )
+                # Send Committee Decision to Telegram for APPROVED verdicts (so user sees reasoning)
+                try:
+                    from bot.telegram_notifier import send_message
+                    if ADMIN_CHAT_ID:
+                        log.info(f"DEBUG: Attempting to send Committee APPROVED message to Telegram for symbol: {symbol}")
+                        send_message(ADMIN_CHAT_ID, committee_verdict.to_telegram_format())
+                except Exception as e:
+                    log.error(f"[COMMITTEE APPROVED NOTIFY ERROR] {e}")
 
     # ── Iterate only subscribers who have started their trading engine ─────────
     subscribers = get_trading_subscribers()
@@ -1383,7 +1395,7 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
                     chat_id, symbol, action,
                     confidence=confidence, stop_loss_pct=stop_loss_pct,
                     strategy_label=strategy_label,
-                    committee_confidence=(committee_verdict.confidence if committee_verdict else None),
+                    committee_confidence=(committee_verdict.ai_confidence if committee_verdict else None),
                 )
                 print(f"   [AUTO  {chat_id}] {symbol} {action} → {result}")
                 if isinstance(result, str) and result.startswith("✅ Opened"):
@@ -1457,9 +1469,9 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
         "opened": opened,
         "skipped": skipped,
         "failed": failed,
-        "committee_decision": (committee_verdict.decision.value if committee_verdict else None),
-        "committee_confidence": (committee_verdict.confidence if committee_verdict else None),
-        "committee_reason": (committee_verdict.reason if committee_verdict else None),
+        "committee_decision": (committee_verdict.verdict if committee_verdict else None),
+        "committee_confidence": (committee_verdict.ai_confidence if committee_verdict else None),
+        "committee_reason": (committee_verdict.reasoning if committee_verdict else None),
     }
 
 
