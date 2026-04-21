@@ -30,7 +30,7 @@ from utils.ai_model import (
     analyze_multi_timeframe,
     load_or_train_model,
 )
-from core.decision_agent import get_decision_agent, AgentVerdict
+from core.decision_agent import get_decision_agent
 from utils.autonomous_training import AutonomousTrainingManager
 from utils.market_hours import (
     get_market_status,

@@ -2,16 +2,19 @@
 
 This document inventories all AI/ML logic in the project and how each part behaves in production.
 
-## Runtime Decision Flow
+## Runtime Decision Flow (Updated: Multi-Agent Committee)
 
 1. `core/signal_engine.py::scan_watchlist_parallel()` scans symbols and builds candidate signals.
 2. Candidate sources:
-   - RF multi-timeframe (`utils/ai_model.py::analyze_multi_timeframe`)
-   - Mean Reversion (`core/strategy_meanrev.py::analyze`)
-   - Momentum (`core/strategy_momentum.py::analyze`)
+   - RF multi-timeframe (`utils/ai_model.py`) -> *Now serves as an input to the Technical Analyst Agent.*
+   - Mean Reversion (`core/strategy_meanrev.py`)
+   - Momentum (`core/strategy_momentum.py`)
 3. Best candidate per symbol is forwarded to `main.py::dispatch_signal()`.
-4. `dispatch_signal()` applies **AI Gatekeeper** (`utils/ai_model.py::validate_signal`).
-5. If approved (or soft override), per-user dispatch runs and order execution continues in `core/executor.py`.
+4. `dispatch_signal()` invokes the **Multi-Agent Committee** (`core/decision_agent.py::get_decision_agent()`).
+5. The **DecisionAgent** executes a 4-Expert consensus (Technical, Trend, Memory, Sentiment):
+   - In **SHADOW MODE**: Logs decision and notifies Telegram, but never blocks execution.
+   - In **ACTIVE GATING**: Requires consensus to proceed; otherwise, returns `REJECTED`.
+6. Upon approval, per-user dispatch runs and order execution is finalized in `core/executor.py`.
 
 ---
 
