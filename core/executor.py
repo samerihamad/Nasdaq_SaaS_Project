@@ -4,9 +4,11 @@ import time
 import uuid
 import math
 import os
+import json
 import logging
 import threading
 import hashlib
+import traceback
 from datetime import datetime, timedelta, timezone
 import pandas as pd
 from bot.notifier import send_telegram_message, notify_admin_alert
@@ -92,6 +94,27 @@ _EXEC_TELEMETRY = {
     "local_guard_blocks": 0,
     "weekend_blocks": 0,
 }
+
+# System error logger for forensic analysis
+# Ensure log directory exists before creating handler
+os.makedirs(LOG_ROOT, exist_ok=True)
+_system_error_logger = logging.getLogger("system_errors")
+_system_error_handler = logging.FileHandler(os.path.join(LOG_ROOT, "system_errors.log"))
+_system_error_handler.setFormatter(logging.Formatter("%(asctime)s — %(levelname)s — %(message)s"))
+_system_error_logger.addHandler(_system_error_handler)
+_system_error_logger.setLevel(logging.ERROR)
+
+
+def _log_system_error(error_type: str, details: dict) -> None:
+    """
+    Log full error details to logs/system_errors.log for forensic analysis.
+    Never fails - errors are logged and execution continues.
+    """
+    try:
+        error_json = json.dumps(details, default=str, indent=2)
+        _system_error_logger.error(f"[{error_type}] {error_json}")
+    except Exception:
+        pass  # Never fail main flow on logging errors
 
 _TIME_SHIFT_ERROR_MARKERS = (
     "time shift",
@@ -534,9 +557,20 @@ def _broker_request(
     """
     Unified broker request wrapper.
     Returns: (ok, payload, error_msg, status_code)
+    
+    ENHANCED: Full error payload logging to logs/system_errors.log for forensic analysis.
     """
     respect_capital_http_interval_sync()
     req_headers = _with_broker_timestamp_headers(headers)
+    
+    # Prepare request context for error logging
+    request_context = {
+        "method": method.upper(),
+        "url": url,
+        "chat_id": chat_id,
+        "timestamp": synchronized_utc_now().isoformat(),
+    }
+    
     try:
         res = requests.request(
             method=method.upper(),
@@ -547,11 +581,29 @@ def _broker_request(
             timeout=timeout,
         )
     except Exception as exc:
+        # FULL ERROR EXPOSURE: Log connection/timeout errors with full traceback
+        error_details = {
+            **request_context,
+            "error_type": type(exc).__name__,
+            "error_message": str(exc),
+            "traceback": traceback.format_exc(),
+            "payload_sent": json_payload,
+        }
+        _log_system_error("BROKER_REQUEST_EXCEPTION", error_details)
         return False, {}, str(exc), 0
 
     data = _safe_json_response(res)
     if res.status_code != 200:
         err = _normalize_broker_error(res=res, payload=data)
+        # FULL ERROR EXPOSURE: Log broker rejection with full payload
+        error_details = {
+            "request": request_context,
+            "status_code": res.status_code,
+            "error": err,
+            "broker_payload": data,
+            "payload_sent": json_payload,
+        }
+        _log_system_error("BROKER_HTTP_ERROR", error_details)
         # Self-heal on session expiry/time drift and retry once with fresh session.
         if _is_time_or_session_error(int(res.status_code), err):
             recovered, _, payload = _force_resync_and_relogin(
@@ -584,7 +636,17 @@ def _broker_request(
                     return False, {}, str(exc2), 0
         return False, data, err, int(res.status_code)
     if isinstance(data, dict) and data.get("errorCode"):
-        return False, data, _normalize_broker_error(res=res, payload=data), int(res.status_code)
+        err = _normalize_broker_error(res=res, payload=data)
+        # FULL ERROR EXPOSURE: Log broker application error with full payload
+        error_details = {
+            "request": request_context,
+            "status_code": res.status_code,
+            "error": err,
+            "broker_payload": data,
+            "payload_sent": json_payload,
+        }
+        _log_system_error("BROKER_APPLICATION_ERROR", error_details)
+        return False, data, err, int(res.status_code)
     return True, data, "", int(res.status_code)
 
 
@@ -1459,13 +1521,13 @@ def _open_position_with_protection(
     *,
     creds=None,
     chat_id: str | None = None,
-    max_retries: int = 3,
-    slippage_tolerance_pct: float = 0.002,  # 0.2% slippage tolerance
+    max_retries: int = 5,  # Increased from 3 for high-volatility periods
+    slippage_tolerance_pct: float = 0.005,  # 0.5% slippage tolerance for NVDA/AAPL volatility
 ):
     """
     Open one position with attached stop-loss and take-profit levels.
-    Implements retry mechanism (up to 3 times) for REJECTED orders due to liquidity.
-    Includes 0.1-0.2% slippage tolerance for limit price execution.
+    Implements retry mechanism (up to 5 times) for REJECTED orders due to liquidity.
+    Includes 0.5% slippage tolerance for NVDA/AAPL volatility during market open.
     
     Returns (ok: bool, payload_or_error: dict|str).
     """
