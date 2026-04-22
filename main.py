@@ -178,6 +178,48 @@ _hourly_refresh_thread: Optional[threading.Thread] = None
 # Log [CALENDAR] sleep message at most once per UTC day when skipping Capital.com scans.
 _last_calendar_sleep_log_date = None
 
+
+def _parse_executor_result(result) -> dict:
+    """
+    Parse result from place_trade_for_user() which now returns structured dict.
+    Backward compatible with legacy string returns.
+    
+    Returns standardized dict with: status, stage, symbol, action, message
+    """
+    if isinstance(result, dict):
+        return result
+    
+    # Handle legacy string returns
+    result_str = str(result) if result else ""
+    if result_str.startswith("✅ Opened"):
+        return {"status": "opened", "stage": "complete", "message": result_str}
+    elif result_str.startswith("🧾 Limit placed"):
+        return {"status": "limit_placed", "stage": "complete", "message": result_str}
+    elif result_str.startswith("⏭️"):
+        return {"status": "skipped", "stage": "early_exit", "message": result_str}
+    elif "rejected" in result_str.lower() or "failed" in result_str.lower():
+        return {"status": "failed", "stage": "unknown", "message": result_str}
+    else:
+        return {"status": "unknown", "stage": "unknown", "message": result_str}
+
+
+def _is_trade_successful(result) -> bool:
+    """Check if executor result indicates successful trade."""
+    parsed = _parse_executor_result(result)
+    return parsed.get("status") in ("opened", "limit_placed")
+
+
+def _is_trade_skipped(result) -> bool:
+    """Check if executor result indicates skipped trade."""
+    parsed = _parse_executor_result(result)
+    return parsed.get("status") == "skipped"
+
+
+def _is_trade_failed(result) -> bool:
+    """Check if executor result indicates failed trade."""
+    parsed = _parse_executor_result(result)
+    return parsed.get("status") in ("failed", "rejected")
+
 # Dashboard bot subprocess handle (Phase 6-A Fix: auto-start Telegram bot)
 _dashboard_bot_process: Optional[subprocess.Popen] = None
 
@@ -651,34 +693,33 @@ def _hybrid_approval_loop():
                         stop_loss_pct=stop_loss_pct,
                         strategy_label=strategy_label,
                     )
-                    print(f"   [HYBRID {chat_id}] Signal #{signal_id} → {result}")
+                    parsed = _parse_executor_result(result)
+                    print(f"   [HYBRID {chat_id}] Signal #{signal_id} → {parsed}")
                     # place_trade_for_user() sends its own rich message on success.
                     # For non-open outcomes, send explicit feedback to the user here
                     # so Hybrid mode never looks "silent" after approval.
                     with sqlite3.connect(db_path) as cx:
-                        if isinstance(result, str) and result.startswith("✅ Opened"):
+                        if _is_trade_successful(result):
                             cx.execute(
                                 "UPDATE pending_signals SET status='EXECUTED' WHERE signal_id=?",
                                 (signal_id,),
                             )
-                        elif isinstance(result, str) and result.startswith("🧾 Limit placed"):
-                            cx.execute(
-                                "UPDATE pending_signals SET status='EXECUTED' WHERE signal_id=?",
-                                (signal_id,),
-                            )
-                        elif isinstance(result, str) and result.startswith("⏭️"):
+                        elif _is_trade_skipped(result):
                             cx.execute(
                                 "UPDATE pending_signals SET status='SKIPPED' WHERE signal_id=?",
                                 (signal_id,),
                             )
-                            send_telegram_message(chat_id, result)
+                            send_telegram_message(chat_id, parsed.get("message", str(result)))
                         else:
                             cx.execute(
                                 "UPDATE pending_signals SET status='FAILED' WHERE signal_id=?",
                                 (signal_id,),
                             )
-                            if isinstance(result, str) and result.strip():
-                                send_telegram_message(chat_id, result)
+                            # Executor now sends its own async failure notifications
+                            # But we still send a user-friendly message here
+                            msg = parsed.get("message", str(result))
+                            if msg and msg.strip():
+                                send_telegram_message(chat_id, msg)
                 except Exception as exc:
                     print(f"   [HYBRID {chat_id}] Signal #{signal_id} execution error: {exc}")
                     with sqlite3.connect(db_path) as cx:
@@ -1499,8 +1540,9 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
                     strategy_label=strategy_label,
                     committee_confidence=(committee_verdict.ai_confidence if committee_verdict else None),
                 )
-                print(f"   [AUTO  {chat_id}] {symbol} {action} → {result}")
-                if isinstance(result, str) and result.startswith("✅ Opened"):
+                parsed = _parse_executor_result(result)
+                print(f"   [AUTO  {chat_id}] {symbol} {action} → {parsed}")
+                if _is_trade_successful(result):
                     opened += 1
                     unsupported_for_all = False
                     print(f"[TRADE OPENED] {symbol} {action}")
@@ -1513,19 +1555,20 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
                         print(
                             f"[FAST EXECUTION] RSI Extreme ({float(rsi_15m):.1f}) - Bypassing Reversal Confirmation"
                         )
-                elif isinstance(result, str) and result.startswith("Trade rejected:"):
+                elif _is_trade_skipped(result):
+                    skipped += 1
+                    msg = parsed.get("message", str(result))
+                    if "symbol not available on broker" not in msg:
+                        unsupported_for_all = False
+                    print(f"[TRADE SKIPPED] {msg}")
+                elif parsed.get("status") == "rejected":
                     skipped += 1
                     unsupported_for_all = False
-                    print(f"[PRETRADE BLOCK] {result}")
-                elif isinstance(result, str) and result.startswith("⏭️"):
-                    skipped += 1
-                    if "symbol not available on broker" not in result:
-                        unsupported_for_all = False
-                    print(f"[TRADE SKIPPED] {result}")
+                    print(f"[PRETRADE BLOCK] {parsed.get('message', result)}")
                 else:
                     failed += 1
                     unsupported_for_all = False
-                    print(f"[TRADE FAILED] {result}")
+                    print(f"[TRADE FAILED] {parsed.get('message', result)}")
 
             else:
                 # HYBRID: post to DB, non-blocking.

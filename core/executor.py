@@ -16,6 +16,8 @@ from bot.licensing import safe_decrypt
 from config import (
     TP1_PCT,
     TP2_PCT,
+    TP1_ATR_MULT,
+    TP2_ATR_MULT,
     TP1_SPLIT_PCT,
     TP2_SPLIT_PCT,
     TP2_MIN_DISTANCE_BUFFER_MULT,
@@ -47,9 +49,15 @@ from database.db_manager import (
 from core.risk_manager import (
     can_open_trade,
     calculate_position_size, STATE_MANUAL_OVERRIDE,
-    check_daily_drawdown, check_rr_ratio,
+    check_daily_drawdown,
     get_effective_leverage, validate_pre_trade, generate_institutional_stop_loss,
     compute_last_rsi,
+)
+from core.risk_guardian import (
+    get_risk_guardian,
+    calculate_atr_targets,
+    validate_rr_ratio,
+    STATE_CIRCUIT_BREAKER,
 )
 from core.trade_session_finalize import after_trade_leg_closed
 from core.trailing_stop import (
@@ -115,6 +123,73 @@ def _log_system_error(error_type: str, details: dict) -> None:
         _system_error_logger.error(f"[{error_type}] {error_json}")
     except Exception:
         pass  # Never fail main flow on logging errors
+
+
+def _notify_execution_failure(
+    chat_id: str,
+    symbol: str,
+    action: str,
+    reason: str,
+    retry_count: int = 0,
+) -> None:
+    """
+    Send async [EXECUTION FAILED] notification to Telegram with error details.
+    Called when order fails after all retry attempts exhausted.
+    """
+    def _send_failure_task():
+        try:
+            # Read recent errors from system_errors.log for context
+            recent_errors = []
+            try:
+                log_path = os.path.join(LOG_ROOT, "system_errors.log")
+                if os.path.exists(log_path):
+                    with open(log_path, 'r') as f:
+                        lines = f.readlines()
+                        # Get last 3 relevant error lines
+                        relevant = [l for l in lines if symbol in l or 'REJECTED' in l or 'execution' in l.lower()]
+                        recent_errors = relevant[-3:] if relevant else []
+            except Exception:
+                pass
+
+            lang = get_subscriber_lang(chat_id)
+            timestamp = datetime.now(timezone.utc).strftime('%H:%M:%S UTC')
+
+            error_snippet = ""
+            if recent_errors:
+                error_snippet = "\n".join(recent_errors[-1:])[-200:]  # Last 200 chars
+
+            if lang == "en":
+                msg = (
+                    f"🚨 **[EXECUTION FAILED]**\n"
+                    f"Symbol: {symbol} {action}\n"
+                    f"Time: {timestamp}\n"
+                    f"Reason: {reason[:150]}\n"
+                    f"Retries: {retry_count}/5\n"
+                )
+                if error_snippet:
+                    msg += f"\nLog: {error_snippet}"
+            else:
+                msg = (
+                    f"🚨 **[فشل التنفيذ]**\n"
+                    f"الرمز: {symbol} {('شراء' if action=='BUY' else 'بيع')}\n"
+                    f"الوقت: {timestamp}\n"
+                    f"السبب: {reason[:150]}\n"
+                    f"المحاولات: {retry_count}/5\n"
+                )
+                if error_snippet:
+                    msg += f"\nالسجل: {error_snippet}"
+
+            send_telegram_message(chat_id, msg)
+            log.warning(f"[EXECUTION FAILED] Notified {chat_id} for {symbol} {action}: {reason[:100]}")
+        except Exception as e:
+            _system_error_logger.error(f"[NOTIFY FAILURE] Failed to send execution failure: {e}")
+
+    # Submit to background thread (non-blocking)
+    try:
+        threading.Thread(target=_send_failure_task, daemon=True).start()
+    except Exception as e:
+        log.error(f"[NOTIFY FAILURE] Could not start notification thread: {e}")
+
 
 _TIME_SHIFT_ERROR_MARKERS = (
     "time shift",
@@ -2611,11 +2686,14 @@ def _generate_protection_levels(
     except Exception:
         stop_price, stop_reason, stop_meta = base_stop_price, "fallback_base_stop_exception", {}
 
-    rr_ok, rr_ratio, rr_reason = check_rr_ratio(
+    # Use RiskGuardianAgent for ATR-based R:R validation
+    guardian = get_risk_guardian()
+    atr_value = float(atr) if (atr is not None and math.isfinite(float(atr))) else 0.0
+    rr_ok, rr_ratio, rr_reason = guardian.validate_rr_ratio(
         float(entry_price),
         float(stop_price),
         str(action),
-        float(atr) if (atr is not None and math.isfinite(float(atr))) else 0.0,
+        atr_value,
     )
     if isinstance(rr_ratio, float) and (math.isnan(rr_ratio) or math.isinf(rr_ratio)):
         rr_ok = False
@@ -2862,7 +2940,14 @@ def place_trade_for_user(
             action=str(action),
             details=str(gate_msg)[:240],
         )
-        return gate_msg
+        return {
+            "status": "rejected",
+            "stage": "execution_gate",
+            "message": gate_msg,
+            "symbol": symbol,
+            "action": action,
+            "chat_id": chat_id,
+        }
     lang = str(gate_ctx.get("lang") or get_subscriber_lang(chat_id))
     reason = str(gate_ctx.get("open_reason") or "")
     creds = gate_ctx["creds"]
@@ -2907,7 +2992,14 @@ def place_trade_for_user(
             action=str(action),
             details=str(prot_msg)[:240],
         )
-        return prot_msg
+        return {
+            "status": "rejected",
+            "stage": "protection_levels",
+            "message": prot_msg,
+            "symbol": symbol,
+            "action": action,
+            "chat_id": chat_id,
+        }
     entry_price = float(prot_ctx["entry_price"])
     atr = prot_ctx["atr"]
     effective_sl_pct = float(prot_ctx["effective_sl_pct"])
@@ -2944,7 +3036,14 @@ def place_trade_for_user(
             details=str(size_msg)[:240],
         )
         _maybe_notify_rejection(chat_id, size_msg, symbol=symbol, action=action, stage="pre_trade_validation")
-        return size_msg
+        return {
+            "status": "rejected",
+            "stage": "position_sizing",
+            "message": size_msg,
+            "symbol": symbol,
+            "action": action,
+            "chat_id": chat_id,
+        }
     pre_details = size_ctx["pre_details"]
     pretrade_size = float(size_ctx["pretrade_size"])
 
@@ -2965,7 +3064,14 @@ def place_trade_for_user(
             action=str(action),
             details=str(slip_msg)[:240],
         )
-        return slip_msg
+        return {
+            "status": "rejected",
+            "stage": "slippage_check",
+            "message": slip_msg,
+            "symbol": symbol,
+            "action": action,
+            "chat_id": chat_id,
+        }
 
     # ── Sprint 2: limit-first entry policy ───────────────────────────────────
     if ENABLE_LIMIT_ORDER_MODE and not force_market:
@@ -3023,9 +3129,12 @@ def place_trade_for_user(
         send_telegram_message(chat_id, msg)
         return f"🧾 Limit placed ({symbol} {action}) @ {float(limit_px):.4f}"
 
-    # ── Position size (1–2% risk, confidence-scaled) ──────────────────────────
-    size = pretrade_size if pretrade_size >= 1.0 else calculate_position_size(
-        balance, confidence, entry_price, effective_sl_pct, chat_id
+    # ── Position size (1–2% risk, confidence-scaled, volatility-adjusted) ─────
+    # RiskGuardianAgent applies extra 50% reduction in volatile regimes
+    guardian = get_risk_guardian()
+    atr_for_sizing = float(atr) if atr is not None and math.isfinite(float(atr)) else None
+    size = pretrade_size if pretrade_size >= 1.0 else guardian.calculate_position_size(
+        balance, confidence, entry_price, effective_sl_pct, chat_id, regime_type, atr_for_sizing
     )
     # Protection levels used BOTH for broker order and Telegram report.
     # Stop comes from institutional SL synthesis done pre-trade.
@@ -3055,15 +3164,36 @@ def place_trade_for_user(
             send_telegram_message(chat_id, msg)
         return msg
 
-    # Fixed targets as % distance from entry (independent of ATR/stop_dist).
+    # ATR-based targets (Risk Guardian v3.1) — volatility-adaptive take profit.
+    # Falls back to fixed percentage if ATR unavailable.
+    guardian = get_risk_guardian()
+    try:
+        atr_value = float(atr) if atr is not None and math.isfinite(float(atr)) else 0.0
+        if atr_value > 0:
+            target1, target2 = guardian.calculate_atr_targets(entry_price, atr_value, action)
+            log.info(f"[ATR TARGETS] {symbol}: Using ATR-based targets (ATR={atr_value:.4f})")
+        else:
+            # Fallback to fixed percentage (legacy)
+            if action == 'BUY':
+                target1 = entry_price * (1 + TP1_PCT)
+                target2 = entry_price * (1 + TP2_PCT)
+            else:
+                target1 = entry_price * (1 - TP1_PCT)
+                target2 = entry_price * (1 - TP2_PCT)
+            log.info(f"[ATR TARGETS] {symbol}: ATR unavailable, using fallback percentages")
+    except Exception as e:
+        log.warning(f"[ATR TARGETS] {symbol}: Error calculating ATR targets: {e}. Using fallback.")
+        if action == 'BUY':
+            target1 = entry_price * (1 + TP1_PCT)
+            target2 = entry_price * (1 + TP2_PCT)
+        else:
+            target1 = entry_price * (1 - TP1_PCT)
+            target2 = entry_price * (1 - TP2_PCT)
+
     if action == 'BUY':
-        target1 = entry_price * (1 + TP1_PCT)
-        target2 = entry_price * (1 + TP2_PCT)
         dir_ar   = 'شراء'
         sq_color = '🟩'
     else:
-        target1 = entry_price * (1 - TP1_PCT)
-        target2 = entry_price * (1 - TP2_PCT)
         dir_ar   = 'بيع'
         sq_color = '🟥'
 
@@ -3262,9 +3392,20 @@ def place_trade_for_user(
                 details=f"leg={leg_role} reason={reason[:220]}",
             )
             _log_trade_rejection(chat_id, symbol, action, f"{leg_role}_execution", msg, reason)
+            # Send async execution failure notification with system_errors.log details
+            _notify_execution_failure(chat_id, symbol, action, reason, retry_count=5)
             if (not SUPPRESS_EXPECTED_REJECTION_TELEGRAM) or (not _is_expected_rejection(reason)):
                 _maybe_notify_rejection(chat_id, msg, symbol=symbol, action=action, stage=f"{leg_role}_execution")
-            return msg
+            return {
+                "status": "failed",
+                "stage": f"{leg_role}_execution",
+                "message": msg,
+                "symbol": symbol,
+                "action": action,
+                "chat_id": chat_id,
+                "reason": reason,
+                "rollback": True,
+            }
 
     opened_trade_ids: list[int] = []
     
@@ -3313,7 +3454,16 @@ def place_trade_for_user(
     if not opened_legs:
         err = f"❌ Order failed ({symbol} {action}): no verified open position on broker"
         _maybe_notify_rejection(chat_id, err, symbol=symbol, action=action, stage="verify_open_position")
-        return err
+        _notify_execution_failure(chat_id, symbol, action, "no verified open position on broker", retry_count=0)
+        return {
+            "status": "failed",
+            "stage": "verify_open_position",
+            "message": err,
+            "symbol": symbol,
+            "action": action,
+            "chat_id": chat_id,
+            "reason": "no verified open position",
+        }
 
     verified_qty = float(sum(l[0] for l in opened_legs))
     total_amount = entry_price * verified_qty
@@ -3430,10 +3580,20 @@ def place_trade_for_user(
         float(calculated_slippage_pct * 100.0),
         float(atr) if atr is not None and math.isfinite(float(atr)) else 0.0,
     )
-    return (
-        f"✅ Opened — legs: {len(opened_legs)} | size: {verified_qty} | "
-        f"stop: {stop_info} | RR: {rr_ratio:.1f}"
-    )
+    return {
+        "status": "opened",
+        "stage": "complete",
+        "symbol": symbol,
+        "action": action,
+        "chat_id": chat_id,
+        "legs": len(opened_legs),
+        "size": verified_qty,
+        "stop": stop_info,
+        "rr_ratio": float(rr_ratio),
+        "entry_price": float(entry_price),
+        "trade_ids": opened_trade_ids,
+        "parent_session": parent_session,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

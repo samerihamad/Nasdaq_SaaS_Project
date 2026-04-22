@@ -117,8 +117,17 @@ ATR_PERIOD           = 14
 # ── Fixed Target Distances (entry-relative) ────────────────────────────────
 # These targets are used to set TP1/TP2 levels regardless of ATR/stop_distance.
 # TP1/T2 are percentages from entry price in the direction of the trade.
-TP1_PCT = 0.01   # 1%
-TP2_PCT = 0.025  # 2.5%
+TP1_PCT = 0.01   # 1% — legacy fallback, prefer ATR-based
+TP2_PCT = 0.025  # 2.5% — legacy fallback, prefer ATR-based
+
+# ── ATR-Based Take Profit (Risk Guardian v3.1) ───────────────────────────────
+# Replaces fixed percentage targets with volatility-adaptive ATR multipliers.
+# TP1 = Entry ± (ATR × multiplier), TP2 = Entry ± (ATR × multiplier)
+TP1_ATR_MULT = float(os.getenv("TP1_ATR_MULT", "1.5"))   # Conservative first target
+TP2_ATR_MULT = float(os.getenv("TP2_ATR_MULT", "3.0"))   # Extended second target
+
+# Volatility-based position size reduction (extra protection in volatile regimes)
+VOLATILITY_SIZE_REDUCTION_PCT = float(os.getenv("VOLATILITY_SIZE_REDUCTION_PCT", "0.50"))  # 50% extra reduction
 
 # ── Multi-leg execution split ────────────────────────────────────────────────
 # Capital.com only supports one TP per position, so we split into 2 legs:

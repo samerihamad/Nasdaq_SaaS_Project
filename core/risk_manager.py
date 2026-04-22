@@ -289,8 +289,8 @@ def can_open_trade(chat_id, is_pending_trigger=False):
         if weighted_exposure >= float(GLOBAL_MAX_OPEN_TRADES):
             return False, f"Global weighted exposure reached ({weighted_exposure}/{float(GLOBAL_MAX_OPEN_TRADES)})"
 
-        # Shadow cap for pending orders
-        max_pending_shadow_cap = 12
+        # Shadow cap for pending orders (env-driven, default 12)
+        max_pending_shadow_cap = int(os.getenv("MAX_PENDING_ORDERS", "12"))
         if pending_orders >= max_pending_shadow_cap:
             return False, (
                 f"Max Pending Orders Shadow Cap reached "
