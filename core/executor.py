@@ -108,6 +108,8 @@ os.makedirs(LOG_ROOT, exist_ok=True)
 _system_error_logger = logging.getLogger("system_errors")
 _system_error_handler = logging.FileHandler(os.path.join(LOG_ROOT, "system_errors.log"))
 _system_error_handler.setFormatter(logging.Formatter("%(asctime)s — %(levelname)s — %(message)s"))
+# FORCE FLUSH: Ensure errors are written immediately, not buffered
+_system_error_handler.flush = lambda: sys.stderr.flush()
 _system_error_logger.addHandler(_system_error_handler)
 _system_error_logger.setLevel(logging.ERROR)
 
@@ -116,21 +118,32 @@ def _log_system_error(error_type: str, details: dict) -> None:
     """
     Log full error details to logs/system_errors.log for forensic analysis.
     NEVER fails — if JSON serialization fails, log raw string representation.
+    FORCE FLUSH: All errors echoed to console immediately with flush=True.
     """
     try:
         error_json = json.dumps(details, default=str, indent=2)
         _system_error_logger.error(f"[{error_type}] {error_json}")
+        # FORCE FLUSH: Ensure error is written to disk immediately
+        _system_error_handler.flush()
+        sys.stderr.flush()
+        # CONSOLE ECHO: Always print to console so errors are VISIBLE
+        print(f"[SYSTEM ERROR LOGGED] {error_type}: {str(details)[:200]}", flush=True)
     except (TypeError, ValueError) as json_err:
         # JSON serialization failed — log raw representation
         try:
             raw_repr = str(details)[:2000]
             _system_error_logger.error(f"[{error_type}_RAW] JSON_ERR:{json_err} | DATA:{raw_repr}")
+            _system_error_handler.flush()
+            sys.stderr.flush()
+            print(f"[SYSTEM ERROR LOGGED - RAW] {error_type}", flush=True)
         except Exception as fallback_err:
             # Ultimate fallback — at least log that an error occurred
             print(f"[CRITICAL_LOG_FAILURE] {error_type}: {fallback_err}", flush=True)
+            sys.stderr.flush()
     except Exception as e:
         # Handler not available — try to at least print
         print(f"[CRITICAL_LOG_FAILURE] {error_type}: {e}", flush=True)
+        sys.stderr.flush()
 
 
 def _notify_execution_failure(
@@ -692,6 +705,8 @@ def _broker_request(
     data = _safe_json_response(res)
     if res.status_code != 200:
         err = _normalize_broker_error(res=res, payload=data)
+        # CONSOLE ECHO: Backup mouth — always visible in server console
+        print(f"[BROKER ERROR] Status: {res.status_code} | Error: {err[:200]}", flush=True)
         # FULL ERROR EXPOSURE: Log broker rejection with full payload
         error_details = {
             "request": request_context,
@@ -1009,9 +1024,11 @@ def get_user_credentials(chat_id):
 
 
 def get_session(creds, chat_id: str | None = None, force_refresh: bool = False):
+    # API PERMISSION PROBE: Diagnostic print to check session permissions
     api_key, password, is_demo, user_email = (
         str(creds[0]).strip(), str(creds[1]).strip(), creds[2], str(creds[3]).strip()
     )
+    print(f"[SESSION REQUEST] User: {user_email[:5]}... | Demo: {is_demo} | ForceRefresh: {force_refresh}", flush=True)
     base_url = (
         "https://demo-api-capital.backend-capital.com/api/v1"
         if is_demo else
