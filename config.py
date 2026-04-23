@@ -388,6 +388,11 @@ ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
 # Optional: shell command to restart the trading engine (Linux systemd example in deploy/).
 ENGINE_RESTART_CMD = os.getenv("ENGINE_RESTART_CMD", "").strip()
 
+# ── Phase 7: Unified Reporter Timezone Hardening ────────────────────────────
+# Local timezone offset from UTC (hours). Default 4 = UAE/Dubai (UTC+4).
+# Used by unified_reporter.py for consistent local-time reporting.
+LOCAL_TIMEZONE_OFFSET = int(os.getenv("LOCAL_TIMEZONE_OFFSET", "4"))
+
 # ── Capital.com Broker ────────────────────────────────────────────────────────
 
 # These are per-user credentials stored in DB; the keys below are for

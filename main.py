@@ -51,7 +51,8 @@ from utils.market_hours import (
     next_utc_occurrence,
     seconds_until_utc,
 )
-from utils.daily_report import send_daily_reports
+# LEGACY DISABLED Phase 7: utils.daily_report replaced by core.unified_reporter
+# from utils.daily_report import send_daily_reports
 from core.executor import place_trade_for_user, monitor_and_close, process_pending_limit_orders
 from core.sync import pnl_sync_background_active
 from core.watcher import run_watcher, get_all_active_subscribers, get_trading_subscribers
@@ -602,26 +603,27 @@ def _backup_loop():
         time.sleep(BACKUP_INTERVAL)
 
 
-def _nightly_report_loop():
+def _unified_report_loop():
     """
-    Phase 6-A: Daemon thread — sends dual-channel strategic reports at 23:30 UAE time.
+    Phase 7: Unified Daily Report — SINGLE AUTHORITY for daily summaries.
     
-    UAE time = UTC+4, so 23:30 UAE = 19:30 UTC.
+    Schedule: 20:05 UTC (00:05 UAE) — 5 minutes after market close.
     
-    Admin Report (internal metrics):
-      - Committee blocking performance
-      - Losses prevented estimation
-      - Consensus health
+    Consolidates:
+      - Daily Performance: P&L, Win Rate, Account Balance
+      - Strategic Insights: Committee Signal Stats (Approved vs. Blocked)
+      - Risk Guardian Status: Circuit Breakers, Drawdown alerts
     
-    Client Report (trading results):
-      - Daily P&L
-      - Trade statistics
-      - Market overview
+    This replaces BOTH:
+      - Phase 6-A strategy_reporter.py (23:30 UAE trigger)
+      - Legacy utils/daily_report.py (market-close trigger)
+    
+    Only ONE report is sent per day per subscriber.
     """
     from datetime import datetime
     
-    REPORT_HOUR_UTC = 19      # 19:30 UTC = 23:30 UAE
-    REPORT_MINUTE = 30
+    REPORT_HOUR_UTC = 20      # 20:05 UTC = 00:05 UAE (5 min after market close)
+    REPORT_MINUTE = 5
     ALREADY_SENT_TODAY = None
     
     while True:
@@ -629,24 +631,24 @@ def _nightly_report_loop():
             now = datetime.now(timezone.utc)
             today_str = now.strftime("%Y-%m-%d")
             
-            # Check if it's time to send (19:30 UTC)
+            # Check if it's time to send (20:05 UTC)
             if now.hour == REPORT_HOUR_UTC and now.minute == REPORT_MINUTE:
                 if ALREADY_SENT_TODAY != today_str:
-                    print("[NIGHTLY-REPORT] Phase 6-A: Generating strategic reports...")
+                    print("[UNIFIED-REPORT] Phase 7: Generating unified daily reports...")
                     try:
-                        from core.strategy_reporter import run_nightly_reports
-                        result = run_nightly_reports()
-                        print(f"[NIGHTLY-REPORT] Admin sent: {result['admin_sent']}, Clients: {result['clients_sent']}")
+                        from core.unified_reporter import send_unified_reports
+                        result = send_unified_reports()
+                        print(f"[UNIFIED-REPORT] Admin: {result['admin_sent']}, Clients: {result['clients_sent']}, Date: {result['date']}")
                         ALREADY_SENT_TODAY = today_str
                     except Exception as e:
-                        print(f"[NIGHTLY-REPORT] Error: {e}")
+                        print(f"[UNIFIED-REPORT] Error: {e}")
             
-            # Sleep for 60 seconds (check every minute)
-            time.sleep(60)
+            # Sleep for 30 seconds (check twice per minute)
+            time.sleep(30)
             
         except Exception as e:
-            print(f"[NIGHTLY-REPORT] Thread error: {e}")
-            time.sleep(60)
+            print(f"[UNIFIED-REPORT] Thread error: {e}")
+            time.sleep(30)
 
 
 def _hybrid_approval_loop():
@@ -923,7 +925,7 @@ def _start_background_threads():
         (_hybrid_approval_loop, "hybrid-approvals"),
         (_limit_order_worker_loop, "limit-orders"),
         (_market_open_alert_loop, "market-open-alert"),
-        (_nightly_report_loop,  "nightly-report"),  # Phase 6-A
+        (_unified_report_loop,  "unified-report"),  # Phase 7: Unified reporting
     ]:
         t = threading.Thread(target=target, name=name, daemon=True)
         t.start()
@@ -1827,12 +1829,15 @@ def run_trading_bot():
                 except Exception:
                     pass
 
-            # ── Detect OPEN → CLOSED transition → send daily report ───────────
-            if _prev_market_status == STATUS_OPEN and market_status != STATUS_OPEN:
-                if _daily_report_sent != today:
-                    print("[MARKET] السوق أغلق — إرسال التقرير اليومي لجميع المشتركين...")
-                    send_daily_reports()
-                    _daily_report_sent = today
+            # ── Detect OPEN → CLOSED transition ────────────────────────────────
+            # LEGACY DISABLED Phase 7: Market-close daily report replaced by
+            # unified reporter at 20:05 UTC. DO NOT call send_daily_reports() here.
+            # if _prev_market_status == STATUS_OPEN and market_status != STATUS_OPEN:
+            #     if _daily_report_sent != today:
+            #         print("[MARKET] Market closed — sending daily report...")
+            #         send_daily_reports()
+            #         _daily_report_sent = today
+            pass  # Phase 7: Unified Reporter handles daily reports at 20:05 UTC
 
             # ── Detect CLOSED → OPEN transition → reset closed flag ───────────
             if _prev_market_status != STATUS_OPEN and market_status == STATUS_OPEN:

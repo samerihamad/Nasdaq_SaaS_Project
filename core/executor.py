@@ -22,7 +22,6 @@ from config import (
     TP2_SPLIT_PCT,
     TP2_MIN_DISTANCE_BUFFER_MULT,
     BE_LOCK_BUFFER_PCT,
-    SUPPRESS_EXPECTED_REJECTION_TELEGRAM,
     ENABLE_LIMIT_ORDER_MODE,
     LIMIT_ORDER_TTL_BARS,
     LIMIT_ORDER_BAR_MINUTES,
@@ -116,13 +115,22 @@ _system_error_logger.setLevel(logging.ERROR)
 def _log_system_error(error_type: str, details: dict) -> None:
     """
     Log full error details to logs/system_errors.log for forensic analysis.
-    Never fails - errors are logged and execution continues.
+    NEVER fails — if JSON serialization fails, log raw string representation.
     """
     try:
         error_json = json.dumps(details, default=str, indent=2)
         _system_error_logger.error(f"[{error_type}] {error_json}")
-    except Exception:
-        pass  # Never fail main flow on logging errors
+    except (TypeError, ValueError) as json_err:
+        # JSON serialization failed — log raw representation
+        try:
+            raw_repr = str(details)[:2000]
+            _system_error_logger.error(f"[{error_type}_RAW] JSON_ERR:{json_err} | DATA:{raw_repr}")
+        except Exception as fallback_err:
+            # Ultimate fallback — at least log that an error occurred
+            print(f"[CRITICAL_LOG_FAILURE] {error_type}: {fallback_err}", flush=True)
+    except Exception as e:
+        # Handler not available — try to at least print
+        print(f"[CRITICAL_LOG_FAILURE] {error_type}: {e}", flush=True)
 
 
 def _notify_execution_failure(
@@ -131,64 +139,72 @@ def _notify_execution_failure(
     action: str,
     reason: str,
     retry_count: int = 0,
+    full_broker_payload: dict | None = None,
 ) -> None:
     """
-    Send async [EXECUTION FAILED] notification to Telegram with error details.
+    Send async [EXECUTION FAILED] notification to Telegram with full broker payload.
     Called when order fails after all retry attempts exhausted.
+    
+    CRITICAL: Receives broker payload directly — does NOT rely on log file which may be empty.
     """
     def _send_failure_task():
         try:
-            # Read recent errors from system_errors.log for context
-            recent_errors = []
-            try:
-                log_path = os.path.join(LOG_ROOT, "system_errors.log")
-                if os.path.exists(log_path):
-                    with open(log_path, 'r') as f:
-                        lines = f.readlines()
-                        # Get last 3 relevant error lines
-                        relevant = [l for l in lines if symbol in l or 'REJECTED' in l or 'execution' in l.lower()]
-                        recent_errors = relevant[-3:] if relevant else []
-            except Exception:
-                pass
-
             lang = get_subscriber_lang(chat_id)
             timestamp = datetime.now(timezone.utc).strftime('%H:%M:%S UTC')
-
-            error_snippet = ""
-            if recent_errors:
-                error_snippet = "\n".join(recent_errors[-1:])[-200:]  # Last 200 chars
-
+            
+            # Build clean error summary from broker payload (NOT from log file)
+            broker_details = {}
+            if isinstance(full_broker_payload, dict):
+                # Extract only the essential fields
+                broker_details = {
+                    "errorCode": full_broker_payload.get("errorCode"),
+                    "errorMessage": full_broker_payload.get("errorMessage") or full_broker_payload.get("message"),
+                    "rejectionReason": full_broker_payload.get("rejectionReason"),
+                }
+                # Remove None values
+                broker_details = {k: v for k, v in broker_details.items() if v is not None}
+            
             if lang == "en":
                 msg = (
                     f"🚨 **[EXECUTION FAILED]**\n"
                     f"Symbol: {symbol} {action}\n"
                     f"Time: {timestamp}\n"
-                    f"Reason: {reason[:150]}\n"
+                    f"Reason: {reason[:200]}\n"
                     f"Retries: {retry_count}/5\n"
                 )
-                if error_snippet:
-                    msg += f"\nLog: {error_snippet}"
+                if broker_details:
+                    broker_json = json.dumps(broker_details, indent=2, default=str, ensure_ascii=False)[:500]
+                    msg += f"\n📋 Broker Response:\n```json\n{broker_json}\n```"
             else:
                 msg = (
                     f"🚨 **[فشل التنفيذ]**\n"
                     f"الرمز: {symbol} {('شراء' if action=='BUY' else 'بيع')}\n"
                     f"الوقت: {timestamp}\n"
-                    f"السبب: {reason[:150]}\n"
+                    f"السبب: {reason[:200]}\n"
                     f"المحاولات: {retry_count}/5\n"
                 )
-                if error_snippet:
-                    msg += f"\nالسجل: {error_snippet}"
+                if broker_details:
+                    broker_json = json.dumps(broker_details, indent=2, default=str, ensure_ascii=False)[:500]
+                    msg += f"\n📋 رد الوسيط:\n```json\n{broker_json}\n```"
 
             send_telegram_message(chat_id, msg)
-            log.warning(f"[EXECUTION FAILED] Notified {chat_id} for {symbol} {action}: {reason[:100]}")
+            log.warning(f"[EXECUTION FAILED] Notified {chat_id} for {symbol} {action}")
         except Exception as e:
-            _system_error_logger.error(f"[NOTIFY FAILURE] Failed to send execution failure: {e}")
+            # CRITICAL: Even notification failure must be logged
+            try:
+                _system_error_logger.error(f"[NOTIFY FAILURE] Failed to send execution failure: {e}")
+            except Exception:
+                print(f"[CRITICAL] Notification failure: {e}", flush=True)
 
     # Submit to background thread (non-blocking)
     try:
         threading.Thread(target=_send_failure_task, daemon=True).start()
     except Exception as e:
-        log.error(f"[NOTIFY FAILURE] Could not start notification thread: {e}")
+        # Log thread start failure
+        try:
+            _system_error_logger.error(f"[NOTIFY FAILURE] Could not start notification thread: {e}")
+        except Exception:
+            print(f"[CRITICAL] Could not start notification thread: {e}", flush=True)
 
 
 _TIME_SHIFT_ERROR_MARKERS = (
@@ -448,19 +464,25 @@ def _log_trade_rejection(
 
 
 def _is_expected_rejection(reason: str) -> bool:
+    """
+    Only suppress notifications for KNOWN configuration errors.
+    ANY broker rejection message containing 'REJECTED' is NOT expected and MUST be reported.
+    """
     r = str(reason or "").lower()
-    markers = [
+    
+    # ONLY these exact error codes are "expected" (user config issues)
+    exact_codes = [
         "error.invalid.takeprofit.minvalue",
         "error.invalid.stoploss.maxvalue",
-        "deal rejected (rejected)",
-        "target not achievable within atr",
-        "does not meet minimum 1:2",
-        "symbol not available on broker",
-        "distance too tight for broker rules",
-        "min distance",
-        "max distance",
+        "error.invalid.stoploss.minvalue",
+        "error.invalid.takeprofit.maxvalue",
     ]
-    return any(m in r for m in markers)
+    
+    # If it contains the word "rejected" anywhere, it's a broker rejection → NOT expected
+    if "rejected" in r:
+        return False
+    
+    return any(code in r for code in exact_codes)
 
 
 def _extract_min_tp_value(err: str) -> float | None:
@@ -3160,8 +3182,8 @@ def place_trade_for_user(
     if stop_dist <= 0:
         msg = f"❌ Order failed ({symbol} {action}): invalid stop distance"
         _log_trade_rejection(chat_id, symbol, action, "stop_validation", msg)
-        if not SUPPRESS_EXPECTED_REJECTION_TELEGRAM:
-            send_telegram_message(chat_id, msg)
+        # ALWAYS notify on execution failures
+        send_telegram_message(chat_id, msg)
         return msg
 
     # ATR-based targets (Risk Guardian v3.1) — volatility-adaptive take profit.
@@ -3392,10 +3414,18 @@ def place_trade_for_user(
                 details=f"leg={leg_role} reason={reason[:220]}",
             )
             _log_trade_rejection(chat_id, symbol, action, f"{leg_role}_execution", msg, reason)
-            # Send async execution failure notification with system_errors.log details
-            _notify_execution_failure(chat_id, symbol, action, reason, retry_count=5)
-            if (not SUPPRESS_EXPECTED_REJECTION_TELEGRAM) or (not _is_expected_rejection(reason)):
-                _maybe_notify_rejection(chat_id, msg, symbol=symbol, action=action, stage=f"{leg_role}_execution")
+            # Send async execution failure notification with full broker payload
+            # CRITICAL: Pass the broker payload directly — do NOT rely on log file
+            _notify_execution_failure(
+                chat_id=chat_id,
+                symbol=symbol,
+                action=action,
+                reason=reason,
+                retry_count=5,
+                full_broker_payload=payload if 'payload' in locals() else None,
+            )
+            # ALWAYS notify on execution failures — suppression removed per Phase 7
+            _maybe_notify_rejection(chat_id, msg, symbol=symbol, action=action, stage=f"{leg_role}_execution")
             return {
                 "status": "failed",
                 "stage": f"{leg_role}_execution",
