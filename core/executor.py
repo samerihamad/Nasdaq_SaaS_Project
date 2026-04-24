@@ -45,6 +45,9 @@ from database.db_manager import (
     get_user_signal_profile,
     touch_signal_delivered,
 )
+# Session Management Agent integration (Phase 8: High-Scale Auth)
+# Routes all authentication through centralized queue to prevent 429 errors
+from core.session_agent import get_valid_session as _agent_get_session
 from core.risk_manager import (
     can_open_trade,
     calculate_position_size, STATE_MANUAL_OVERRIDE,
@@ -1024,7 +1027,56 @@ def get_user_credentials(chat_id):
 
 
 def get_session(creds, chat_id: str | None = None, force_refresh: bool = False):
-    # API PERMISSION PROBE: Diagnostic print to check session permissions
+    """
+    Get Capital.com session with 429 protection via SessionAgent.
+    
+    Phase 8: All auth requests now route through centralized queue.
+    - Rate limited to 1 auth per 10 seconds globally
+    - Cached sessions returned instantly
+    - 50+ users queued automatically without blocking
+    """
+    api_key, password, is_demo, user_email = (
+        str(creds[0]).strip(), str(creds[1]).strip(), creds[2], str(creds[3]).strip()
+    )
+    
+    # PHASE 8: Route through SessionAgent for 429 protection
+    try:
+        # Try async agent first (handles queue, caching, rate limiting)
+        import asyncio
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        
+        if loop is not None:
+            # We're in async context - can await directly
+            future = _agent_get_session(
+                user_id=str(chat_id) if chat_id else user_email[:8],
+                creds=(api_key, password, is_demo, user_email),
+                force_refresh=force_refresh
+            )
+            # Create task and run it
+            task = asyncio.create_task(future)
+            return loop.run_until_complete(task)
+        else:
+            # No running loop - create one
+            result = asyncio.run(_agent_get_session(
+                user_id=str(chat_id) if chat_id else user_email[:8],
+                creds=(api_key, password, is_demo, user_email),
+                force_refresh=force_refresh
+            ))
+            return result
+    except Exception as agent_error:
+        # Agent failed - fallback to direct auth with warning
+        print(f"[SESSION AGENT FALLBACK] User: {user_email[:5]}... Error: {agent_error}", flush=True)
+        return _get_session_direct(creds, chat_id=chat_id, force_refresh=force_refresh)
+
+
+def _get_session_direct(creds, chat_id: str | None = None, force_refresh: bool = False):
+    """
+    DIRECT AUTH FALLBACK: Use only when SessionAgent fails.
+    Maintains original get_session() logic for backward compatibility.
+    """
     api_key, password, is_demo, user_email = (
         str(creds[0]).strip(), str(creds[1]).strip(), creds[2], str(creds[3]).strip()
     )
