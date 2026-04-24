@@ -1030,69 +1030,26 @@ def get_session(creds, chat_id: str | None = None, force_refresh: bool = False):
     """
     Get Capital.com session with 429 protection via SessionAgent.
     
-    Phase 8: All auth requests now route through centralized queue.
+    Phase 8 (FIXED): All auth requests route through centralized queue.
+    - SYNCHRONOUS API - No asyncio.run() conflicts
     - Rate limited to 1 auth per 10 seconds globally
-    - Cached sessions returned instantly
-    - 50+ users queued automatically without blocking
-    - FIX: Handles both sync and async contexts without event loop conflicts
+    - Cached sessions returned instantly (NON-BLOCKING)
+    - 50+ users queued automatically without blocking main thread
     """
     api_key, password, is_demo, user_email = (
         str(creds[0]).strip(), str(creds[1]).strip(), creds[2], str(creds[3]).strip()
     )
     
     # PHASE 8: Route through SessionAgent for 429 protection
+    # SessionAgent is now FULLY SYNCHRONOUS - no event loop conflicts
     try:
-        import asyncio
-        import threading
-        
-        def run_async_in_thread(coro):
-            """Run async coroutine in a separate thread to avoid loop conflicts."""
-            result_container = {}
-            exception_container = {}
-            
-            def thread_target():
-                try:
-                    # Create new event loop in this thread
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    result_container['result'] = loop.run_until_complete(coro)
-                    loop.close()
-                except Exception as e:
-                    exception_container['error'] = e
-            
-            # Run in separate thread
-            thread = threading.Thread(target=thread_target)
-            thread.start()
-            thread.join(timeout=60)  # 60 second timeout
-            
-            if thread.is_alive():
-                raise TimeoutError("Session acquisition timed out after 60s")
-            
-            if 'error' in exception_container:
-                raise exception_container['error']
-            
-            return result_container.get('result')
-        
-        try:
-            # Check if we're in a running event loop
-            loop = asyncio.get_running_loop()
-            # We're in async context - must use thread-based execution
-            # to avoid "This event loop is already running" error
-            result = run_async_in_thread(_agent_get_session(
-                user_id=str(chat_id) if chat_id else user_email[:8],
-                creds=(api_key, password, is_demo, user_email),
-                force_refresh=force_refresh
-            ))
-            return result
-        except RuntimeError:
-            # No running loop - safe to use asyncio.run()
-            result = asyncio.run(_agent_get_session(
-                user_id=str(chat_id) if chat_id else user_email[:8],
-                creds=(api_key, password, is_demo, user_email),
-                force_refresh=force_refresh
-            ))
-            return result
-            
+        result = _agent_get_session(
+            user_id=str(chat_id) if chat_id else user_email[:8],
+            creds=(api_key, password, is_demo, user_email),
+            force_refresh=force_refresh,
+            timeout=60.0
+        )
+        return result
     except Exception as agent_error:
         # Agent failed - fallback to direct auth with warning
         print(f"[SESSION AGENT FALLBACK] User: {user_email[:5]}... Error: {agent_error}", flush=True)
