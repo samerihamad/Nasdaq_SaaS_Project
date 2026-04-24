@@ -154,7 +154,14 @@ class SessionManager:
         return (expires_ts - 60) > now
     
     async def start(self):
-        """Start the queue processor worker."""
+        """Start the queue processor worker in the current event loop."""
+        # Ensure we're attached to the current running loop
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
         if self._worker_task is None or self._worker_task.done():
             self._worker_task = asyncio.create_task(self._queue_processor())
             logger.info("[SessionAgent] Queue processor started")
