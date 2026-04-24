@@ -10,12 +10,12 @@ cd "$SCRIPT_DIR"
 
 echo "🚀 [AUTO-DEPLOY] New files detected. Starting cleanup..."
 
-# Cleanup Python cache
-find . -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
-find . -name "*.pyc" -delete 2>/dev/null || true
-find . -name "*.pyo" -delete 2>/dev/null || true
+# Cleanup Python cache (exclude venv to avoid permission issues)
+find . -name '__pycache__' -type d -not -path './venv/*' -exec rm -rf {} +
+find . -name "*.pyc" -delete
+find . -name "*.pyo" -delete
 
-echo "🧹 [AUTO-DEPLOY] Cache cleaned."
+echo '🧹 [CLEANUP] Project cache cleared successfully.'
 
 # Kill existing main.py processes safely
 if pgrep -f "main.py" > /dev/null; then
