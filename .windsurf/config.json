@@ -1,0 +1,33 @@
+{
+  "version": "1.0",
+  "workflows": {
+    "ship": {
+      "description": "Deploy code to server with auto-restart",
+      "post_command": {
+        "command": "bash ./post-ship.sh",
+        "description": "Trigger server auto-deploy after files are uploaded",
+        "blocking": true,
+        "on_success": "echo '✅ Ship + Auto-deploy completed successfully'",
+        "on_failure": "echo '❌ Ship completed but auto-deploy failed. Run manually: bash post-ship.sh'"
+      }
+    }
+  },
+  "commands": {
+    "ship-and-restart": {
+      "description": "Ship files and restart server service",
+      "steps": [
+        {
+          "type": "builtin",
+          "command": "ship",
+          "description": "Upload files to server"
+        },
+        {
+          "type": "shell",
+          "command": "bash ./post-ship.sh",
+          "description": "Execute auto-deploy on server",
+          "blocking": true
+        }
+      ]
+    }
+  }
+}
