@@ -47,7 +47,7 @@ from database.db_manager import (
 )
 # Session Management Agent integration (Phase 8: High-Scale Auth)
 # Routes all authentication through centralized queue to prevent 429 errors
-from core.session_agent import get_valid_session as _agent_get_session
+from core.session_agent import SessionManager, get_valid_session as _agent_get_session
 from core.risk_manager import (
     can_open_trade,
     calculate_position_size, STATE_MANUAL_OVERRIDE,
@@ -1030,25 +1030,29 @@ def get_session(creds, chat_id: str | None = None, force_refresh: bool = False):
     """
     Get Capital.com session with 429 protection via SessionAgent.
     
-    Phase 8 (FIXED): All auth requests route through centralized queue.
-    - SYNCHRONOUS API - No asyncio.run() conflicts
+    Phase 8 (ACTIVE): All auth requests route through centralized queue.
+    - EXPLICIT SessionManager.get_instance() call
     - Rate limited to 1 auth per 10 seconds globally
     - Cached sessions returned instantly (NON-BLOCKING)
-    - 50+ users queued automatically without blocking main thread
     """
+    # VERY LOUD DEBUG - CONFIRM AGENT IS ACTIVE
+    print("[DEBUG] AGENT SYSTEM ACTIVATED - HELLO SAMER", flush=True)
+    
     api_key, password, is_demo, user_email = (
         str(creds[0]).strip(), str(creds[1]).strip(), creds[2], str(creds[3]).strip()
     )
     
-    # PHASE 8: Route through SessionAgent for 429 protection
-    # SessionAgent is now FULLY SYNCHRONOUS - no event loop conflicts
+    # PHASE 8: Explicit SessionManager call for 429 protection
     try:
-        result = _agent_get_session(
+        # Get singleton instance and call sync method directly
+        session_manager = SessionManager()
+        result = session_manager.get_valid_session_sync(
             user_id=str(chat_id) if chat_id else user_email[:8],
             creds=(api_key, password, is_demo, user_email),
             force_refresh=force_refresh,
             timeout=60.0
         )
+        print(f"[SESSION AGENT] SUCCESS for User {user_email[:5]}...", flush=True)
         return result
     except Exception as agent_error:
         # Agent failed - fallback to direct auth with warning

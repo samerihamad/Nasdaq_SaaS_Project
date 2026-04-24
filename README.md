@@ -82,9 +82,9 @@ passing `can_open_trade()`.**
 **Open positions are never touched by the circuit breaker** — they stay
 active until the ATR trailing stop or hard 3% portfolio stop is hit.
 
----
+----
 
-## Setup
+# Setup
 
 ### 1. Install dependencies
 ```bash

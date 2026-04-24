@@ -34,7 +34,7 @@ shortcuts** for local development; on a VPS you run the same Python modules from
 
 - `run_main.bat`, `run_dashboard.bat`, `run_backup.bat` — optional; replace with shell scripts or systemd units.
 
-## Suggested production habits
+# Suggested production habits
 
 - One **Python venv** on the server: `python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt` (+ any other deps your app imports).
 - **Restart** services after `.env` changes.
