@@ -394,7 +394,7 @@ STREAMLIT_PUBLIC_URL = os.getenv("STREAMLIT_PUBLIC_URL", "http://127.0.0.1:8501"
 # Shared secret: must match Streamlit ?token= and be kept private.
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
 # Optional: shell command to restart the trading engine (Linux systemd example in deploy/).
-ENGINE_RESTART_CMD = os.getenv("ENGINE_RESTART_CMD", "").strip()
+ENGINE_RESTART_CMD = os.getenv("ENGINE_RESTART_CMD", "sudo systemctl restart natb-engine.service").strip()
 
 # ── Phase 7: Unified Reporter Timezone Hardening ────────────────────────────
 # Local timezone offset from UTC (hours). Default 4 = UAE/Dubai (UTC+4).

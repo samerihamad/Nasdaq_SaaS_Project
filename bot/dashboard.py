@@ -2214,10 +2214,17 @@ async def system_status_handler(update: Update, context: ContextTypes.DEFAULT_TY
     processing_msg = await update.message.reply_text("🔍 Checking system status...")
     
     try:
+        import psutil
+        import threading
         from core.executor import get_system_sync_status
         
         # Get own status
         status = get_system_sync_status(chat_id)
+        
+        # Hardware Metrics
+        cpu_usage = psutil.cpu_percent(interval=0.1)
+        ram_usage = psutil.virtual_memory().percent
+        active_threads = threading.active_count()
         
         # Format report
         db_status = status["database"]["status"]
@@ -2229,6 +2236,11 @@ async def system_status_handler(update: Update, context: ContextTypes.DEFAULT_TY
         broker_conn = "🟢 Connected" if status["broker"]["connected"] else "🔴 Disconnected"
         
         report = f"""⚙️ SYSTEM STATUS REPORT
+
+🖥️ Hardware Metrics:
+   • CPU Usage: {cpu_usage}%
+   • RAM Usage: {ram_usage}%
+   • Active Threads: {active_threads}
 
 📊 Database:
    {db_emoji} Status: {db_status.upper()}

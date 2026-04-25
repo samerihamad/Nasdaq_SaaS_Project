@@ -130,6 +130,7 @@ def _run_time_sync_diagnostic() -> str:
 
 
 def _try_engine_restart() -> tuple[bool, str]:
+    import shlex
     cmd = (ENGINE_RESTART_CMD or "").strip()
     if not cmd:
         return False, (
@@ -138,9 +139,10 @@ def _try_engine_restart() -> tuple[bool, str]:
             "(Linux) or a script that restarts the bot/engine safely."
         )
     try:
+        args = shlex.split(cmd)
         subprocess.Popen(
-            cmd,
-            shell=True,
+            args,
+            shell=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
