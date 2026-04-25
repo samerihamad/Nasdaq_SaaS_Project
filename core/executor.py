@@ -2920,15 +2920,21 @@ def _execute_broker_order(
     creds,
     chat_id: str,
     opened_broker_legs: list[dict],
+    max_retries: int = 5,  # FIXED: Respect the 5 attempts setting
 ) -> tuple[bool, str, float]:
     """
     Final layer touching Capital.com API for one execution leg.
     Returns (ok, error_message, effective_target).
+    
+    FIX: Removed hardcoded 'attempts = 2' override. Now respects max_retries=5.
     """
-    attempts = 2 if str(len(opened_broker_legs)) == "1" else 1
     last_err = ""
     current_target = float(leg_target)
-    for attempt in range(attempts):
+    
+    for attempt in range(max_retries):
+        # EXPLICIT LOG: Show attempt number
+        print(f"[EXECUTION] Attempt {attempt + 1}/{max_retries} for {chat_id[:8]}... {order_epic} {action}", flush=True)
+        
         ok, out = _open_position_with_protection(
             base_url,
             headers,
@@ -2939,16 +2945,25 @@ def _execute_broker_order(
             current_target,
             creds=creds,
             chat_id=str(chat_id),
+            max_retries=1,  # Don't retry inside - we handle retries here
         )
         if not ok:
             last_err = str(out)
-            if attempt == 0 and min_dist and float(min_dist) > 0 and entry_price > 0:
+            # EXPLICIT LOG: Show failure reason
+            print(f"[EXECUTION] Attempt {attempt + 1}/{max_retries} FAILED. Reason: {last_err[:100]}", flush=True)
+            
+            if attempt < max_retries - 1 and min_dist and float(min_dist) > 0 and entry_price > 0:
+                # Widen target for retry
                 widen = float(min_dist) * float(TP2_MIN_DISTANCE_BUFFER_MULT)
                 current_target = (float(entry_price) + widen) if action == "BUY" else (float(entry_price) - widen)
                 stop_level, target1, current_target = _sanitize_protection_levels(
                     action, entry_price, stop_level, target1, current_target
                 )
+                print(f"[EXECUTION] Adjusting target for retry {attempt + 2}/{max_retries}", flush=True)
                 continue
+            
+            # EXPLICIT LOG: All attempts exhausted
+            print(f"[EXECUTION] All {max_retries} attempts exhausted. Final error: {last_err[:100]}", flush=True)
             return False, last_err or "unknown rejection", float(current_target)
 
         payload = out if isinstance(out, dict) else {}

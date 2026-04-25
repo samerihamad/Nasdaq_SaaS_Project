@@ -87,7 +87,8 @@ EMERGENCY_BYPASS_ON_ERROR = True
 # AI Gate thresholds for the committee's decision logic
 # Phase 5-A: Strict Consensus — now requires 3 out of 4 experts to approve
 COMMITTEE_APPROVE_THRESHOLD = 2  # At least 2 experts must approve (majority consensus)
-CONFIDENCE_THRESHOLD = 55.0  # Minimum confidence for an expert to approve
+# RESTORED: User strategic requirement - 42% confidence threshold for transparency
+CONFIDENCE_THRESHOLD = 42.0  # Minimum confidence for an expert to approve
 
 
 def is_gating_active() -> bool:

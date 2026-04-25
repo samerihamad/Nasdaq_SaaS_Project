@@ -172,7 +172,10 @@ class SessionManager:
             logger.error(f"[SessionAgent] Failed to save cache: {e}")
     
     def _is_session_valid(self, cache_key: str) -> bool:
-        """Check if cached session is still valid."""
+        """
+        Check if cached session is still valid via LIVE BROKER CHECK.
+        SessionAgent 4.0: Validates tokens by making lightweight API call to Capital.com.
+        """
         with self._cache_lock:
             if cache_key not in self.session_cache:
                 return False
@@ -181,8 +184,49 @@ class SessionManager:
             expires_ts = float(session.get("expires_ts", 0))
             now = datetime.now(timezone.utc).timestamp()
             
-            # Buffer: consider expired 60 seconds early to avoid edge cases
-            return (expires_ts - 60) > now
+            # Check local TTL first
+            if (expires_ts - 60) <= now:
+                logger.debug(f"[SessionAgent] Cache expired for {cache_key[:16]}...")
+                return False
+            
+            # SessionAgent 4.0: LIVE BROKER CHECK
+            # Make lightweight request to validate token is still accepted by Capital.com
+            try:
+                base_url = session.get("base_url")
+                headers = session.get("headers", {})
+                
+                if not base_url or not headers.get("CST"):
+                    return False
+                
+                import requests
+                # Lightweight check: /accounts endpoint (fast, read-only)
+                check_url = f"{base_url}/accounts"
+                check_headers = {
+                    "X-CAP-API-KEY": headers.get("X-CAP-API-KEY", ""),
+                    "CST": headers.get("CST", ""),
+                    "X-SECURITY-TOKEN": headers.get("X-SECURITY-TOKEN", ""),
+                }
+                
+                resp = requests.get(check_url, headers=check_headers, timeout=5)
+                
+                if resp.status_code == 401:
+                    logger.warning(f"[SessionAgent] Token INVALID (401) for {cache_key[:16]}... Force re-login.")
+                    return False
+                elif resp.status_code == 403:
+                    logger.warning(f"[SessionAgent] Token EXPIRED (403) for {cache_key[:16]}... Force re-login.")
+                    return False
+                elif resp.status_code == 200:
+                    logger.debug(f"[SessionAgent] Token VALID (200) for {cache_key[:16]}...")
+                    return True
+                else:
+                    # Unknown response - assume invalid to be safe
+                    logger.warning(f"[SessionAgent] Token check ambiguous ({resp.status_code}) for {cache_key[:16]}... Force re-login.")
+                    return False
+                    
+            except Exception as e:
+                logger.warning(f"[SessionAgent] Live broker check failed for {cache_key[:16]}...: {e}")
+                # On check failure, fall back to TTL validation (conservative)
+                return (expires_ts - 60) > now
     
     def _start_background_worker(self):
         """Start the background worker thread (non-blocking)."""

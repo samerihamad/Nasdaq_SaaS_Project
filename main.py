@@ -1414,16 +1414,26 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
         # ACTIVE MODE: Committee decision gates execution
         else:
             if committee_verdict.verdict == "REJECT":
-                print(
-                    f"[COMMITTEE BLOCK] {symbol} {action} | "
-                    f"reason={committee_verdict.reasoning} | "
-                    f"confidence={committee_verdict.ai_confidence:.1f}%"
+                # VERY LOUD ALERT: Committee rejection must not be silent
+                reject_msg = (
+                    f"🚫 [COMMITTEE REJECTED] Symbol: {symbol} | "
+                    f"Action: {action} | "
+                    f"Confidence: {committee_verdict.ai_confidence:.1f}% | "
+                    f"Reason: {committee_verdict.reasoning}"
                 )
+                print(f"\n{'='*60}", flush=True)
+                print(reject_msg, flush=True)
+                print(f"{'='*60}\n", flush=True)
+                
                 # Send Committee Decision to Telegram even when rejected (so user sees reasoning) — NON-BLOCKING
                 if ADMIN_CHAT_ID:
                     _send_telegram_async(
                         ADMIN_CHAT_ID,
-                        committee_verdict.to_telegram_format(),
+                        f"🚫 [COMMITTEE REJECTED]\n"
+                        f"Symbol: {symbol}\n"
+                        f"Action: {action}\n"
+                        f"Confidence: {committee_verdict.ai_confidence:.1f}%\n"
+                        f"Reason: {committee_verdict.reasoning}",
                         context=f"Committee REJECT for {symbol} {action}"
                     )
 
