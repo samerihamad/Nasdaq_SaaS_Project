@@ -29,8 +29,12 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 import requests
+import logging
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
+
+# Initialize logger
+logger = logging.getLogger(__name__)
 
 from database.db_manager import (
     DB_PATH,
@@ -537,6 +541,9 @@ async def admin_handler(update: Update, context):
 
     # ── quick restart (uses ENGINE_RESTART_CMD) ───────────────────────────────
     elif cmd in ("restart", "quickrestart", "reboot"):
+        # DEBUG: Log command receipt
+        user_id = update.effective_user.id if update.effective_user else "Unknown"
+        logger.info(f"[DEBUG] Command /admin restart received from user_id={user_id}")
         ok, msg = _try_engine_restart()
         await update.message.reply_text(
             ("✅ " if ok else "⚠️ ") + msg,

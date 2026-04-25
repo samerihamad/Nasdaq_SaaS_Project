@@ -2201,6 +2201,10 @@ async def system_status_handler(update: Update, context: ContextTypes.DEFAULT_TY
     - Hash sync status
     - Open positions count vs broker
     """
+    # DEBUG: Log command receipt
+    user_id = update.effective_user.id if update.effective_user else "Unknown"
+    logger.info(f"[DEBUG] Command /system_status received from user_id={user_id}")
+    
     chat_id = str(update.message.chat_id)
     
     # Security: Admin only
