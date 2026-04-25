@@ -606,48 +606,89 @@ def _backup_loop():
 def _unified_report_loop():
     """
     Phase 7: Unified Daily Report — SINGLE AUTHORITY for daily summaries.
-    
-    Schedule: 20:05 UTC (00:05 UAE) — 5 minutes after market close.
-    
-    Consolidates:
-      - Daily Performance: P&L, Win Rate, Account Balance
-      - Strategic Insights: Committee Signal Stats (Approved vs. Blocked)
-      - Risk Guardian Status: Circuit Breakers, Drawdown alerts
-    
-    This replaces BOTH:
-      - Phase 6-A strategy_reporter.py (23:30 UAE trigger)
-      - Legacy utils/daily_report.py (market-close trigger)
-    
-    Only ONE report is sent per day per subscriber.
+
+    Trigger Window: 16:05–17:00 ET (DST-aware via pytz).
+    Replaces the old static 20:05 UTC check, which was wrong during EST (winter,
+    UTC-5) because 16:00 ET = 21:00 UTC then — the old trigger fired 55 min
+    BEFORE market close.
+
+    Resiliency model:
+      - 55-minute window eliminates single-minute clock-skip misses.
+      - Up to MAX_RETRIES send attempts with RETRY_BACKOFF_S back-off.
+      - ALREADY_SENT_TODAY is keyed on the ET trading-day date, so the
+        guard never double-fires or skips across the UTC/UAE midnight boundary.
+      - Runs as an isolated daemon thread — exceptions here never touch
+        _engine_consecutive_failures or MAIN_LOOP_MAX_CONSECUTIVE_FAILURES.
     """
-    from datetime import datetime
-    
-    REPORT_HOUR_UTC = 20      # 20:05 UTC = 00:05 UAE (5 min after market close)
-    REPORT_MINUTE = 5
-    ALREADY_SENT_TODAY = None
-    
+    from utils.market_hours import _now_et
+
+    MAX_RETRIES     = 5
+    RETRY_BACKOFF_S = 60   # seconds between retries inside the trigger window
+
+    ALREADY_SENT_TODAY: Optional[str] = None   # "YYYY-MM-DD" in ET
+    _retry_count:       int            = 0
+    _last_et_date_seen: Optional[str]  = None
+
     while True:
         try:
-            now = datetime.now(timezone.utc)
-            today_str = now.strftime("%Y-%m-%d")
-            
-            # Check if it's time to send (20:05 UTC)
-            if now.hour == REPORT_HOUR_UTC and now.minute == REPORT_MINUTE:
-                if ALREADY_SENT_TODAY != today_str:
-                    print("[UNIFIED-REPORT] Phase 7: Generating unified daily reports...")
-                    try:
-                        from core.unified_reporter import send_unified_reports
-                        result = send_unified_reports()
-                        print(f"[UNIFIED-REPORT] Admin: {result['admin_sent']}, Clients: {result['clients_sent']}, Date: {result['date']}")
-                        ALREADY_SENT_TODAY = today_str
-                    except Exception as e:
-                        print(f"[UNIFIED-REPORT] Error: {e}")
-            
-            # Sleep for 30 seconds (check twice per minute)
+            now_et  = _now_et()
+            et_date = now_et.strftime("%Y-%m-%d")
+
+            # Reset the per-day retry counter when the ET calendar day rolls over.
+            if _last_et_date_seen != et_date:
+                _retry_count       = 0
+                _last_et_date_seen = et_date
+
+            # Trigger window: 16:05 ET – 17:00 ET (inclusive).
+            # Using ET here means pytz automatically handles EDT ↔ EST transitions;
+            # no manual UTC offset arithmetic needed.
+            in_window = (
+                (now_et.hour == 16 and now_et.minute >= 5) or
+                (now_et.hour == 17 and now_et.minute == 0)
+            )
+
+            if in_window and ALREADY_SENT_TODAY != et_date and _retry_count < MAX_RETRIES:
+                attempt = _retry_count + 1
+                print(
+                    f"[UNIFIED-REPORT] Phase 7: attempt {attempt}/{MAX_RETRIES} "
+                    f"(ET {now_et.strftime('%H:%M')}, trading-day={et_date})",
+                    flush=True,
+                )
+                try:
+                    from core.unified_reporter import send_unified_reports
+                    result = send_unified_reports()
+                    if result.get("admin_sent"):
+                        print(
+                            f"[UNIFIED-REPORT] Confirmed — "
+                            f"Admin: {result['admin_sent']}, "
+                            f"Clients: {result['clients_sent']}, "
+                            f"Date: {result['date']}",
+                            flush=True,
+                        )
+                        ALREADY_SENT_TODAY = et_date
+                        _retry_count       = 0
+                    else:
+                        _retry_count += 1
+                        print(
+                            f"[UNIFIED-REPORT] Admin send not confirmed — "
+                            f"retry {_retry_count}/{MAX_RETRIES} in {RETRY_BACKOFF_S}s",
+                            flush=True,
+                        )
+                        time.sleep(RETRY_BACKOFF_S)
+                        continue
+                except Exception as e:
+                    _retry_count += 1
+                    print(
+                        f"[UNIFIED-REPORT] Error (retry {_retry_count}/{MAX_RETRIES}): {e}",
+                        flush=True,
+                    )
+                    time.sleep(RETRY_BACKOFF_S)
+                    continue
+
             time.sleep(30)
-            
+
         except Exception as e:
-            print(f"[UNIFIED-REPORT] Thread error: {e}")
+            print(f"[UNIFIED-REPORT] Thread error: {e}", flush=True)
             time.sleep(30)
 
 

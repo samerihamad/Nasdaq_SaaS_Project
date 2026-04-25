@@ -49,15 +49,23 @@ class UnifiedReporter:
     # ═════════════════════════════════════════════════════════════════════════════
     
     def _get_local_date(self) -> str:
-        """Get current date using env-driven timezone offset."""
-        offset_hours = int(os.getenv("LOCAL_TIMEZONE_OFFSET", "4"))
-        local_time = datetime.now(timezone.utc) + timedelta(hours=offset_hours)
-        return local_time.strftime("%Y-%m-%d")
-    
+        """
+        Return the current ET trading-day date (DST-aware, via pytz).
+
+        Why ET and not UAE?
+        Market close is 16:00 ET.  At 16:05 ET the UAE clock reads 00:05 next
+        day (EDT) or 01:05 next day (EST), so the old UTC+4 offset returned D+1
+        while every trade in the DB was stored against UTC date D.  Using the
+        ET date aligns the report date with both the DB timestamps and the
+        financial calendar.
+        """
+        from utils.market_hours import _now_et
+        return _now_et().strftime("%Y-%m-%d")
+
     def _get_local_datetime(self) -> datetime:
-        """Get current datetime using env-driven timezone offset."""
-        offset_hours = int(os.getenv("LOCAL_TIMEZONE_OFFSET", "4"))
-        return datetime.now(timezone.utc) + timedelta(hours=offset_hours)
+        """Return current ET datetime (DST-aware, NTP-corrected via market_hours)."""
+        from utils.market_hours import _now_et
+        return _now_et()
     
     # ═════════════════════════════════════════════════════════════════════════════
     # DATA COLLECTION
