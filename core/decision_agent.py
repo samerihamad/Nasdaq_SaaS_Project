@@ -60,7 +60,13 @@ from utils.ai_model import (
     MODEL_VERSION,
 )
 from bot.notifier import send_telegram_message
-from config import ADMIN_CHAT_ID, NEWS_API_KEY, FMP_API_KEY
+from config import (
+    ADMIN_CHAT_ID, NEWS_API_KEY, FMP_API_KEY,
+    COMMITTEE_CONFIDENCE_THRESHOLD,
+    COMMITTEE_SHADOW_MODE,
+    COMMITTEE_APPROVE_THRESHOLD,
+    COMMITTEE_EMERGENCY_BYPASS,
+)
 
 # Initialize logger FIRST (before any imports that might use it)
 log = logging.getLogger(__name__)
@@ -76,24 +82,22 @@ except Exception as _mem_err:
 # =============================================================================
 # PHASE 3-A: ACTIVE GATING CONFIGURATION
 # =============================================================================
+# UNIFIED: All settings now imported from config.py (linked to .env)
+# COMMITTEE_CONFIDENCE_THRESHOLD = 42.0 per user requirement
+# COMMITTEE_SHADOW_MODE = False (active gating enabled)
+# COMMITTEE_APPROVE_THRESHOLD = 2 (majority consensus)
+# COMMITTEE_EMERGENCY_BYPASS = True (safety valve)
 
-# SHADOW_MODE = False enables active gating (committee can block trades)
-# Set to True to return to shadow mode (opinions only, never blocks)
-SHADOW_MODE = False
-
-# Emergency Bypass: If True, agent errors default to APPROVE (safety valve)
-EMERGENCY_BYPASS_ON_ERROR = True
-
-# AI Gate thresholds for the committee's decision logic
-# Phase 5-A: Strict Consensus — now requires 3 out of 4 experts to approve
-COMMITTEE_APPROVE_THRESHOLD = 2  # At least 2 experts must approve (majority consensus)
-# RESTORED: User strategic requirement - 42% confidence threshold for transparency
-CONFIDENCE_THRESHOLD = 42.0  # Minimum confidence for an expert to approve
+# Local aliases for backward compatibility (values from config.py)
+SHADOW_MODE = COMMITTEE_SHADOW_MODE
+EMERGENCY_BYPASS_ON_ERROR = COMMITTEE_EMERGENCY_BYPASS
+COMMITTEE_APPROVE_THRESHOLD = COMMITTEE_APPROVE_THRESHOLD  # pylint: disable=self-assigning-variable
+CONFIDENCE_THRESHOLD = COMMITTEE_CONFIDENCE_THRESHOLD  # pylint: disable=self-assigning-variable
 
 
 def is_gating_active() -> bool:
     """Check if the committee is in active gating mode (can block trades)."""
-    return not SHADOW_MODE
+    return not COMMITTEE_SHADOW_MODE
 
 # =============================================================================
 # PHASE 2-A: Multi-Agent Committee Dataclasses

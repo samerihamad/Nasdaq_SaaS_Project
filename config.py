@@ -237,7 +237,15 @@ CB_SUSPENSION_HOURS = int(os.getenv("CB_SUSPENSION_HOURS", "2"))
 MAX_RISK_PCT_VOLATILE = float(os.getenv("MAX_RISK_PCT_VOLATILE", "1.0"))
 
 # Strict minimum volume vs MA20 for liquidity quality (higher = stricter filter).
-STRICT_MIN_VOLUME_RATIO = float(os.getenv("STRICT_MIN_VOLUME_RATIO", "0.8"))
+# RELAXED from 0.8 to 0.4 to allow trading in lower volume sessions
+STRICT_MIN_VOLUME_RATIO = float(os.getenv("STRICT_MIN_VOLUME_RATIO", "0.4"))
+
+# ── Committee Gate Configuration (decision_agent.py) ─────────────────────────
+# These settings link the Committee Gate to .env for Dashboard control
+COMMITTEE_CONFIDENCE_THRESHOLD = float(os.getenv("COMMITTEE_CONFIDENCE_THRESHOLD", "42.0"))
+COMMITTEE_SHADOW_MODE = os.getenv("COMMITTEE_SHADOW_MODE", "false").lower() == "true"
+COMMITTEE_APPROVE_THRESHOLD = int(os.getenv("COMMITTEE_APPROVE_THRESHOLD", "2"))
+COMMITTEE_EMERGENCY_BYPASS = os.getenv("COMMITTEE_EMERGENCY_BYPASS", "true").lower() == "true"
 
 # ── Institutional risk controls (core/risk_manager.py) ─────────────────────────
 WEEKLY_DRAWDOWN_LIMIT = float(os.getenv("WEEKLY_DRAWDOWN_LIMIT", "10.0"))
@@ -272,7 +280,7 @@ FINAL_SYNC_HOURLY_RETRY_SEC = float(os.getenv("FINAL_SYNC_HOURLY_RETRY_SEC", "36
 FINAL_SYNC_CONSOLE_WARN_AFTER_SEC = float(os.getenv("FINAL_SYNC_CONSOLE_WARN_AFTER_SEC", "86400"))
 
 # ── Execution / main loop safety ───────────────────────────────────────────────
-MAX_SLIPPAGE_PCT = float(os.getenv("MAX_SLIPPAGE_PCT", "0.003"))
+MAX_SLIPPAGE_PCT = float(os.getenv("MAX_SLIPPAGE_PCT", "0.01"))  # RELAXED: 1% for Nasdaq volatility
 MAIN_LOOP_MAX_CONSECUTIVE_FAILURES = int(os.getenv("MAIN_LOOP_MAX_CONSECUTIVE_FAILURES", "3"))
 
 # ── News API (optional — NewsAPI.org) ─────────────────────────────────────────
