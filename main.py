@@ -1871,6 +1871,9 @@ def run_trading_bot():
             today         = utc_today()
             market_status = get_market_status()
 
+            # DIAGNOSTIC: Log every market status check with flag state
+            logger.info(f"[DIAGNOSTIC] Market Status check: _prev={_prev_market_status}, current={market_status}, _closed_notified={_closed_notified}, pid={os.getpid()}")
+
             if _prev_market_status is not None and _prev_market_status != market_status:
                 try:
                     tz_map = get_current_timezones(now_utc)
@@ -1897,6 +1900,7 @@ def run_trading_bot():
 
             # ── Detect CLOSED → OPEN transition → reset closed flag ───────────
             if _prev_market_status != STATUS_OPEN and market_status == STATUS_OPEN:
+                logger.info(f"[DIAGNOSTIC] RESET TRIGGERED: _prev_market_status={_prev_market_status} -> market_status={STATUS_OPEN}, resetting _closed_notified to False")
                 _closed_notified = False
                 _auto_resume_trading_at_open()
 
@@ -1946,6 +1950,7 @@ def run_trading_bot():
 
             # ── Market CLOSED: notify once, run watcher for all users ─────────
             if market_status == STATUS_CLOSED:
+                logger.info(f"[DIAGNOSTIC] In STATUS_CLOSED block, _closed_notified={_closed_notified}")
                 if not _closed_notified:
                     mins = minutes_to_open()
                     hrs  = mins // 60
@@ -1961,6 +1966,7 @@ def run_trading_bot():
                             ),
                         )
                     _closed_notified = True
+                    logger.info(f"[DIAGNOSTIC] ALERT SENT: Setting _closed_notified=True")
                     print(f"[MARKET] Closed — opens in ~{mins} min")
 
                 run_watcher()   # monitors all users' open positions

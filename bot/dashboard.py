@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand,
+    ReplyKeyboardMarkup, KeyboardButton,
 )
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
@@ -699,6 +700,19 @@ def _engine_status_line(chat_id: str, lang: str) -> str:
     return t('engine_status_on_closed', lang)
 
 
+def _persistent_menu_keyboard(lang: str):
+    """Persistent ReplyKeyboardMarkup that doesn't disappear after interaction."""
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton('/start'), KeyboardButton('/mode')],
+            [KeyboardButton('/system_status'), KeyboardButton('/clear_cache')],
+        ],
+        resize_keyboard=True,
+        persistent=True,
+        is_persistent=True
+    )
+
+
 async def _show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE,
                           edit: bool = False):
     chat_id = str(update.effective_chat.id)
@@ -716,6 +730,12 @@ async def _show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE,
         )
     else:
         msg = update.message or update.callback_query.message
+        # Send persistent ReplyKeyboardMarkup first (stays at bottom)
+        await msg.reply_text(
+            "✅ استخدم الأزرار أدناه أو اضغط /start للتحديث" if lang == 'ar' else "✅ Use buttons below or press /start to refresh",
+            reply_markup=_persistent_menu_keyboard(lang)
+        )
+        # Then send main inline menu
         await msg.reply_text(text, reply_markup=markup, parse_mode='Markdown')
 
 
@@ -774,20 +794,28 @@ def _schedule_status_job(context: ContextTypes.DEFAULT_TYPE, chat_id: str):
     """Start (or restart) the hourly status broadcast for a subscriber."""
     jq = context.job_queue
     if jq is None:
-        # Without extras, PTB has no JobQueue — do not block the main menu.
         print(
             "[dashboard] JobQueue unavailable (pip install "
             '"python-telegram-bot[job-queue]"). Hourly status jobs skipped.'
         )
         return
-    for job in jq.get_jobs_by_name(f'status_{chat_id}'):
-        job.schedule_removal()
+
+    job_name = f'status_{chat_id}'
+    existing_jobs = jq.get_jobs_by_name(job_name)
+
+    if existing_jobs:
+        # Job already exists — don't create duplicates
+        print(f"[dashboard] Status job already exists for {chat_id}, skipping.")
+        return
+
+    # Only create job if none exists
+    print(f"[dashboard] Creating new hourly status job for {chat_id}")
     jq.run_repeating(
         _send_status_update,
         interval = 3600,
-        first    = 10,          # first message 10 s after login
+        first    = 10,
         chat_id  = int(chat_id),
-        name     = f'status_{chat_id}',
+        name     = job_name,
         data     = {'chat_id': chat_id},
     )
 
