@@ -2208,7 +2208,7 @@ async def system_status_handler(update: Update, context: ContextTypes.DEFAULT_TY
     chat_id = str(update.message.chat_id)
     
     # Security: Admin only
-    if chat_id != ADMIN_CHAT_ID:
+    if str(chat_id) != str(ADMIN_CHAT_ID):
         await update.message.reply_text(
             "⛔ This command is restricted to admin users only."
         )
@@ -2284,7 +2284,7 @@ async def system_purge_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     chat_id = str(update.message.chat_id)
     
     # Security: Admin only
-    if chat_id != ADMIN_CHAT_ID:
+    if str(chat_id) != str(ADMIN_CHAT_ID):
         await update.message.reply_text(
             "⛔ This command is restricted to admin users only."
         )
@@ -2317,7 +2317,7 @@ async def mode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.message.chat_id)
     
     # Security: Admin only
-    if chat_id != ADMIN_CHAT_ID:
+    if str(chat_id) != str(ADMIN_CHAT_ID):
         await update.message.reply_text(
             "⛔ This command is restricted to admin users only."
         )
@@ -2351,7 +2351,7 @@ async def mode_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
     chat_id = str(query.message.chat_id)
     
     # Security: Admin only
-    if chat_id != ADMIN_CHAT_ID:
+    if str(chat_id) != str(ADMIN_CHAT_ID):
         await query.answer("⛔ Admin only", show_alert=True)
         return
     
@@ -2399,7 +2399,7 @@ async def clear_cache_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat_id = str(update.message.chat_id)
     
     # Security: Admin only
-    if chat_id != ADMIN_CHAT_ID:
+    if str(chat_id) != str(ADMIN_CHAT_ID):
         await update.message.reply_text(
             "⛔ This command is restricted to admin users only."
         )
@@ -2479,7 +2479,7 @@ async def system_purge_confirm_handler(update: Update, context: ContextTypes.DEF
     """Handle system purge confirmation response."""
     chat_id = str(update.message.chat_id)
     
-    if chat_id != ADMIN_CHAT_ID:
+    if str(chat_id) != str(ADMIN_CHAT_ID):
         return
     
     if not context.user_data.get('system_purge_confirm'):

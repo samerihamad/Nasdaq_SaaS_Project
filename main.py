@@ -1009,7 +1009,11 @@ def _start_dashboard_bot() -> Optional[subprocess.Popen]:
     
     try:
         # Start dashboard.py in a separate process with its own Python interpreter
-        # Using CREATE_NEW_PROCESS_GROUP on Windows for clean termination
+        # FIX: Log subprocess output to file instead of PIPE (which silently swallows errors)
+        dashboard_log_path = os.path.join(PROJECT_ROOT, "logs", "dashboard_bot.log")
+        os.makedirs(os.path.dirname(dashboard_log_path), exist_ok=True)
+        dashboard_log_file = open(dashboard_log_path, 'a', encoding='utf-8')
+        
         kwargs = {}
         if sys.platform == 'win32':
             kwargs['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -1017,12 +1021,13 @@ def _start_dashboard_bot() -> Optional[subprocess.Popen]:
         _dashboard_bot_process = subprocess.Popen(
             [sys.executable, dashboard_path],
             cwd=PROJECT_ROOT,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stdout=dashboard_log_file,
+            stderr=dashboard_log_file,
             **kwargs
         )
         
         print(f"[DashboardBot] Started with PID {_dashboard_bot_process.pid}")
+        print(f"[DashboardBot] Log file: {dashboard_log_path}")
         print(f"[DashboardBot] Commands now active: /mode, /system_status, /clear_cache")
         return _dashboard_bot_process
         
@@ -1896,6 +1901,17 @@ def run_trading_bot():
                 _auto_resume_trading_at_open()
 
             _prev_market_status = market_status
+
+            # ── Dashboard Bot health check (auto-restart if crashed) ──────────
+            if _dashboard_bot_process is not None:
+                ret = _dashboard_bot_process.poll()
+                if ret is not None:
+                    print(f"[DashboardBot] CRASHED with exit code {ret}. Auto-restarting...", flush=True)
+                    _dashboard_bot_process = None
+                    _start_dashboard_bot()
+            else:
+                # Never started or previously failed — try again
+                _start_dashboard_bot()
 
             # ── Maintenance mode ──────────────────────────────────────────────
             if is_maintenance_mode():
