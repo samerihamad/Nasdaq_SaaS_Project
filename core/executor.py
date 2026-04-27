@@ -3167,6 +3167,7 @@ def place_trade_for_user(
             "chat_id": chat_id,
         }
 
+    # FIX (Apr 27): Structured return values ensure consistent parsing and allow AUTO mode to bypass limit-first policy.
     # ── Sprint 2: limit-first entry policy ───────────────────────────────────
     if ENABLE_LIMIT_ORDER_MODE and not force_market:
         limit_px = _calculate_limit_price(
@@ -3190,7 +3191,13 @@ def place_trade_for_user(
         )
         if not ok_lim and lim_reason == "already_pending":
             msg = f"⏭️ Limit already pending ({symbol} {action})"
-            return msg
+            return {
+                "status": "skipped",
+                "stage": "limit_order",
+                "symbol": symbol,
+                "action": action,
+                "message": msg,
+            }
         lang = get_subscriber_lang(chat_id)
         ttl_bars = int(LIMIT_ORDER_TTL_BARS)
         _prof = get_user_signal_profile(str(chat_id))
@@ -3221,7 +3228,15 @@ def place_trade_for_user(
                 f"{_lim_pol_ar}"
             )
         send_telegram_message(chat_id, msg)
-        return f"🧾 Limit placed ({symbol} {action}) @ {float(limit_px):.4f}"
+        return {
+            "status": "pending_limit",
+            "stage": "limit_order_placed",
+            "symbol": symbol,
+            "action": action,
+            "limit_price": float(limit_px),
+            "order_id": oid,
+            "message": f"🧾 Limit placed ({symbol} {action}) @ {float(limit_px):.4f}",
+        }
 
     # ── Position size (1–2% risk, confidence-scaled, volatility-adjusted) ─────
     # RiskGuardianAgent applies extra 50% reduction in volatile regimes

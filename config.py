@@ -208,7 +208,8 @@ FINAL_SYNC_FALLBACK_ENABLED = os.getenv("FINAL_SYNC_FALLBACK_ENABLED", "true").l
 SUPPRESS_EXPECTED_REJECTION_TELEGRAM = os.getenv("SUPPRESS_EXPECTED_REJECTION_TELEGRAM", "true").lower() == "true"
 
 # ── Sprint 2: Limit order policy ─────────────────────────────────────────────
-ENABLE_LIMIT_ORDER_MODE = os.getenv("ENABLE_LIMIT_ORDER_MODE", "true").lower() == "true"
+# FIX (Apr 27): Default changed to "false" to restore market order execution for AUTO mode.
+ENABLE_LIMIT_ORDER_MODE = os.getenv("ENABLE_LIMIT_ORDER_MODE", "false").lower() == "true"
 LIMIT_ORDER_TTL_BARS = int(os.getenv("LIMIT_ORDER_TTL_BARS", "4"))
 LIMIT_ORDER_BAR_MINUTES = int(os.getenv("LIMIT_ORDER_BAR_MINUTES", "15"))
 LIMIT_ORDER_MOMENTUM_RETRACE = float(os.getenv("LIMIT_ORDER_MOMENTUM_RETRACE", "0.618"))

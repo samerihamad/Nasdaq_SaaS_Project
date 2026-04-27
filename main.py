@@ -1592,11 +1592,13 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
                     touch_engine_activity(chat_id)
                 except Exception:
                     pass
+                # FIX (Apr 27): force_market=True ensures AUTO mode bypasses limit-order branch and reaches _execute_broker_order().
                 result = place_trade_for_user(
                     chat_id, symbol, action,
                     confidence=confidence, stop_loss_pct=stop_loss_pct,
                     strategy_label=strategy_label,
                     committee_confidence=(committee_verdict.ai_confidence if committee_verdict else None),
+                    force_market=True,
                 )
                 parsed = _parse_executor_result(result)
                 print(f"   [AUTO  {chat_id}] {symbol} {action} → {parsed}")
