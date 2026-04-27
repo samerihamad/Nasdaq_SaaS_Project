@@ -492,12 +492,10 @@ def analyze(
             return {"rejected": True, "strategy": "MeanRev", "reason": rej, "action": direction}
 
     # ── Price Action Confirmation ─────────────────────────────────────────────
-    # STRICT: Signal candle (iloc[-2]) must be confirmed by live candle breaking its extreme
-    if not _price_action_confirmed(df_15m, direction):
-        rej = f"Rejected: Price Action Confirmation failed (current candle did not break setup candle extreme)"
-        log.info("[MeanRev %s] %s", symbol, rej)
-        return {"rejected": True, "strategy": "MeanRev", "reason": rej, "action": direction}
-    log.info("[MeanRev %s] Price Action Confirmation passed", symbol)
+    # REMOVED: Live candle checks (iloc[-1]) are unreliable for confirmation.
+    # Existing filters (RSI, Reversal Candle, Liquidity Sweep) are sufficient.
+    # Signal will proceed to execution gates (DecisionAgent, Risk Manager).
+    log.info("[MeanRev %s] Signal passed all technical filters — proceeding to execution gates", symbol)
 
     # ── Composite scoring ─────────────────────────────────────────────────────
     score = 0
