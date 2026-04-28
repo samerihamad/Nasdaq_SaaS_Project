@@ -1221,7 +1221,9 @@ def _get_session_direct(creds, chat_id: str | None = None, force_refresh: bool =
     # Retry briefly before surfacing an authentication failure to the user.
     for attempt in range(3):
         try:
-            respect_capital_http_interval_sync()
+            # FIX (Apr 28): Apply global rate limiter to auth requests to prevent 429 on /session endpoint
+            from core.rate_limiter import global_rate_limiter
+            global_rate_limiter.throttle()
             auth_headers = _with_broker_timestamp_headers(headers)
             auth_res = requests.post(
                 f"{base_url}/session",

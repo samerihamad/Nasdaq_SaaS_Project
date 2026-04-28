@@ -389,6 +389,9 @@ def _broker_fetch_and_finalize_trade(trade_id: int, *, notify: bool = True) -> b
         "Accept": "application/json",
     }
     try:
+        # FIX (Apr 28): Apply global rate limiter to auth requests to prevent 429 on /session endpoint
+        from core.rate_limiter import global_rate_limiter
+        global_rate_limiter.throttle()
         auth_res = requests.post(
             f"{base_url}/session",
             json={"identifier": email, "password": password},
@@ -1709,6 +1712,9 @@ def try_sync_final_for_trade_id(
         "Accept": "application/json",
     }
     try:
+        # FIX (Apr 28): Apply global rate limiter to auth requests to prevent 429 on /session endpoint
+        from core.rate_limiter import global_rate_limiter
+        global_rate_limiter.throttle()
         auth_res = requests.post(
             f"{base_url}/session",
             json={"identifier": email, "password": password},

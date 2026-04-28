@@ -199,6 +199,9 @@ def _get_live_balance(chat_id: str) -> float | None:
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
+        # FIX (Apr 28): Apply global rate limiter to auth requests to prevent 429 on /session endpoint
+        from core.rate_limiter import global_rate_limiter
+        global_rate_limiter.throttle()
         auth = requests.post(
             f"{base_url}/session",
             json={"identifier": str(email).strip(), "password": str(password).strip()},
