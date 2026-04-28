@@ -1597,7 +1597,6 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
                     chat_id, symbol, action,
                     confidence=confidence, stop_loss_pct=stop_loss_pct,
                     strategy_label=strategy_label,
-                    committee_confidence=(committee_verdict.ai_confidence if committee_verdict else None),
                     force_market=True,
                 )
                 parsed = _parse_executor_result(result)
