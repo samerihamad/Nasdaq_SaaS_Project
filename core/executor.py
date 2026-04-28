@@ -37,6 +37,7 @@ from utils.market_scanner import (
     scan_market,
     _SESSION_CACHE as _SHARED_SESSION_CACHE,
 )
+from core.rate_limiter import global_rate_limiter  # FIX (Apr 28): Cross-user rate limiting
 from utils.market_hours import is_trading_required, is_nyse_trading_day, ET
 from database.db_manager import (
     DB_PATH,
@@ -146,7 +147,106 @@ def _log_system_error(error_type: str, details: dict) -> None:
     except Exception as e:
         # Handler not available — try to at least print
         print(f"[CRITICAL_LOG_FAILURE] {error_type}: {e}", flush=True)
-        sys.stderr.flush()
+
+
+# ── Phase 3: Detailed Execution Logging ────────────────────────────────────────
+
+def _ensure_daily_log_dir() -> str:
+    """Create daily log directory and return its path."""
+    day_dir = os.path.join(LOG_ROOT, synchronized_utc_now().strftime("%Y-%m-%d"))
+    os.makedirs(day_dir, exist_ok=True)
+    return day_dir
+
+
+def _append_daily_log(filename: str, message: str) -> None:
+    """Append a timestamped line into a daily log file. NEVER fails."""
+    try:
+        log_dir = _ensure_daily_log_dir()
+        path = os.path.join(log_dir, filename)
+        ts = synchronized_utc_now().strftime("%Y-%m-%d %H:%M:%S UTC")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {message}\n")
+    except Exception as exc:
+        print(f"[LOG] Failed writing {filename}: {exc}", flush=True)
+
+
+def _log_execution_detail(
+    chat_id: str,
+    symbol: str,
+    action: str,
+    http_status: int,
+    attempt: int,
+    max_attempts: int,
+    error_msg: str,
+    elapsed_sec: float,
+    strategy: str = "",
+    confidence: float = 0.0,
+) -> None:
+    """
+    Log per-attempt execution details to execution_details.txt.
+
+    FIX (Apr 28): Phase 3 observability — full forensic trail of every
+    broker request attempt, including HTTP status, timing, and error.
+    """
+    _append_daily_log(
+        "execution_details.txt",
+        (
+            f"chat_id={chat_id[:8]}... symbol={symbol} action={action} "
+            f"strategy={strategy} confidence={confidence:.1f}% "
+            f"http_status={http_status} attempt={attempt}/{max_attempts} "
+            f"elapsed={elapsed_sec:.3f}s error={error_msg[:200]}"
+        ),
+    )
+
+
+def _log_rate_limit_event(
+    chat_id: str,
+    http_status: int,
+    retry_after: str = "N/A",
+    rate_limit_remaining: str = "N/A",
+    url: str = "",
+    method: str = "",
+) -> None:
+    """
+    Log HTTP 429 rate limit events to rate_limit_events.txt.
+
+    FIX (Apr 28): Phase 3 observability — dedicated log for rate limit
+    events so they can be counted and analyzed independently.
+    """
+    _append_daily_log(
+        "rate_limit_events.txt",
+        (
+            f"http_status={http_status} chat_id={chat_id[:8] if chat_id else 'n/a'}... "
+            f"method={method} url={url[:100]} "
+            f"retry_after={retry_after} rate_limit_remaining={rate_limit_remaining}"
+        ),
+    )
+
+
+def _log_execution_summary(
+    symbol: str,
+    action: str,
+    total_attempts: int,
+    final_status: str,
+    total_elapsed_sec: float,
+    chat_id: str = "",
+    strategy: str = "",
+) -> None:
+    """
+    Log final execution outcome to execution_summary.txt.
+
+    FIX (Apr 28): Phase 3 observability — one-line-per-trade summary
+    for quick success/failure rate analysis.
+    """
+    _append_daily_log(
+        "execution_summary.txt",
+        (
+            f"symbol={symbol} action={action} strategy={strategy} "
+            f"chat_id={chat_id[:8] if chat_id else 'n/a'}... "
+            f"attempts={total_attempts} status={final_status} "
+            f"elapsed={total_elapsed_sec:.3f}s"
+        ),
+    )
 
 
 def _notify_execution_failure(
@@ -673,6 +773,10 @@ def _broker_request(
     
     ENHANCED: Full error payload logging to logs/system_errors.log for forensic analysis.
     """
+    # FIX (Apr 28): Global rate limiter prevents cross-user request bursts.
+    # This is the primary gate: even if multiple users' trades fire simultaneously,
+    # the global bucket ensures only ~2 req/s reach Capital.com across ALL users.
+    global_rate_limiter.throttle()
     respect_capital_http_interval_sync()
     req_headers = _with_broker_timestamp_headers(headers)
     
@@ -710,6 +814,25 @@ def _broker_request(
         err = _normalize_broker_error(res=res, payload=data)
         # CONSOLE ECHO: Backup mouth — always visible in server console
         print(f"[BROKER ERROR] Status: {res.status_code} | Error: {err[:200]}", flush=True)
+        # FIX (Apr 28): Log 429 rate-limit details with Retry-After header for forensic analysis
+        if res.status_code == 429:
+            retry_after = res.headers.get("Retry-After", res.headers.get("retry-after", "none"))
+            rate_limit_remaining = res.headers.get("X-RateLimit-Remaining", "none")
+            print(
+                f"[RATE LIMIT] 429 detected | Retry-After={retry_after} | "
+                f"X-RateLimit-Remaining={rate_limit_remaining} | "
+                f"chat_id={chat_id} | url={url}",
+                flush=True,
+            )
+            # FIX (Apr 28): Phase 3 — persist 429 event to rate_limit_events.txt
+            _log_rate_limit_event(
+                chat_id=chat_id or "",
+                http_status=int(res.status_code),
+                retry_after=str(retry_after),
+                rate_limit_remaining=str(rate_limit_remaining),
+                url=url,
+                method=method.upper(),
+            )
         # FULL ERROR EXPOSURE: Log broker rejection with full payload
         error_details = {
             "request": request_context,
@@ -2930,10 +3053,23 @@ def _execute_broker_order(
     """
     last_err = ""
     current_target = float(leg_target)
+    last_http_status = 0  # FIX (Apr 28): Track HTTP status for 429 backoff
+    exec_start = time.monotonic()  # FIX (Apr 28): Phase 3 — track total elapsed time
     
     for attempt in range(max_retries):
+        attempt_start = time.monotonic()
         # EXPLICIT LOG: Show attempt number
         print(f"[EXECUTION] Attempt {attempt + 1}/{max_retries} for {chat_id[:8]}... {order_epic} {action}", flush=True)
+        
+        # FIX (Apr 28): Exponential backoff with jitter on 429 rate limit errors.
+        # Prevents "retry storm" where multiple users re-hit the rate limiter simultaneously.
+        if last_http_status == 429 and attempt > 0:
+            import random as _rnd
+            backoff_base = 1.0 * (2 ** (attempt - 1))  # 1s, 2s, 4s, 8s...
+            backoff_cap = min(backoff_base, 30.0)
+            jitter = _rnd.uniform(0, backoff_cap)
+            print(f"[EXECUTION] HTTP 429 backoff: attempt={attempt + 1}, waiting {jitter:.2f}s (base={backoff_cap:.1f}s)", flush=True)
+            time.sleep(jitter)
         
         ok, out = _open_position_with_protection(
             base_url,
@@ -2947,10 +3083,25 @@ def _execute_broker_order(
             chat_id=str(chat_id),
             max_retries=1,  # Don't retry inside - we handle retries here
         )
+        attempt_elapsed = time.monotonic() - attempt_start
         if not ok:
             last_err = str(out)
-            # EXPLICIT LOG: Show failure reason
-            print(f"[EXECUTION] Attempt {attempt + 1}/{max_retries} FAILED. Reason: {last_err[:100]}", flush=True)
+            # FIX (Apr 28): Extract HTTP status code from error string for 429 detection
+            if "429" in last_err or "too-many" in last_err.lower():
+                last_http_status = 429
+            # EXPLICIT LOG: Show failure reason with HTTP status
+            print(f"[EXECUTION] Attempt {attempt + 1}/{max_retries} FAILED. http_status={last_http_status} | Reason: {last_err[:100]}", flush=True)
+            # FIX (Apr 28): Phase 3 — log per-attempt detail to execution_details.txt
+            _log_execution_detail(
+                chat_id=chat_id,
+                symbol=order_epic,
+                action=action,
+                http_status=last_http_status,
+                attempt=attempt + 1,
+                max_attempts=max_retries,
+                error_msg=last_err,
+                elapsed_sec=attempt_elapsed,
+            )
             
             if attempt < max_retries - 1 and min_dist and float(min_dist) > 0 and entry_price > 0:
                 # Widen target for retry
@@ -2964,6 +3115,12 @@ def _execute_broker_order(
             
             # EXPLICIT LOG: All attempts exhausted
             print(f"[EXECUTION] All {max_retries} attempts exhausted. Final error: {last_err[:100]}", flush=True)
+            # FIX (Apr 28): Phase 3 — log final failure to execution_summary.txt
+            _log_execution_summary(
+                symbol=order_epic, action=action, total_attempts=attempt + 1,
+                final_status="FAILED", total_elapsed_sec=time.monotonic() - exec_start,
+                chat_id=chat_id,
+            )
             return False, last_err or "unknown rejection", float(current_target)
 
         payload = out if isinstance(out, dict) else {}
@@ -2977,6 +3134,12 @@ def _execute_broker_order(
             exclude_deal_ids={str(x.get("deal_id")).strip() for x in opened_broker_legs if str(x.get("deal_id")).strip()},
         )
         if not ok_deal or not deal_id:
+            # FIX (Apr 28): Phase 3 — log deal confirmation failure
+            _log_execution_summary(
+                symbol=order_epic, action=action, total_attempts=attempt + 1,
+                final_status="DEAL_CONFIRM_FAILED", total_elapsed_sec=time.monotonic() - exec_start,
+                chat_id=chat_id,
+            )
             return False, str(cerr), float(current_target)
 
         capital_oid = (
@@ -2995,7 +3158,19 @@ def _execute_broker_order(
                 "capital_order_id": capital_oid,
             }
         )
+        # FIX (Apr 28): Phase 3 — log successful execution to execution_summary.txt
+        _log_execution_summary(
+            symbol=order_epic, action=action, total_attempts=attempt + 1,
+            final_status="FILLED", total_elapsed_sec=time.monotonic() - exec_start,
+            chat_id=chat_id,
+        )
         return True, "", float(current_target)
+    # FIX (Apr 28): Phase 3 — log final failure at loop exit
+    _log_execution_summary(
+        symbol=order_epic, action=action, total_attempts=max_retries,
+        final_status="FAILED", total_elapsed_sec=time.monotonic() - exec_start,
+        chat_id=chat_id,
+    )
     return False, last_err or "unknown rejection", float(current_target)
 
 def place_trade_for_user(

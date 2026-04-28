@@ -54,6 +54,8 @@ from utils.market_hours import (
 # LEGACY DISABLED Phase 7: utils.daily_report replaced by core.unified_reporter
 # from utils.daily_report import send_daily_reports
 from core.executor import place_trade_for_user, monitor_and_close, process_pending_limit_orders
+from core.trade_queue import trade_queue  # FIX (Apr 28): Queue-based execution for 429 prevention
+from core.execution_monitor import execution_monitor  # FIX (Apr 28): Phase 3 observability
 from core.sync import pnl_sync_background_active
 from core.watcher import run_watcher, get_all_active_subscribers, get_trading_subscribers
 from core.signal_engine import scan_watchlist_parallel
@@ -91,6 +93,13 @@ from config import (
     STRUCTURAL_REJECTION_NOTIFY_MAX_PER_CYCLE,
     ENABLE_AUTONOMOUS_TRAINING,
     MAIN_LOOP_MAX_CONSECUTIVE_FAILURES,
+    CAPITAL_REQUEST_RATE_PER_SEC,
+    CAPITAL_BURST_CAPACITY,
+    SIGNAL_DISPATCH_DELAY_SECONDS,
+    TRADE_EXECUTION_DELAY_SECONDS,
+    EXPONENTIAL_BACKOFF_BASE,
+    EXPONENTIAL_BACKOFF_MAX,
+    MAX_TRADE_RETRIES,
 )
 
 # ── PROJECT ROOT (Phase 6-A Fix: dynamic path for cross-platform compatibility) ─
@@ -106,6 +115,14 @@ REQUIRED_DIRS = [
 for d in REQUIRED_DIRS:
     os.makedirs(d, exist_ok=True)
     print(f"[Startup] Directory ensured: {d}")
+
+# FIX (Apr 28): Phase 4 — Rate limiting configuration logging at startup
+print(f"[CONFIG] Capital.com rate limiting: {CAPITAL_REQUEST_RATE_PER_SEC} req/sec, "
+      f"burst capacity: {CAPITAL_BURST_CAPACITY}")
+print(f"[CONFIG] Signal dispatch delay: {SIGNAL_DISPATCH_DELAY_SECONDS}s, "
+      f"trade execution delay: {TRADE_EXECUTION_DELAY_SECONDS}s")
+print(f"[CONFIG] Exponential backoff: base={EXPONENTIAL_BACKOFF_BASE}s max={EXPONENTIAL_BACKOFF_MAX}s, "
+      f"max retries: {MAX_TRADE_RETRIES}")
 
 # ── Single-instance lock ──────────────────────────────────────────────────────
 _LOCK_FILE = "main.pid"
@@ -1599,12 +1616,20 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
                     strategy_label=strategy_label,
                     force_market=True,
                 )
+                # FIX (Apr 28): Space subscriber executions to prevent HTTP 429 burst.
+                if attempted < len(subscribers):
+                    time.sleep(0.5)
                 parsed = _parse_executor_result(result)
                 print(f"   [AUTO  {chat_id}] {symbol} {action} → {parsed}")
                 if _is_trade_successful(result):
                     opened += 1
                     unsupported_for_all = False
                     print(f"[TRADE OPENED] {symbol} {action}")
+                    # FIX (Apr 28): Phase 3 — record successful trade
+                    execution_monitor.record_trade(
+                        symbol=symbol, action=action, status="FILLED",
+                        chat_id=chat_id, strategy_label=strategy_label,
+                    )
                     if (
                         mr_fast_bypass
                         and profile == "FAST"
@@ -1620,14 +1645,31 @@ def dispatch_signal(symbol: str, action: str, confidence: float, reason: str,
                     if "symbol not available on broker" not in msg:
                         unsupported_for_all = False
                     print(f"[TRADE SKIPPED] {msg}")
+                    # FIX (Apr 28): Phase 3 — record skipped trade
+                    execution_monitor.record_trade(
+                        symbol=symbol, action=action, status="SKIPPED",
+                        chat_id=chat_id, error=msg[:200],
+                    )
                 elif parsed.get("status") == "rejected":
                     skipped += 1
                     unsupported_for_all = False
                     print(f"[PRETRADE BLOCK] {parsed.get('message', result)}")
+                    # FIX (Apr 28): Phase 3 — record rejected trade
+                    execution_monitor.record_trade(
+                        symbol=symbol, action=action, status="REJECTED",
+                        chat_id=chat_id, error=str(parsed.get('message', result))[:200],
+                    )
                 else:
                     failed += 1
                     unsupported_for_all = False
                     print(f"[TRADE FAILED] {parsed.get('message', result)}")
+                    # FIX (Apr 28): Phase 3 — record failed trade
+                    err_msg = str(parsed.get('message', result))[:200]
+                    execution_monitor.record_trade(
+                        symbol=symbol, action=action, status="FAILED",
+                        chat_id=chat_id, error=err_msg,
+                        http_status=429 if "429" in err_msg else 0,
+                    )
 
             else:
                 # HYBRID: post to DB, non-blocking.
@@ -1802,6 +1844,11 @@ def run_trading_bot():
     # Phase 6-A Fix: Auto-start Telegram Dashboard Bot in separate process
     # This ensures commands (/mode, /system_status, etc.) are always responsive
     _start_dashboard_bot()
+
+    # FIX (Apr 28): Start trade queue worker for serialized, rate-limited execution.
+    # This prevents HTTP 429 bursts when multiple signals × users fire simultaneously.
+    trade_queue.set_executor(place_trade_for_user)
+    trade_queue.start()
 
     print("🚀 NATB v2.0 — محرك التداول الذكي")
     # Scan uses the looser floor so FAST-tier candidates are not discarded before per-user gates.
@@ -2050,6 +2097,8 @@ def run_trading_bot():
 
             scan_started = time.time()
             print(f"[SCAN START] symbols={len(_watchlist)}")
+            # FIX (Apr 28): Phase 3 — reset execution monitor for new cycle
+            execution_monitor.start_cycle()
 
             # Initialize progress tracking for heartbeat notifications
             _start_scan_progress(len(_watchlist))
@@ -2152,6 +2201,10 @@ def run_trading_bot():
                         # REMOVED: mom_low_vol_entry — legacy AI gate eliminated
                         # REMOVED: mom_macd_bypassed — MACD bypass eliminated
                     )
+                    # FIX (Apr 28): Space signals to prevent HTTP 429 burst on Capital.com API.
+                    # Without this, 4 signals × 2 users × 2 legs = 16 requests fire in <2s.
+                    if accepted_count < len([s for s in signals if not s.get("rejected")]):
+                        time.sleep(0.5)
                     if isinstance(dispatch_result, dict) and dispatch_result.get("status") == "committee_rejected":
                         committee_rejected_count += 1
                         # Track for cycle summary
@@ -2195,6 +2248,9 @@ def run_trading_bot():
                     accepted_signals=accepted_count,
                     committee_rejected=committee_rejected_count,
                 )
+                # FIX (Apr 28): Phase 3 — write execution health report at cycle end
+                cycle_report = execution_monitor.write_cycle_report()
+                print(f"[EXEC MONITOR] {cycle_report}")
                 if rej_suppressed > 0:
                     top_reason, top_count = ("N/A", 0)
                     if rej_counter:

@@ -284,6 +284,18 @@ FINAL_SYNC_CONSOLE_WARN_AFTER_SEC = float(os.getenv("FINAL_SYNC_CONSOLE_WARN_AFT
 MAX_SLIPPAGE_PCT = float(os.getenv("MAX_SLIPPAGE_PCT", "0.01"))  # RELAXED: 1% for Nasdaq volatility
 MAIN_LOOP_MAX_CONSECUTIVE_FAILURES = int(os.getenv("MAIN_LOOP_MAX_CONSECUTIVE_FAILURES", "3"))
 
+# ── Rate Limiting / Execution Throttling (Phase 4 — Apr 28) ──────────────────────
+# Capital.com API rate limit parameters (tune after load testing).
+# Current conservative estimate: 2 req/sec with burst capacity of 5.
+CAPITAL_REQUEST_RATE_PER_SEC = float(os.getenv("CAPITAL_REQUEST_RATE_PER_SEC", "2.0"))
+CAPITAL_BURST_CAPACITY = int(os.getenv("CAPITAL_BURST_CAPACITY", "5"))
+SIGNAL_DISPATCH_DELAY_SECONDS = float(os.getenv("SIGNAL_DISPATCH_DELAY_SECONDS", "0.5"))
+TRADE_EXECUTION_DELAY_SECONDS = float(os.getenv("TRADE_EXECUTION_DELAY_SECONDS", "0.1"))
+EXPONENTIAL_BACKOFF_BASE = float(os.getenv("EXPONENTIAL_BACKOFF_BASE", "1.0"))
+EXPONENTIAL_BACKOFF_MAX = float(os.getenv("EXPONENTIAL_BACKOFF_MAX", "60.0"))
+MAX_TRADE_RETRIES = int(os.getenv("MAX_TRADE_RETRIES", "5"))
+TRADE_EXECUTION_TIMEOUT = float(os.getenv("TRADE_EXECUTION_TIMEOUT", "60.0"))
+
 # ── News API (optional — NewsAPI.org) ─────────────────────────────────────────
 
 NEWS_API_KEY         = os.getenv("NEWS_API_KEY", "")
